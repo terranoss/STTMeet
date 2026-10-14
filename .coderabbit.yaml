@@ -1,0 +1,27 @@
+# Set the tone so it isn't annoying
+tone_instructions: "Be direct, concise, and explain the 'why' behind the issue. Do not nitpick formatting."
+
+reviews:
+  # The "chill" profile tells it to only flag important things, not minor style issues
+  profile: "chill"
+  
+  # Tell it to ignore files you don't care about (like auto-generated files)
+  path_filters:
+    - "!*.lock"
+    - "!/node_modules/**"
+    - "!/dist/**"
+
+  # STEP 2: The Global Architecture Instructions
+  instructions: |
+    - Focus heavily on business logic correctness and architectural flaws.
+    - Ignore formatting, indentation, and syntax preferences. Assume our linters will catch style issues.
+    - Flag any potential N+1 database queries.
+    - Flag any unhandled edge cases, such as missing error boundaries or null values.
+    - Strictly review for security vulnerabilities, especially SQL injections and cross-site scripting (XSS).
+
+  # Bonus: You can give it specific rules for specific folders
+  path_instructions:
+    - path: "src/api/**"
+      instructions: |
+        - Extremely strict security review. Ensure all user inputs are sanitized.
+        - Flag any endpoint that touches payment or user deletion if it lacks authorization checks.

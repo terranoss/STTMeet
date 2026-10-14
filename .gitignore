@@ -17,6 +17,17 @@
 graphify-out/
 
 # ---------------------------------------------------------------------------
+# Windows installer build artifacts (scripts\build_windows.cmd)
+# ---------------------------------------------------------------------------
+venv/
+sttmeet.build/
+sttmeet.dist/
+sttmeet.exe
+installer_output/
+nuitka-crash-report.xml
+vendor/
+
+# ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
 __pycache__/

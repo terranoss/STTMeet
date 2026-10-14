@@ -71,6 +71,7 @@ from ..session_store import (
     save_session,
     session_path
 )
+from ..version import get_display_version
 
 # Set UI Theme
 ctk.set_appearance_mode("System")
@@ -254,7 +255,7 @@ class STTMeetApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("STTMeet — Malaysian Meeting STT & Minutes Generator")
+        self.title(f"STTMeet {get_display_version()} — Malaysian Meeting STT & Minutes Generator")
         self.geometry("1100x820")
         self.minsize(950, 750)
 

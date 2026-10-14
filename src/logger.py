@@ -1,14 +1,16 @@
 """
 STTMeet Logger
 Centralized rotating file logger for the application.
-Writes to sttmeet.log in the project root directory.
+Writes to sttmeet.log next to the application data directory
+(repo root in development, %LOCALAPPDATA%\\STTMeet when installed).
 """
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 
-LOG_FILE = Path(__file__).resolve().parent.parent / "sttmeet.log"
+from .config import BASE_DIR
+
+LOG_FILE = BASE_DIR / "sttmeet.log"
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 BACKUP_COUNT = 3              # Keep last 3 rotated files
 
