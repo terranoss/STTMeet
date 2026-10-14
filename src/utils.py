@@ -7,18 +7,33 @@ import subprocess
 from pathlib import Path
 from typing import Tuple, Dict, Any
 
+from .config import ensure_ffmpeg_on_path
+
+
+def _ffmpeg_path() -> str:
+    """Absolute path to ffmpeg, preferring the copy bundled with the app."""
+    ensure_ffmpeg_on_path()
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _ffprobe_path() -> str:
+    """Absolute path to ffprobe, preferring the copy bundled with the app."""
+    ensure_ffmpeg_on_path()
+    return shutil.which("ffprobe") or "ffprobe"
+
+
 def check_ffmpeg() -> Tuple[bool, str]:
     """
-    Check if FFmpeg is installed and accessible in the system PATH.
-    Returns (is_installed, version_or_message).
+    Check if FFmpeg is available, either bundled with the app or installed in
+    the system PATH. Returns (is_installed, version_or_message).
     """
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
-        return False, "FFmpeg was not found in system PATH."
+        return False, "FFmpeg was not found (bundled copy missing and not in system PATH)."
     
     try:
         res = subprocess.run(
-            ["ffmpeg", "-version"],
+            [ffmpeg_path, "-version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -45,7 +60,7 @@ def get_audio_duration(file_path: str) -> float:
     """
     try:
         cmd = [
-            "ffprobe",
+            _ffprobe_path(),
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",

@@ -17,9 +17,11 @@ from .config import (
     DEFAULT_MAX_SCAN_MINUTES,
     DEFAULT_SILENCE_THRESHOLD_DB,
     DEFAULT_MIN_SILENCE_MS,
-    DEFAULT_OVERLAP_SECONDS
+    DEFAULT_OVERLAP_SECONDS,
+    ensure_ffmpeg_on_path
 )
 from .logger import get_logger
+from .utils import _ffmpeg_path, _ffprobe_path
 
 log = get_logger(__name__)
 
@@ -59,7 +61,7 @@ def preprocess_audio(
         progress_callback("Pre-processing audio (converting to 16kHz mono MP3)...")
 
     cmd = [
-        "ffmpeg", "-y",
+        _ffmpeg_path(), "-y",
         "-i", input_path,
         "-ac", "1",
         "-ar", "16000",
@@ -122,6 +124,8 @@ def split_audio_into_chunks(
     if progress_callback:
         progress_callback("Loading audio file for chunking...", 0.0)
 
+    # pydub resolves ffmpeg/ffprobe through PATH; make sure the bundled copy is visible
+    ensure_ffmpeg_on_path()
     audio = AudioSegment.from_file(audio_path)
     total_len_ms = len(audio)
     log.info("Audio loaded: %.1f seconds total.", total_len_ms / 1000)

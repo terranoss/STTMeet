@@ -3,11 +3,71 @@ STTMeet Configuration Module
 Handles environment variables, API keys, cache folders, and tunable audio settings.
 """
 import os
+import sys
 from pathlib import Path
+from typing import Optional
+
 from dotenv import load_dotenv, set_key
 
+
+def is_frozen() -> bool:
+    """True when running from a compiled/frozen build (Nuitka, PyInstaller)."""
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
+def get_base_dir() -> Path:
+    """
+    Writable base directory for .env, cache and logs.
+
+    Development: the repository root (so the checked-in .env and
+    .sttmeet_cache/ keep working).
+    Frozen/installed: %LOCALAPPDATA%\\STTMeet, because the install directory
+    (C:\\Program Files) is not writable by standard users.
+    """
+    if is_frozen():
+        local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        return Path(local_app_data) / "STTMeet"
+    return Path(__file__).resolve().parent.parent
+
+
+def get_bundled_ffmpeg_dir() -> Path:
+    """
+    Directory holding the FFmpeg binaries shipped inside the installer.
+
+    Frozen builds place them next to the executable as ``ffmpeg\\``. In
+    development there is no bundled copy and this returns a non-existent path.
+    """
+    if is_frozen():
+        return Path(sys.executable).resolve().parent / "ffmpeg"
+    return Path(__file__).resolve().parent.parent / "vendor" / "ffmpeg" / "bin"
+
+
+def ensure_ffmpeg_on_path() -> Optional[Path]:
+    """
+    Prepend the bundled FFmpeg directory to PATH (once per process).
+
+    Makes ``ffmpeg`` / ``ffprobe`` resolvable by every subprocess call without
+    touching each call site. Returns the directory that was added, or None.
+    """
+    global _FFMPEG_PATH_ADDED
+    if _FFMPEG_PATH_ADDED:
+        return _FFMPEG_PATH_ADDED
+
+    ffmpeg_dir = get_bundled_ffmpeg_dir()
+    if (ffmpeg_dir / "ffmpeg.exe").exists() or (ffmpeg_dir / "ffmpeg").exists():
+        current = os.environ.get("PATH", "")
+        entry = str(ffmpeg_dir)
+        if entry.lower() not in current.lower().split(os.pathsep):
+            os.environ["PATH"] = entry + os.pathsep + current
+        _FFMPEG_PATH_ADDED = ffmpeg_dir
+    return _FFMPEG_PATH_ADDED
+
+
+_FFMPEG_PATH_ADDED: Optional[Path] = None
+
 # Base Directory of Project
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = get_base_dir()
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 ENV_PATH = BASE_DIR / ".env"
 
 # Load existing environment variables

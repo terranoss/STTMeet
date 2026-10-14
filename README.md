@@ -65,12 +65,24 @@ STTMeet/
 ├── README.md                   # Project documentation
 ├── test_pipeline.py            # Unit tests for logic, post-processing & session store
 │
+├── assets/
+│   └── app_icon.ico            # Application + installer icon
+│
+├── scripts/
+│   ├── build_windows.cmd       # Entry point: one-command Windows installer build
+│   ├── build_windows.ps1       # Nuitka freeze + FFmpeg fetch + Inno Setup compile
+│   └── sttmeet_setup.iss       # Inno Setup 6 installer definition
+│
+├── docs/
+│   └── windows-installer-workflow.md  # Build, smoke-test and release guide
+│
 ├── .github/
 │   ├── workflows/tests.yml     # CI: unit tests on Python 3.10 & 3.12
 │   └── ISSUE_TEMPLATE/         # Bug report & feature request forms
 │
 ├── src/
 │   ├── __init__.py
+│   ├── version.py              # Application version (read by the build script & UI)
 │   ├── config.py               # Settings manager (API keys, paths, chunk & model settings)
 │   ├── logger.py               # Centralized rotating file logger
 │   ├── utils.py                # FFmpeg checker, audio duration, token & cost estimator
@@ -106,6 +118,7 @@ cd STTMeet
      ffmpeg -version
      ```
    - *If not installed, install via `winget install Gyan.FFmpeg` or download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/).*
+   - Alternatively, run `.\scripts\build_windows.cmd` once — it vendors FFmpeg into `vendor\ffmpeg\bin\`, which the app also prefers over `PATH`.
 
 ### Step 3: Install Dependencies
 ```powershell
@@ -146,6 +159,24 @@ python main.py
    - Click **💾 Save Session** to store the settings, status and output. The app also autosaves at chunk completion, on cancel, on speaker mapping and on close.
    - Re-select the same audio file later to restore the workspace exactly as you left it.
    - Click **🔄 Reset** to clear the workspace and purge the local cache.
+
+---
+
+## 🪟 Building the Windows Installer
+
+Ship a single installer that bundles Python, the app and FFmpeg:
+
+```powershell
+.\scripts\build_windows.cmd
+```
+
+This creates/uses `venv\`, downloads FFmpeg into `vendor\ffmpeg\bin\`, freezes the app with [Nuitka](https://nuitka.net/) into `sttmeet.dist\`, and compiles **`installer_output\sttmeet_setup.exe`** with [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+
+Requirements on the build machine: Python 3.10+, an `assets\app_icon.ico`, **Visual Studio Build Tools (C++ workload)** — `google-genai`'s generated C is too large for gcc's assembler — and Inno Setup 6. Nothing else: FFmpeg is fetched automatically and end users do not need to install anything.
+
+Installed builds write their data to `%LOCALAPPDATA%\STTMeet` (`.env`, `sttmeet.log`, `.sttmeet_cache\`) because `C:\Program Files` is not user-writable.
+
+See [docs/windows-installer-workflow.md](docs/windows-installer-workflow.md) for flags, artefacts, smoke-testing and the release checklist.
 
 ---
 
