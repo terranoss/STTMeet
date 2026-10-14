@@ -69,7 +69,7 @@ function Write-Step([string]$Message) {
 }
 
 function Test-BuildDeps([string]$PythonExe) {
-    $probe = "import importlib.util; mods=('google.genai','pydub','customtkinter','docx','dotenv','nuitka'); missing=[m for m in mods if importlib.util.find_spec(m) is None]; raise SystemExit(1 if missing else 0)"
+    $probe = "import importlib.util; mods=('google.genai','pydub','customtkinter','docx','dotenv','PyInstaller'); missing=[m for m in mods if importlib.util.find_spec(m) is None]; raise SystemExit(1 if missing else 0)"
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     $null = & $PythonExe -c $probe 2>&1
@@ -82,8 +82,6 @@ function Install-BuildDeps([string]$PythonExe, [string]$Root) {
     Write-Step "Installing dependencies"
     & $PythonExe -m pip install -r (Join-Path $Root "requirements.txt")
     if ($LASTEXITCODE -ne 0) { throw "requirements.txt install failed." }
-    & $PythonExe -m pip install "nuitka" "ordered-set" "zstandard"
-    if ($LASTEXITCODE -ne 0) { throw "Nuitka install failed." }
 }
 
 function Get-AppVersion([string]$Root) {
@@ -168,49 +166,6 @@ function Install-Ffmpeg([string]$Root, [string]$BinDir) {
     Write-Host "FFmpeg ready in $BinDir"
 }
 
-function Find-MSVCVcvars {
-    <#
-      Returns the path to vcvars64.bat for a Visual Studio install with the C++
-      workload, or $null.
-
-      Nuitka locates MSVC through the registry, which misses very new Visual
-      Studio releases (e.g. VS 18). Entering the vcvars environment instead
-      puts cl.exe on PATH, which Nuitka always honours.
-    #>
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) { return $null }
-
-    $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if ($LASTEXITCODE -ne 0 -or -not $installPath) { return $null }
-
-    foreach ($vcvars in @(
-        (Join-Path "$installPath".Trim() "VC\Auxiliary\Build\vcvars64.bat"),
-        (Join-Path "$installPath".Trim() "VC\Auxiliary\Build\vcvarsall.bat")
-    )) {
-        if (Test-Path $vcvars) { return $vcvars }
-    }
-    return $null
-}
-
-function Invoke-Nuitka([string[]]$NuitkaArgs, [string]$Vcvars) {
-    <#
-      Runs the Nuitka freeze, optionally inside a Visual Studio developer
-      environment so cl.exe is on PATH.
-    #>
-    if (-not $Vcvars) {
-        & $VenvPython @NuitkaArgs
-        return
-    }
-
-    $parts = @("call `"$Vcvars`" >nul &&", "`"$VenvPython`"")
-    foreach ($arg in $NuitkaArgs) {
-        $parts += "`"$arg`""
-    }
-    $cmdLine = $parts -join " "
-    Write-Host "Entering developer environment: $Vcvars"
-    & cmd.exe /c $cmdLine
-}
-
 function Find-ISCC {
     $candidates = @(
         (Join-Path $env:LocalAppData "Programs\Inno Setup 6\ISCC.exe"),
@@ -262,7 +217,6 @@ if ($env:OS -ne "Windows_NT") {
 $AppVersion = Get-AppVersion -Root $RepoRoot
 $WinFileVersion = Get-WindowsFileVersion $AppVersion
 $ExeStandalone = Join-Path $RepoRoot "sttmeet.dist\sttmeet.exe"
-$ExeOneFile = Join-Path $RepoRoot "sttmeet.exe"
 
 if (-not $InstallerOnly) {
     $PythonCmd = $null
@@ -318,63 +272,55 @@ if (-not $InstallerOnly) {
         Write-Host "Bundling .env.example as runtime\env.example (API key is entered in the app)"
     }
 
-    Write-Step "Freezing with Nuitka (this can take several minutes)"
-    $JobCount = [Environment]::ProcessorCount
-    if ($JobCount -lt 1) { $JobCount = 1 }
-    Write-Host "Parallel C jobs: $JobCount"
-    $NuitkaArgs = @(
-        "-m", "nuitka",
-        "--standalone",
-        "--assume-yes-for-downloads",
-        "--enable-plugin=tk-inter",
-        "--jobs=$JobCount",
-        "--windows-console-mode=disable",
-        "--windows-icon-from-ico=$Icon",
-        "--company-name=STTMeet",
-        "--product-name=STTMeet",
-        "--file-description=STTMeet",
-        "--file-version=$WinFileVersion",
-        "--product-version=$WinFileVersion",
-        "--copyright=Copyright STTMeet",
-        "--include-package=google.genai",
-        "--include-package=customtkinter",
-        "--include-package=docx",
-        "--include-package=dotenv",
-        "--include-package=pydub",
-        "--include-package=src",
-        "--include-package-data=google.genai",
-        "--include-package-data=customtkinter",
-        "--include-package-data=docx",
-        "--include-data-files=.env.example=.env.example",
-        "--nofollow-import-to=google.genai.tests",
-        "--output-dir=$RepoRoot",
-        "--output-filename=sttmeet.exe"
+    Write-Step "Freezing with PyInstaller (Fast standalone packaging)"
+    $PyInstallerExe = Join-Path $RepoRoot "venv\Scripts\pyinstaller.exe"
+    $DistDir = Join-Path $RepoRoot "sttmeet_dist_temp"
+    $WorkDir = Join-Path $RepoRoot "build_pyi"
+
+    if (Test-Path $DistDir) { Remove-Item -LiteralPath $DistDir -Recurse -Force }
+    if (Test-Path $WorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
+
+    $PyiArgs = @(
+        "--onedir",
+        "--noconfirm",
+        "--clean",
+        "--windowed",
+        "--name=sttmeet",
+        "--icon=$Icon",
+        "--distpath=$RepoRoot",
+        "--workpath=$WorkDir",
+        "--contents-directory=_internal",
+        "--collect-all=customtkinter",
+        "--collect-all=google.genai",
+        "--collect-all=docx",
+        "--collect-all=pydub",
+        "--add-data=.env.example;.",
+        "main.py"
     )
-    $Vcvars = $null
-    if ($UseGcc) {
-        Write-Host "C compiler: Nuitka default (gcc/MinGW) - may fail on google.genai"
-    } else {
-        $Vcvars = Find-MSVCVcvars
-        if (-not $Vcvars) {
-            throw "Visual Studio Build Tools with the C++ workload were not found. Install them (https://visualstudio.microsoft.com/downloads/), or re-run with -UseGcc to try Nuitka's default compiler anyway."
-        }
-        Write-Host "C compiler: MSVC via developer environment"
-    }
-    if ($OneFile) {
-        $NuitkaArgs += "--onefile"
-    }
-    $NuitkaArgs += "main.py"
 
-    Invoke-Nuitka -NuitkaArgs $NuitkaArgs -Vcvars $Vcvars
+    Write-Host "Running: pyinstaller $($PyiArgs -join ' ')"
+    & $PyInstallerExe @PyiArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "Nuitka build failed (exit $LASTEXITCODE). If Scons reported assembler errors on module.google.genai.*, the wrong compiler was used - check the 'C compiler:' line above."
+        throw "PyInstaller build failed with exit code $LASTEXITCODE."
     }
 
-    if (-not (Test-Path $ExeStandalone) -and -not (Test-Path $ExeOneFile)) {
-        throw "Nuitka finished but sttmeet.exe was not found under sttmeet.dist\ or repo root."
+    # PyInstaller creates $RepoRoot\sttmeet. Rename/move to sttmeet.dist if needed
+    $PyiOut = Join-Path $RepoRoot "sttmeet"
+    $FinalDist = Join-Path $RepoRoot "sttmeet.dist"
+    if (Test-Path $PyiOut) {
+        if (Test-Path $FinalDist) {
+            Remove-Item -LiteralPath $FinalDist -Recurse -Force
+        }
+        Move-Item -LiteralPath $PyiOut -Destination $FinalDist -Force
     }
+    Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+
+    if (-not (Test-Path $ExeStandalone)) {
+        throw "Build finished but sttmeet.exe was not found under sttmeet.dist\."
+    }
+    Write-Host "Freeze complete: $ExeStandalone"
 } else {
-    Write-Step "Installer only (-InstallerOnly) - skipping Nuitka freeze"
+    Write-Step "Installer only (-InstallerOnly) - skipping freeze"
 }
 
 if (-not $SkipInstaller) {

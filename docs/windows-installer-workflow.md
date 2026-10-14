@@ -10,14 +10,14 @@ How to go from STTMeet source changes to a shippable Windows installer.
 
 **Primary deliverable:** [`installer_output\sttmeet_setup.exe`](../installer_output/sttmeet_setup.exe) (gitignored; created on your machine)
 
-**Toolchain:** [Nuitka](https://nuitka.net/) freeze of `main.py` into `sttmeet.dist\`, then [Inno Setup 6](https://jrsoftware.org/isinfo.php) via [`scripts/sttmeet_setup.iss`](../scripts/sttmeet_setup.iss).
+**Toolchain:** [PyInstaller](https://pyinstaller.org/) freeze of `main.py` into `sttmeet.dist\`, then [Inno Setup 6](https://jrsoftware.org/isinfo.php) via [`scripts/sttmeet_setup.iss`](../scripts/sttmeet_setup.iss).
 
 ---
 
 ## Overview
 
 ```
-Python (dev/test)  ->  Nuitka (sttmeet.dist\)  ->  Inno Setup (installer_output\sttmeet_setup.exe)  ->  GitHub Release
+Python (dev/test)  ->  PyInstaller (sttmeet.dist\)  ->  Inno Setup (installer_output\sttmeet_setup.exe)  ->  GitHub Release
 ```
 
 - Day-to-day feature testing: run with Python (`python main.py`). You do not need the installer to develop.
@@ -34,13 +34,10 @@ Python (dev/test)  ->  Nuitka (sttmeet.dist\)  ->  Inno Setup (installer_output\
 | Python 3.10+ | Same interpreter used for the freeze |
 | `venv/` | Created by the build script if missing |
 | `assets\app_icon.ico` | Required; the build fails loudly if absent |
-| **Visual Studio Build Tools** (C++ workload) | **Required.** `google.genai` produces C sources too large for gcc's assembler |
 | Inno Setup 6 | Provides `ISCC.exe` (required for the installer step) |
 | Internet | Only on the build machine (pip + FFmpeg download) |
 
-> **Why MSVC, not gcc?** `google-genai` compiles into enormous generated C modules. On gcc 15 the build dies with assembler errors such as `unbalanced parenthesis in operand` and `number of operands mismatch for movq` on `module.google.genai.*`. The build script therefore defaults to MSVC and refuses to start without VS Build Tools.
->
-> The script does **not** pass `--msvc=latest`: Nuitka finds Visual Studio through the registry, which misses very new releases (VS 18 reports `cannot locate suitable C compiler`). Instead it locates `vcvars64.bat` with `vswhere` and runs the freeze inside that developer environment, so `cl.exe` is on `PATH`.
+> **Fast & Reliable Packaging:** The project uses PyInstaller (`--onedir`) which freezes dependencies like `google-genai` and `customtkinter` in under a minute without needing a heavy C++ compiler workload on the build machine.
 
 ---
 

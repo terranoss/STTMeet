@@ -2,7 +2,8 @@
 STTMeet GUI Application Window
 Modern Desktop UI built with CustomTkinter.
 Features:
-- Settings: API Key configuration & verification, FFmpeg check
+- Slide-in hamburger menu: Settings (API Key), Save Session, Log folder, About
+- Settings modal: API Key configuration & verification, FFmpeg check
 - Audio File Picker with duration, size, and cost estimation
 - Language Selection (Bahasa Melayu, English, Bilingual)
 - Chunking controls & Audio Pre-processing toggle
@@ -27,11 +28,15 @@ from tkinter import filedialog, messagebox
 from ..config import (
     get_api_key,
     save_api_key,
+    BASE_DIR,
     CACHE_DIR,
     CHUNKS_DIR,
-    DEFAULT_CHUNK_MINUTES
+    DEFAULT_CHUNK_MINUTES,
+    ENV_PATH,
+    MODEL_NAME,
+    MINUTES_MODEL_NAME
 )
-from ..logger import get_logger
+from ..logger import LOG_FILE, get_logger
 
 log = get_logger(__name__)
 from ..utils import (
@@ -1712,8 +1717,4 @@ class STTMeetApp(ctk.CTk):
                     transcript=transcript_content
                 )
 
-        messagebox.showinfo("Export Successful", f"Document(s) saved successfully!")
-
-def run_app():
-    app = STTMeetApp()
-    app.mainloop()
+        messagebox.showinfo("Export Successful", f"Documen

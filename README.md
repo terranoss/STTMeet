@@ -170,9 +170,9 @@ Ship a single installer that bundles Python, the app and FFmpeg:
 .\scripts\build_windows.cmd
 ```
 
-This creates/uses `venv\`, downloads FFmpeg into `vendor\ffmpeg\bin\`, freezes the app with [Nuitka](https://nuitka.net/) into `sttmeet.dist\`, and compiles **`installer_output\sttmeet_setup.exe`** with [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+This creates/uses `venv\`, downloads FFmpeg into `vendor\ffmpeg\bin\`, freezes the app with [PyInstaller](https://pyinstaller.org/) into `sttmeet.dist\`, and compiles **`installer_output\sttmeet_setup.exe`** with [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
-Requirements on the build machine: Python 3.10+, an `assets\app_icon.ico`, **Visual Studio Build Tools (C++ workload)** — `google-genai`'s generated C is too large for gcc's assembler — and Inno Setup 6. Nothing else: FFmpeg is fetched automatically and end users do not need to install anything.
+Requirements on the build machine: Python 3.10+, an `assets\app_icon.ico`, and Inno Setup 6. Nothing else: FFmpeg and Python dependencies are bundled automatically and end users do not need to install anything.
 
 Installed builds write their data to `%LOCALAPPDATA%\STTMeet` (`.env`, `sttmeet.log`, `.sttmeet_cache\`) because `C:\Program Files` is not user-writable.
 
