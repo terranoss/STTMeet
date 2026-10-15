@@ -1,6 +1,7 @@
 # Unit tests for STTMeet logic modules
 import json
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from src.transcript_processor import (
@@ -18,10 +19,12 @@ from src.i18n import (
     LOGIC_COUPLED_LITERALS,
     MINUTES_LANG_BY_UI_LOCALE,
     MINUTES_LANG_DISPLAY,
+    MONTH_NAMES_MS,
     TEMPLATE_DISPLAY,
     STRINGS,
     display_minutes_lang,
     display_template_name,
+    localize_date,
     mode_label,
     normalize_locale,
     translate,
@@ -38,6 +41,7 @@ from src.session_store import (
     session_path
 )
 from src.minutes_generator import (
+    ACTION_ITEMS_PROMPTS,
     TEMPLATES_PROMPTS,
     get_synthesis_prompt,
     get_action_items_prompt,
@@ -85,7 +89,7 @@ def test_cost_estimator():
 def _sample_settings():
     return {
         "engine": "☁️ Gemini 3.5 Flash",
-        "language": "Bilingual",
+        "language": "English",
         "chunk_minutes": 20,
         "preprocess": False,
         "template": "action_minutes",
@@ -197,29 +201,20 @@ def test_every_string_has_english_and_malay():
         assert "ms" in entry and entry["ms"], f"{key} missing 'ms'"
 
 def test_translate_each_mode():
-    assert translate("btn.transcribe", "en") == translate("btn.transcribe", "en")
-    en = translate("menu.settings", "en")
-    ms = translate("menu.settings", "ms")
-    both = translate("menu.settings", "both")
-    assert en == "Settings"
-    assert ms == "Tetapan"
-    assert both == "Settings / Tetapan"
+    assert translate("menu.settings", "en") == "Settings"
+    assert translate("menu.settings", "ms") == "Tetapan"
 
-def test_translate_explicit_both_overrides_auto_join():
-    # Tab captions were Malay-first before localization; that order must survive.
-    assert translate("tab.recap", "both") == "Rekap Mesyuarat / Meeting Recap"
-    # Entries without an explicit variant are auto-joined English / Bahasa.
-    assert "both" not in STRINGS["btn.transcribe"]
-    assert translate("btn.transcribe", "both").endswith("Start / Mula")
-
-def test_translate_both_does_not_duplicate_leading_emoji():
+def test_translate_has_no_combined_mode():
+    # A bilingual "both" mode used to exist; it is gone from both the locale
+    # list and every string entry, so it can never be selected again.
+    assert ALL_MODES == ("en", "ms")
+    assert "both" not in ALL_MODES
+    assert DEFAULT_LOCALE == "ms"
+    assert DEFAULT_LOCALE in ALL_MODES
     for key, entry in STRINGS.items():
-        if "both" in entry:
-            continue
-        combined = translate(key, "both")
-        symbol = entry["en"].split(" ", 1)[0]
-        if symbol and not any(ch.isalnum() for ch in symbol):
-            assert combined.count(symbol) == 1, f"{key} repeats the {symbol} icon"
+        assert "both" not in entry, f"{key} still carries a combined-mode variant"
+    for key, entry in TEMPLATE_DISPLAY.items():
+        assert "both" not in entry, f"{key} still carries a combined-mode variant"
 
 def test_translate_missing_key_raises():
     try:
@@ -230,6 +225,8 @@ def test_translate_missing_key_raises():
 
 def test_translate_falls_back_to_english_for_unknown_mode():
     assert translate("menu.settings", "klingon") == translate("menu.settings", "en")
+    # A locale written by an older build is no longer valid and must not raise.
+    assert translate("menu.settings", "both") == translate("menu.settings", "en")
 
 def test_translate_formats_placeholders():
     assert translate("status.batch_finished", "en", done=3, total=9) == (
@@ -255,9 +252,25 @@ def test_normalize_locale():
 def test_locale_cascades_to_a_valid_minutes_language():
     for locale, expected in MINUTES_LANG_BY_UI_LOCALE.items():
         assert expected in VALID_LANGUAGES, f"{locale} maps to an invalid minutes language"
+    assert set(MINUTES_LANG_BY_UI_LOCALE) == set(ALL_MODES)
     assert MINUTES_LANG_BY_UI_LOCALE["en"] == "English"
     assert MINUTES_LANG_BY_UI_LOCALE["ms"] == "Bahasa Melayu"
-    assert MINUTES_LANG_BY_UI_LOCALE["both"] == "Bilingual"
+
+def test_bilingual_language_is_gone_everywhere():
+    """No prompt table or validator may still offer bilingual generation."""
+    assert "Bilingual" not in VALID_LANGUAGES
+    for languages in TEMPLATES_PROMPTS.values():
+        assert "Bilingual" not in languages
+    assert "Bilingual" not in ACTION_ITEMS_PROMPTS
+    assert "Bilingual" not in RECAP_PROMPTS
+    assert "Bilingual" not in MINUTES_LANG_DISPLAY
+    assert "Bilingual" not in LOGIC_COUPLED_LITERALS
+
+def test_stale_bilingual_session_falls_back_safely():
+    """A session saved under the old bilingual mode must still load."""
+    settings = normalize_settings({"language": "Bilingual"})
+    assert settings["language"] in VALID_LANGUAGES
+    assert settings["language"] == DEFAULT_SETTINGS["language"]
 
 def test_minutes_lang_display_map_matches_valid_languages():
     assert set(MINUTES_LANG_DISPLAY) == set(VALID_LANGUAGES)
@@ -266,15 +279,52 @@ def test_minutes_lang_display_map_matches_valid_languages():
 
 def test_display_minutes_lang_is_display_only():
     # Shows a localized name while the canonical value is untouched.
-    assert display_minutes_lang("Bilingual", "ms") == "Dwibahasa"
-    assert display_minutes_lang("Bilingual", "en") == "Bilingual"
+    assert display_minutes_lang("English", "ms") == "Inggeris"
+    assert display_minutes_lang("English", "en") == "English"
     # An unmapped value is returned verbatim rather than raising.
     assert display_minutes_lang("Welsh", "ms") == "Welsh"
+
+def test_normalize_locale_rejects_retired_modes():
+    assert normalize_locale("both") == DEFAULT_LOCALE
+    assert normalize_locale("Bilingual") == DEFAULT_LOCALE
 
 def test_mode_labels_cover_every_mode():
     for mode in ALL_MODES:
         assert mode_label(mode, "en")
         assert mode_label(mode, "ms")
+
+def test_export_labels_are_localized():
+    """
+    Exported documents used to carry hardcoded bilingual chrome ("Tarikh /
+    Date") no matter the interface language, which is what made them read as
+    mixed-language. Every export label must now be single-language.
+    """
+    keys = [k for k in STRINGS if k.startswith("export.")]
+    assert len(keys) >= 13, f"expected the export label set, found {len(keys)}"
+    for key in keys:
+        en = translate(key, "en")
+        ms = translate(key, "ms")
+        assert en and ms, f"{key} is empty"
+        assert en != ms, f"{key} is identical in both languages; it is not localized"
+        # No forced-bilingual "Malay / English" chrome may survive.
+        for joined in (f"{ms} / {en}", f"{en} / {ms}"):
+            assert joined not in (en, ms), f"{key} still renders as bilingual chrome"
+
+def test_export_titles_interpolate_the_filename():
+    for tab in ("transcript", "recap", "actions", "minutes"):
+        for locale in ALL_MODES:
+            title = translate(f"export.title_{tab}", locale, name="Budget Sync")
+            assert "Budget Sync" in title, f"export.title_{tab} dropped the file name"
+            assert "{name}" not in title
+
+def test_localize_date_uses_language_months():
+    moment = datetime(2026, 3, 9)
+    assert localize_date(moment, "en") == "09 March 2026"
+    assert localize_date(moment, "ms") == "9 Mac 2026"
+    assert localize_date(datetime(2026, 12, 25), "ms") == "25 Disember 2026"
+    assert len(MONTH_NAMES_MS) == 12
+    # An unknown locale degrades to the English form rather than raising.
+    assert localize_date(moment, "klingon") == localize_date(moment, "en")
 
 # ---------------------------------------------------------------------------
 # Preferences
@@ -358,17 +408,22 @@ if __name__ == "__main__":
     test_load_session_missing_and_corrupt()
     test_every_string_has_english_and_malay()
     test_translate_each_mode()
-    test_translate_explicit_both_overrides_auto_join()
-    test_translate_both_does_not_duplicate_leading_emoji()
+    test_translate_has_no_combined_mode()
     test_translate_missing_key_raises()
     test_translate_falls_back_to_english_for_unknown_mode()
     test_translate_formats_placeholders()
     test_logic_coupled_literals_are_not_translated()
     test_normalize_locale()
+    test_normalize_locale_rejects_retired_modes()
     test_locale_cascades_to_a_valid_minutes_language()
+    test_bilingual_language_is_gone_everywhere()
+    test_stale_bilingual_session_falls_back_safely()
     test_minutes_lang_display_map_matches_valid_languages()
     test_display_minutes_lang_is_display_only()
     test_mode_labels_cover_every_mode()
+    test_export_labels_are_localized()
+    test_export_titles_interpolate_the_filename()
+    test_localize_date_uses_language_months()
     test_prefs_roundtrip_and_tolerance()
     test_template_prompts_and_displays()
     test_parse_minutes_sections_for_templates()

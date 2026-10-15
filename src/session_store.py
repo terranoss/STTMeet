@@ -31,7 +31,7 @@ VALID_ENGINES = [
     "☁️ Gemini 3.5 Flash",
     "☁️ Gemini 3.5 Flash Lite",
 ]
-VALID_LANGUAGES = ["Bahasa Melayu", "English", "Bilingual"]
+VALID_LANGUAGES = ["Bahasa Melayu", "English"]
 VALID_TEMPLATES = [
     "action_minutes",
     "discussion_minutes",
