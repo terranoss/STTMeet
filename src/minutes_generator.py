@@ -717,6 +717,155 @@ def generate_meeting_minutes(
     )
 
 
+ACTION_ITEMS_PROMPTS = {
+    "English": """You are an executive project manager and meeting secretary.
+Based on the meeting transcript below, identify and compile all actionable tasks, commitments, decisions requiring execution, and deliverables into an Action Item Register adhering strictly to this structure:
+
+# Action Items & Deliverables
+
+## Action Item Register
+
+| # | Task / Deliverable | Owner / PIC | Target Due Date | Status |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | [Clear, specific, actionable description] | [Name] | [DD/MM/YYYY or TBD] | Not Started / Open |
+
+## Critical Dependencies & Blockers
+* **[Item 1]:** [Details of dependency or required milestone before next step].
+
+## Follow-up Requirements
+* **[Follow-up 1]:** [Review schedule, check-in date, or communication channel].
+
+TRANSCRIPT:
+{transcript}
+""",
+    "Bahasa Melayu": """Anda adalah pengurus projek dan setiausaha mesyuarat profesional.
+Berdasarkan transkrip mesyuarat di bawah, kenal pasti dan susun semua tindakan, komitmen, keputusan yang memerlukan pelaksanaan, dan penyerahan tugas ke dalam Daftar Tindakan rasmi mengikut struktur berikut:
+
+# Senarai Tindakan Mesyuarat (Action Items)
+
+## Daftar Tindakan (Action Item Register)
+
+| Bil | Tindakan / Tugasan | Pegawai Bertanggungjawab (PIC) | Tarikh Akhir | Status |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | [Penerangan tindakan yang jelas, tepat, dan boleh dilaksanakan] | [Nama] | [Tarikh atau Belum Ditetapkan] | Belum Mula / Terbuka |
+
+## Kebergantungan Kritikal & Kekangan
+* **[Perkara 1]:** [Butiran kebergantungan atau kelulusan yang diperlukan sebelum langkah seterusnya].
+
+## Keperluan Susulan
+* **[Susulan 1]:** [Jadual semakan semula atau saluran komunikasi yang dipersetujui].
+
+TRANSKRIP MESYUARAT:
+{transcript}
+""",
+    "Bilingual": """Anda adalah pengurus projek dan setiausaha mesyuarat dwibahasa profesional.
+Berdasarkan transkrip mesyuarat di bawah, hasilkan Daftar Tindakan Dwibahasa (Action Items Register - Bahasa Melayu & English) mengikut struktur berikut:
+
+# Senarai Tindakan Mesyuarat / Action Items Register
+
+## Daftar Tindakan / Action Items
+
+| Bil / # | Tindakan / Task | PIC / Owner | Tarikh / Target Date | Status |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | [Penerangan tindakan / Action description] | [Nama / Name] | [Tarikh / Date] | Belum Mula / Open |
+
+## Kebergantungan & Kekangan / Dependencies & Blockers
+* **[Perkara / Item 1]:** [Keterangan / Description].
+
+## Keperluan Susulan / Follow-up Requirements
+* **[Susulan / Follow-up 1]:** [Keterangan / Description].
+
+TRANSKRIP MESYUARAT / TRANSCRIPT:
+{transcript}
+"""
+}
+
+
+def get_action_items_prompt(language: str = "Bahasa Melayu") -> str:
+    """Retrieve prompt for generating action items."""
+    return ACTION_ITEMS_PROMPTS.get(language) or ACTION_ITEMS_PROMPTS.get("English") or ACTION_ITEMS_PROMPTS["Bahasa Melayu"]
+
+
+def generate_action_items(
+    client: genai.Client,
+    full_transcript: str,
+    language: str = "Bahasa Melayu",
+    progress_callback: Optional[Callable[[str], None]] = None,
+    max_retries: int = 3,
+    model_override: Optional[str] = None,
+    cancel_event=None
+) -> str:
+    """
+    Synthesize meeting transcript into a standalone Action Item Register.
+    Includes automatic retry with exponential backoff and candidate model failover.
+    """
+    log.info(
+        "Generating action items in language '%s' (transcript length: %d chars)",
+        language, len(full_transcript)
+    )
+    if progress_callback:
+        progress_callback(f"Generating action items in {language}...")
+
+    prompt_template = get_action_items_prompt(language=language)
+    full_prompt = prompt_template.format(transcript=full_transcript)
+
+    preferred = model_override or MINUTES_MODEL_NAME
+    models_to_try = [preferred] + [m for m in MINUTES_FALLBACK_MODELS if m != preferred]
+
+    for model_candidate in models_to_try:
+        raise_if_cancelled(cancel_event)
+        log.info("Attempting action items generation with model: %s", model_candidate)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                raise_if_cancelled(cancel_event)
+                log.info("Calling Gemini model '%s' for action items (Attempt %d/%d)...", model_candidate, attempt, max_retries)
+                if progress_callback:
+                    progress_callback(f"Generating action items with {model_candidate} (Attempt {attempt}/{max_retries})...")
+
+                response = client.models.generate_content(
+                    model=model_candidate,
+                    contents=[full_prompt],
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=MAX_OUTPUT_TOKENS,
+                        temperature=0.2
+                    )
+                )
+                raise_if_cancelled(cancel_event)
+                result = response.text or ""
+                log.info("Action items generated successfully with '%s' (%d chars).", model_candidate, len(result))
+                return result
+
+            except CancelledError:
+                raise
+
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota exceeded" in err_str.lower():
+                    log.warning(
+                        "Quota exhausted for model '%s' during action items synthesis. Auto-switching candidate.",
+                        model_candidate
+                    )
+                    if progress_callback:
+                        progress_callback(f"Quota reached for {model_candidate}. Auto-switching model...")
+                    break
+
+                if attempt < max_retries:
+                    wait_sec = attempt * 5
+                    if progress_callback:
+                        progress_callback(f"Server busy. Retrying in {wait_sec}s (Attempt {attempt + 1}/{max_retries})...")
+                    if not cancellable_sleep(cancel_event, wait_sec):
+                        raise CancelledError("Retry backoff cancelled by user.")
+                else:
+                    log.error("All %d action items synthesis attempts failed for '%s': %s", max_retries, model_candidate, err_str[:80])
+                    break
+
+    raise RuntimeError(
+        f"All available Gemini models ({', '.join(models_to_try)}) exceeded daily free quotas or failed.\n"
+        "Please check your Google AI Studio quota limits or retry tomorrow."
+    )
+
+
 def parse_minutes_sections(minutes_text: str) -> Dict[str, str]:
     """
     Extract individual sections (Summary/Discussion, Decisions/Resolutions, Action Items/Directives)

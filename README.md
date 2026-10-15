@@ -8,7 +8,7 @@
 It automatically generates:
 - 📝 **Full Timestamped Transcript** with continuous timeline offsets.
 - 👥 **Speaker Diarization & Name Mapping** (`Speaker 1`, `Speaker 2` -> `En. Ahmad`, `Pn. Sarah`).
-- 📌 **Executive Summary / Ringkasan Eksekutif**.
+- 📌 **Executive Meeting Recap / Rekap Mesyuarat Eksekutif** (TL;DR, Decisions, Deliverables, Strategic Topics, Risks).
 - 💡 **Discussion Highlights / Perkara-Perkara Yang Dibincangkan**.
 - ⚖️ **Key Decisions Made / Keputusan Mesyuarat**.
 - 📋 **Action Items Matrix / Matriks Tindakan** (Task, PIC, Deadline, Status).
@@ -168,9 +168,11 @@ python main.py
 4. **Click ▶ Start:**
    - Watch live progress on the step badges and progress bar.
    - Click **📊 Monitor Chunks** to see per-chunk status; use **↻ Reprocess** on any failed chunk, then **Extract Transcript** to pull completed chunks into the workspace.
-5. **Generate Minutes:**
-   - Click **📝 Generate Minutes** for the Executive Summary, Discussion Points, Decisions and Action Items Matrix — this can be retried on its own without re-transcribing.
-   - Review the **Transkrip Penuh**, **Minit Mesyuarat**, **Ringkasan** and **Senarai Tindakan** tabs.
+5. **Generate Minutes, Recap & Action Items:**
+   - In the **Minit Mesyuarat / Minutes** tab, select a template and click **📝 Generate Minutes** to synthesize the minutes.
+   - In the **Rekap Mesyuarat / Meeting Recap** tab, click **📋 Generate Recap** for an executive meeting recap matching `executive_meeting_recap_template.md`.
+   - In the **Senarai Tindakan / Action Items** tab, click **📋 Generate Action Items** to extract the action item register and deliverables.
+   - Each output can be generated or retried independently without re-transcribing audio.
 6. **Map Speakers & Export:**
    - Click **👥 Map Speaker Names** to assign names (e.g. `Speaker 1` -> `En. Razak`).
    - Click **📄 Export Word (.docx)**, **📝 Export Markdown (.md)**, or **📦 Export All**.

@@ -167,11 +167,15 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "control.output_lang": {"en": "🌐 Output: {value}", "ms": "🌐 Keluaran: {value}"},
     "btn.transcribe": {"en": "▶ Start", "ms": "▶ Mula"},
     "btn.generate_minutes": {"en": "📝 Generate Minutes", "ms": "📝 Jana Minit"},
+    "btn.generate_recap": {"en": "📋 Generate Recap", "ms": "📋 Jana Rekap"},
+    "btn.generate_actions": {"en": "📋 Generate Action Items", "ms": "📋 Jana Senarai Tindakan"},
     "btn.cancel": {"en": "⏹ Cancel", "ms": "⏹ Batal"},
     "btn.monitor": {"en": "📊 Monitor Chunks", "ms": "📊 Pantau Potongan"},
     "btn.reset": {"en": "🔄 Reset", "ms": "🔄 Set Semula"},
     "btn.save_session": {"en": "💾 Save Session", "ms": "💾 Simpan Sesi"},
     "btn.retry_minutes": {"en": "↻ Retry Generation", "ms": "↻ Cuba Jana Semula"},
+    "btn.retry_recap": {"en": "↻ Retry Recap", "ms": "↻ Cuba Semula Rekap"},
+    "btn.retry_actions": {"en": "↻ Retry Action Items", "ms": "↻ Cuba Semula Tindakan"},
     "btn.map_speakers": {"en": "👥 Map Speaker Names", "ms": "👥 Petakan Nama Penceramah"},
     "btn.export_docx": {"en": "📄 Export Word (.docx)", "ms": "📄 Eksport Word (.docx)"},
     "btn.export_md": {"en": "📝 Export Markdown (.md)", "ms": "📝 Eksport Markdown (.md)"},
@@ -196,9 +200,9 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "Minutes", "ms": "Minit Mesyuarat",
         "both": "Minit Mesyuarat / Minutes",
     },
-    "tab.summary": {
-        "en": "Summary", "ms": "Ringkasan",
-        "both": "Ringkasan / Summary",
+    "tab.recap": {
+        "en": "Meeting Recap", "ms": "Rekap Mesyuarat",
+        "both": "Rekap Mesyuarat / Meeting Recap",
     },
     "tab.actions": {
         "en": "Action Items", "ms": "Senarai Tindakan",
@@ -266,6 +270,30 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "Transcript completed. Minutes generation failed (click Retry).",
         "ms": "Transkrip selesai. Penjanaan minit gagal (klik Cuba Semula).",
     },
+    "status.generating_recap": {
+        "en": "Generating Executive Meeting Recap ({language})...",
+        "ms": "Menjana Rekap Mesyuarat Eksekutif ({language})...",
+    },
+    "status.recap_complete": {
+        "en": "Ready. Executive Meeting Recap completed successfully!",
+        "ms": "Sedia. Rekap Mesyuarat Eksekutif berjaya disiapkan!",
+    },
+    "status.recap_failed": {
+        "en": "Recap generation failed: {error}",
+        "ms": "Penjanaan rekap gagal: {error}",
+    },
+    "status.generating_actions": {
+        "en": "Generating Action Items ({language})...",
+        "ms": "Menjana Senarai Tindakan ({language})...",
+    },
+    "status.actions_complete": {
+        "en": "Ready. Action items completed successfully!",
+        "ms": "Sedia. Senarai tindakan berjaya disiapkan!",
+    },
+    "status.actions_failed": {
+        "en": "Action items generation failed: {error}",
+        "ms": "Penjanaan senarai tindakan gagal: {error}",
+    },
     "status.session_restored": {
         "en": "Restored session for {name} ({chunks}).",
         "ms": "Sesi dipulihkan untuk {name} ({chunks}).",
@@ -296,10 +324,18 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "⚠️ Minutes failed ({error}...). Transcript is safe.",
         "ms": "⚠️ Minit gagal ({error}...). Transkrip selamat.",
     },
+    "recap.banner_error": {
+        "en": "⚠️ Recap failed ({error}...). Transcript is safe.",
+        "ms": "⚠️ Rekap gagal ({error}...). Transkrip selamat.",
+    },
+    "actions.banner_error": {
+        "en": "⚠️ Action items failed ({error}...). Transcript is safe.",
+        "ms": "⚠️ Senarai tindakan gagal ({error}...). Transkrip selamat.",
+    },
 
     # --- Tab content fallbacks ---------------------------------------
-    "content.summary_missing": {"en": "Summary not generated.", "ms": "Ringkasan tidak dijana."},
-    "content.actions_missing": {"en": "No action items extracted.", "ms": "Tiada tindakan diekstrak."},
+    "content.recap_missing": {"en": "Meeting Recap not generated yet. Click 'Generate Recap' to produce one.", "ms": "Rekap Mesyuarat belum dijana. Klik 'Jana Rekap' untuk menjana."},
+    "content.actions_missing": {"en": "Action items not generated yet. Click 'Generate Action Items' to produce them.", "ms": "Senarai tindakan belum dijana. Klik 'Jana Senarai Tindakan' untuk menjana."},
 
     # --- Settings modal ----------------------------------------------
     "settings.title": {"en": "Settings", "ms": "Tetapan"},

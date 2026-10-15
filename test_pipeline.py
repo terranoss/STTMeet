@@ -40,7 +40,12 @@ from src.session_store import (
 from src.minutes_generator import (
     TEMPLATES_PROMPTS,
     get_synthesis_prompt,
+    get_action_items_prompt,
     parse_minutes_sections,
+)
+from src.recap_generator import (
+    RECAP_PROMPTS,
+    get_recap_prompt,
 )
 
 def test_time_conversions():
@@ -108,11 +113,15 @@ def test_session_roundtrip():
             status=_sample_status(),
             raw_transcript="[00:01] Speaker 1: Setuju.",
             processed_transcript="[00:01] En. Razak: Setuju.",
-            generated_minutes="# Summary\n...",
+            generated_minutes="# Minutes\n...",
+            generated_recap="# Executive Meeting Recap\n...",
+            generated_actions="# Action Item Register\n...",
             detected_speakers=["Speaker 1"],
             speaker_mapping={"Speaker 1": "En. Razak"}
         )
         assert payload["schema_version"] == SCHEMA_VERSION
+        assert payload["generated_recap"] == "# Executive Meeting Recap\n..."
+        assert payload["generated_actions"] == "# Action Item Register\n..."
         assert save_session(payload, path)
 
         loaded = load_session(path)
@@ -123,6 +132,8 @@ def test_session_roundtrip():
         assert loaded["status"]["chunks"][1]["error"] == "quota exceeded"
         assert loaded["speaker_mapping"] == {"Speaker 1": "En. Razak"}
         assert loaded["processed_transcript"] == "[00:01] En. Razak: Setuju."
+        assert loaded["generated_recap"] == "# Executive Meeting Recap\n..."
+        assert loaded["generated_actions"] == "# Action Item Register\n..."
 
 def test_session_never_stores_api_key():
     payload = build_session_payload(
@@ -196,7 +207,7 @@ def test_translate_each_mode():
 
 def test_translate_explicit_both_overrides_auto_join():
     # Tab captions were Malay-first before localization; that order must survive.
-    assert translate("tab.summary", "both") == "Ringkasan / Summary"
+    assert translate("tab.recap", "both") == "Rekap Mesyuarat / Meeting Recap"
     # Entries without an explicit variant are auto-joined English / Bahasa.
     assert "both" not in STRINGS["btn.transcribe"]
     assert translate("btn.transcribe", "both").endswith("Start / Mula")
@@ -320,6 +331,20 @@ def test_parse_minutes_sections_for_templates():
     assert "Testing line 1" in sec["action_items"]
     assert sec["full_text"] == three_col_sample
 
+def test_recap_prompts():
+    for lang in VALID_LANGUAGES:
+        prompt = get_recap_prompt(language=lang)
+        assert "{transcript}" in prompt
+        assert "# " in prompt
+        assert "Executive" in prompt or "Rekap" in prompt
+
+def test_action_items_prompts():
+    for lang in VALID_LANGUAGES:
+        prompt = get_action_items_prompt(language=lang)
+        assert "{transcript}" in prompt
+        assert "# " in prompt
+        assert "Action" in prompt or "Tindakan" in prompt
+
 if __name__ == "__main__":
     test_time_conversions()
     test_adjust_chunk_timestamps()
@@ -347,4 +372,6 @@ if __name__ == "__main__":
     test_prefs_roundtrip_and_tolerance()
     test_template_prompts_and_displays()
     test_parse_minutes_sections_for_templates()
+    test_recap_prompts()
+    test_action_items_prompts()
     print("All unit tests passed successfully!")

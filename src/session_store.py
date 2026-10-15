@@ -59,6 +59,8 @@ def build_session_payload(
     raw_transcript: str = "",
     processed_transcript: str = "",
     generated_minutes: str = "",
+    generated_recap: str = "",
+    generated_actions: str = "",
     detected_speakers: Optional[List[str]] = None,
     speaker_mapping: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
@@ -73,6 +75,8 @@ def build_session_payload(
         "raw_transcript": raw_transcript or "",
         "processed_transcript": processed_transcript or "",
         "generated_minutes": generated_minutes or "",
+        "generated_recap": generated_recap or "",
+        "generated_actions": generated_actions or "",
         "detected_speakers": list(detected_speakers or []),
         "updated_at": datetime.now().isoformat(),
     }
@@ -185,6 +189,8 @@ def load_session(path: Path) -> Optional[Dict[str, Any]]:
         # v1 files stored no processed_transcript; the raw one is the best available
         "processed_transcript": data.get("processed_transcript") or data.get("raw_transcript", "") or "",
         "generated_minutes": data.get("generated_minutes", "") or "",
+        "generated_recap": data.get("generated_recap", "") or "",
+        "generated_actions": data.get("generated_actions", "") or "",
         "detected_speakers": data.get("detected_speakers") or [],
         "updated_at": data.get("updated_at", ""),
     }

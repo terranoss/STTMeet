@@ -76,8 +76,10 @@ from ..transcript_processor import (
 )
 from ..minutes_generator import (
     generate_meeting_minutes,
+    generate_action_items,
     parse_minutes_sections
 )
+from ..recap_generator import generate_meeting_recap
 from ..exporter import (
     export_to_docx,
     export_to_markdown,
@@ -375,6 +377,8 @@ class STTMeetApp(ctk.CTk):
         self.raw_transcript: str = ""
         self.processed_transcript: str = ""
         self.generated_minutes: str = ""
+        self.generated_recap: str = ""
+        self.generated_actions: str = ""
         self.detected_speakers: List[str] = []
         self.speaker_entries: Dict[str, ctk.CTkEntry] = {}
         self.speaker_mapping: Dict[str, str] = {}
@@ -555,7 +559,7 @@ class STTMeetApp(ctk.CTk):
         for internal, key in (
             ("tab_transcript", "tab.transcript"),
             ("tab_minutes", "tab.minutes"),
-            ("tab_summary", "tab.summary"),
+            ("tab_recap", "tab.recap"),
             ("tab_actions", "tab.actions"),
         ):
             try:
@@ -1356,19 +1360,6 @@ class STTMeetApp(ctk.CTk):
         )
         self.output_lang_chip.grid(row=0, column=7, padx=4, pady=10, sticky="e")
 
-        self.gen_minutes_btn = ctk.CTkButton(
-            ctrl_frame,
-            text=self._t("btn.generate_minutes"),
-            fg_color="#1976D2",
-            hover_color="#1565C0",
-            font=ctk.CTkFont(weight="bold"),
-            command=self._start_minutes_generation_only,
-            state="disabled",
-            width=150
-        )
-        self.gen_minutes_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
-        self._i18n_label(self.gen_minutes_btn, "btn.generate_minutes")
-
         self.cancel_btn = ctk.CTkButton(
             ctrl_frame,
             text=self._t("btn.cancel"),
@@ -1378,7 +1369,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=75
         )
-        self.cancel_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
+        self.cancel_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
         self._i18n_label(self.cancel_btn, "btn.cancel")
 
         self.monitor_btn = ctk.CTkButton(
@@ -1391,7 +1382,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.monitor_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
+        self.monitor_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
         self._i18n_label(self.monitor_btn, "btn.monitor")
 
         self.reset_btn = ctk.CTkButton(
@@ -1403,7 +1394,7 @@ class STTMeetApp(ctk.CTk):
             command=self._reset_workspace,
             width=85
         )
-        self.reset_btn.grid(row=0, column=11, padx=4, pady=10, sticky="e")
+        self.reset_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
         self._i18n_label(self.reset_btn, "btn.reset")
 
         self.save_session_btn = ctk.CTkButton(
@@ -1416,7 +1407,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.save_session_btn.grid(row=0, column=12, padx=(4, 16), pady=10, sticky="e")
+        self.save_session_btn.grid(row=0, column=11, padx=(4, 16), pady=10, sticky="e")
         self._i18n_label(self.save_session_btn, "btn.save_session")
 
         # Visual Stepper Bar
@@ -1475,7 +1466,7 @@ class STTMeetApp(ctk.CTk):
         # never changes tab identity; only the captions are re-labelled.
         self.tab_transcript = self.tabview.add("tab_transcript")
         self.tab_minutes = self.tabview.add("tab_minutes")
-        self.tab_summary = self.tabview.add("tab_summary")
+        self.tab_recap = self.tabview.add("tab_recap")
         self.tab_actions = self.tabview.add("tab_actions")
         self._retranslate_tabs()
 
@@ -1484,7 +1475,7 @@ class STTMeetApp(ctk.CTk):
 
         # Minutes tab with top inline retry banner
         self.tab_minutes.grid_columnconfigure(0, weight=1)
-        self.tab_minutes.grid_rowconfigure(1, weight=1)
+        self.tab_minutes.grid_rowconfigure(2, weight=1)
 
         self.minutes_banner_frame = ctk.CTkFrame(self.tab_minutes, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
         self.minutes_banner_label = ctk.CTkLabel(
@@ -1504,17 +1495,31 @@ class STTMeetApp(ctk.CTk):
             command=self._start_minutes_generation_only
         )
         self.retry_minutes_btn.pack(side="right", padx=12, pady=6)
-        # Template selector toolbar directly inside the Minutes tab
+
+        # Minutes Toolbar
         minutes_toolbar = ctk.CTkFrame(self.tab_minutes, fg_color="transparent")
-        minutes_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
-        minutes_toolbar.grid_columnconfigure(2, weight=1)
+        minutes_toolbar.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 2))
+        minutes_toolbar.grid_columnconfigure(3, weight=1)
+
+        self.gen_minutes_btn = ctk.CTkButton(
+            minutes_toolbar,
+            text=self._t("btn.generate_minutes"),
+            fg_color="#1976D2",
+            hover_color="#1565C0",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._start_minutes_generation_only,
+            state="disabled",
+            width=160
+        )
+        self.gen_minutes_btn.grid(row=0, column=0, padx=4, sticky="w")
+        self._i18n_label(self.gen_minutes_btn, "btn.generate_minutes")
 
         tmpl_tab_lbl = ctk.CTkLabel(
             minutes_toolbar,
             text=self._t("control.template"),
             font=ctk.CTkFont(size=12, weight="bold")
         )
-        tmpl_tab_lbl.grid(row=0, column=0, padx=(4, 6), sticky="w")
+        tmpl_tab_lbl.grid(row=0, column=1, padx=(16, 6), sticky="w")
         self._i18n_label(tmpl_tab_lbl, "control.template")
 
         self.tab_template_dropdown = ctk.CTkOptionMenu(
@@ -1524,15 +1529,98 @@ class STTMeetApp(ctk.CTk):
             width=220,
             command=self._on_template_selected
         )
-        self.tab_template_dropdown.grid(row=0, column=1, padx=4, sticky="w")
+        self.tab_template_dropdown.grid(row=0, column=2, padx=4, sticky="w")
 
         # Note: self.minutes_banner_frame starts hidden (gridded on row 0 when error occurs)
 
         self.txt_minutes = ctk.CTkTextbox(self.tab_minutes, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
-        self.txt_minutes.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self.txt_minutes.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
 
-        self.txt_summary = self._create_textbox(self.tab_summary)
-        self.txt_actions = self._create_textbox(self.tab_actions)
+        # Recap tab with top toolbar and inline error banner
+        self.tab_recap.grid_columnconfigure(0, weight=1)
+        self.tab_recap.grid_rowconfigure(2, weight=1)
+
+        self.recap_banner_frame = ctk.CTkFrame(self.tab_recap, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
+        self.recap_banner_label = ctk.CTkLabel(
+            self.recap_banner_frame,
+            text="",
+            text_color=("#C62828", "#FFCDD2"),
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.recap_banner_label.pack(side="left", padx=12, pady=6)
+
+        self.retry_recap_btn = ctk.CTkButton(
+            self.recap_banner_frame,
+            text=self._t("btn.retry_recap"),
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+            width=140,
+            command=self._start_recap_generation_only
+        )
+        self.retry_recap_btn.pack(side="right", padx=12, pady=6)
+
+        recap_toolbar = ctk.CTkFrame(self.tab_recap, fg_color="transparent")
+        recap_toolbar.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 2))
+        recap_toolbar.grid_columnconfigure(1, weight=1)
+
+        self.gen_recap_btn = ctk.CTkButton(
+            recap_toolbar,
+            text=self._t("btn.generate_recap"),
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._start_recap_generation_only,
+            state="disabled",
+            width=160
+        )
+        self.gen_recap_btn.grid(row=0, column=0, padx=4, sticky="w")
+        self._i18n_label(self.gen_recap_btn, "btn.generate_recap")
+
+        self.txt_recap = ctk.CTkTextbox(self.tab_recap, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_recap.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
+
+        # Action Items tab with top toolbar and inline error banner
+        self.tab_actions.grid_columnconfigure(0, weight=1)
+        self.tab_actions.grid_rowconfigure(2, weight=1)
+
+        self.actions_banner_frame = ctk.CTkFrame(self.tab_actions, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
+        self.actions_banner_label = ctk.CTkLabel(
+            self.actions_banner_frame,
+            text="",
+            text_color=("#C62828", "#FFCDD2"),
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.actions_banner_label.pack(side="left", padx=12, pady=6)
+
+        self.retry_actions_btn = ctk.CTkButton(
+            self.actions_banner_frame,
+            text=self._t("btn.retry_actions"),
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+            width=140,
+            command=self._start_actions_generation_only
+        )
+        self.retry_actions_btn.pack(side="right", padx=12, pady=6)
+
+        actions_toolbar = ctk.CTkFrame(self.tab_actions, fg_color="transparent")
+        actions_toolbar.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 2))
+        actions_toolbar.grid_columnconfigure(1, weight=1)
+
+        self.gen_actions_btn = ctk.CTkButton(
+            actions_toolbar,
+            text=self._t("btn.generate_actions"),
+            fg_color="#00897B",
+            hover_color="#00695C",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._start_actions_generation_only,
+            state="disabled",
+            width=180
+        )
+        self.gen_actions_btn.grid(row=0, column=0, padx=4, sticky="w")
+        self._i18n_label(self.gen_actions_btn, "btn.generate_actions")
+
+        self.txt_actions = ctk.CTkTextbox(self.tab_actions, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_actions.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
 
     def _create_textbox(self, parent_tab):
         parent_tab.grid_columnconfigure(0, weight=1)
@@ -1726,7 +1814,7 @@ class STTMeetApp(ctk.CTk):
         self._session_settings_snapshot = None
 
         # Clear text displays
-        for tb in [self.txt_transcript, self.txt_minutes, self.txt_summary, self.txt_actions]:
+        for tb in [self.txt_transcript, self.txt_minutes, self.txt_recap, self.txt_actions]:
             tb.delete("1.0", "end")
 
         chunk_mins = int(self.chunk_size_var.get().split()[0])
@@ -2176,6 +2264,8 @@ class STTMeetApp(ctk.CTk):
         self._update_transcript_view(full_transcript)
         self._update_step_badge("step3", "done", f"({len(ordered_parts)}/{total})")
         self.gen_minutes_btn.configure(state="normal")
+        self.gen_recap_btn.configure(state="normal")
+        self.gen_actions_btn.configure(state="normal")
 
         # Save meeting session so it restores across app restarts
         if self.active_file_hash:
@@ -2314,6 +2404,132 @@ class STTMeetApp(ctk.CTk):
         t = threading.Thread(target=runner, daemon=True)
         t.start()
 
+    def _start_recap_generation_only(self):
+        """
+        Independent trigger for Executive Meeting Recap.
+        Enables user to generate or retry meeting recap from existing transcript.
+        """
+        transcript_to_use = self.processed_transcript or self.raw_transcript
+        if not transcript_to_use.strip():
+            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
+            return
+
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
+            return
+
+        if self.is_processing:
+            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
+            return
+
+        self.is_processing = True
+        self.cancel_event.clear()
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.gen_recap_btn.configure(state="disabled")
+        self._hide_recap_error_banner()
+
+        language = self.lang_var.get()
+        file_hash = compute_file_hash(self.selected_audio_file) if self.selected_audio_file else "manual_session"
+
+        def runner():
+            try:
+                self._set_status(self._t("status.generating_recap", language=display_minutes_lang(language, self.ui_locale)))
+                client = get_gemini_client(api_key)
+                recap_text = generate_meeting_recap(
+                    client=client,
+                    full_transcript=transcript_to_use,
+                    language=language,
+                    progress_callback=lambda msg: self._set_status(f"[Recap] {msg}"),
+                    model_override=self._get_selected_model_override(),
+                    cancel_event=self.cancel_event
+                )
+                self.generated_recap = recap_text
+                self.after(0, lambda: self._update_recap_view(recap_text))
+                self.after(0, self._hide_recap_error_banner)
+                if file_hash:
+                    self._save_full_session(file_hash)
+                self._set_status(self._t("status.recap_complete"))
+            except CancelledError:
+                log.info("Recap synthesis cancelled by user.")
+                self._set_status(self._t("status.cancelled"))
+            except Exception as e:
+                err_msg = str(e)
+                log.error("Recap generation failed: %s", err_msg)
+                self.after(0, lambda msg=err_msg: self._show_recap_error_banner(msg))
+                self._set_status(self._t("status.recap_failed", error=err_msg[:40]))
+            finally:
+                self.is_processing = False
+                self.after(0, lambda: self.start_btn.configure(state="normal"))
+                self.after(0, lambda: self.gen_recap_btn.configure(state="normal"))
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
+    def _start_actions_generation_only(self):
+        """
+        Independent trigger for Action Items.
+        Enables user to generate or retry action items directly from existing transcript.
+        """
+        transcript_to_use = self.processed_transcript or self.raw_transcript
+        if not transcript_to_use.strip():
+            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
+            return
+
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
+            return
+
+        if self.is_processing:
+            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
+            return
+
+        self.is_processing = True
+        self.cancel_event.clear()
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.gen_actions_btn.configure(state="disabled")
+        self._hide_actions_error_banner()
+
+        language = self.lang_var.get()
+        file_hash = compute_file_hash(self.selected_audio_file) if self.selected_audio_file else "manual_session"
+
+        def runner():
+            try:
+                self._set_status(self._t("status.generating_actions", language=display_minutes_lang(language, self.ui_locale)))
+                client = get_gemini_client(api_key)
+                actions_text = generate_action_items(
+                    client=client,
+                    full_transcript=transcript_to_use,
+                    language=language,
+                    progress_callback=lambda msg: self._set_status(f"[Actions] {msg}"),
+                    model_override=self._get_selected_model_override(),
+                    cancel_event=self.cancel_event
+                )
+                self.generated_actions = actions_text
+                self.after(0, lambda: self._update_actions_view(actions_text))
+                self.after(0, self._hide_actions_error_banner)
+                if file_hash:
+                    self._save_full_session(file_hash)
+                self._set_status(self._t("status.actions_complete"))
+            except CancelledError:
+                log.info("Action items synthesis cancelled by user.")
+                self._set_status(self._t("status.cancelled"))
+            except Exception as e:
+                err_msg = str(e)
+                log.error("Action items generation failed: %s", err_msg)
+                self.after(0, lambda msg=err_msg: self._show_actions_error_banner(msg))
+                self._set_status(self._t("status.actions_failed", error=err_msg[:40]))
+            finally:
+                self.is_processing = False
+                self.after(0, lambda: self.start_btn.configure(state="normal"))
+                self.after(0, lambda: self.gen_actions_btn.configure(state="normal"))
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
     def _update_step_badge(self, step_key: str, state: str, extra: str = ""):
         """
         Update the visual state of a step badge.
@@ -2393,6 +2609,8 @@ class STTMeetApp(ctk.CTk):
             raw_transcript=self.raw_transcript,
             processed_transcript=self.processed_transcript,
             generated_minutes=self.generated_minutes,
+            generated_recap=self.generated_recap,
+            generated_actions=self.generated_actions,
             detected_speakers=self.detected_speakers,
             speaker_mapping=self.speaker_mapping
         )
@@ -2459,6 +2677,8 @@ class STTMeetApp(ctk.CTk):
             self.raw_transcript = data["raw_transcript"]
             self.processed_transcript = data["processed_transcript"] or self.raw_transcript
             self.generated_minutes = data["generated_minutes"]
+            self.generated_recap = data.get("generated_recap", "") or ""
+            self.generated_actions = data.get("generated_actions", "") or ""
             self.detected_speakers = data["detected_speakers"]
             self.speaker_mapping = data["speaker_mapping"]
             self.active_file_hash = audio_hash
@@ -2469,13 +2689,22 @@ class STTMeetApp(ctk.CTk):
 
             if self.processed_transcript:
                 self._update_transcript_view(self.processed_transcript)
-                if not self.generated_minutes:
-                    self.gen_minutes_btn.configure(state="normal")
+                self.gen_minutes_btn.configure(state="normal")
+                self.gen_recap_btn.configure(state="normal")
+                self.gen_actions_btn.configure(state="normal")
 
             if self.generated_minutes:
                 sections = parse_minutes_sections(self.generated_minutes)
                 self._populate_minutes_tabs(sections)
                 self._hide_minutes_error_banner()
+
+            if self.generated_recap:
+                self._update_recap_view(self.generated_recap)
+                self._hide_recap_error_banner()
+
+            if self.generated_actions:
+                self._update_actions_view(self.generated_actions)
+                self._hide_actions_error_banner()
 
             chunk_summary = self._describe_restored_chunks(data["status"])
             if chunk_summary:
@@ -2532,6 +2761,8 @@ class STTMeetApp(ctk.CTk):
         self._progress_value = status["progress"]
         if status["steps"].get("step3") == "done":
             self.gen_minutes_btn.configure(state="normal")
+            self.gen_recap_btn.configure(state="normal")
+            self.gen_actions_btn.configure(state="normal")
 
     def _describe_restored_chunks(self, status: Dict) -> str:
         """Summarise restored chunk counts for the status line."""
@@ -2551,13 +2782,15 @@ class STTMeetApp(ctk.CTk):
             return
 
         # Clear text in all 4 tabs
-        for tb in [self.txt_transcript, self.txt_minutes, self.txt_summary, self.txt_actions]:
+        for tb in [self.txt_transcript, self.txt_minutes, self.txt_recap, self.txt_actions]:
             tb.delete("1.0", "end")
 
         # Clear memory state
         self.raw_transcript = ""
         self.processed_transcript = ""
         self.generated_minutes = ""
+        self.generated_recap = ""
+        self.generated_actions = ""
         self.detected_speakers = []
         self.speaker_mapping = {}
         self.active_chunks_meta = []
@@ -2569,7 +2802,11 @@ class STTMeetApp(ctk.CTk):
         self._progress_value = 0.0
         self._session_settings_snapshot = None
         self._hide_minutes_error_banner()
+        self._hide_recap_error_banner()
+        self._hide_actions_error_banner()
         self.gen_minutes_btn.configure(state="disabled")
+        self.gen_recap_btn.configure(state="disabled")
+        self.gen_actions_btn.configure(state="disabled")
         self.monitor_btn.configure(state="disabled")
         self.active_file_hash = ""
         self._set_save_session_enabled(True)
@@ -2612,6 +2849,32 @@ class STTMeetApp(ctk.CTk):
     def _hide_minutes_error_banner(self):
         self.minutes_banner_frame.grid_forget()
 
+    def _show_recap_error_banner(self, err_msg: str):
+        self.recap_banner_label.configure(
+            text=self._t("recap.banner_error", error=err_msg[:60])
+        )
+        self.recap_banner_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+
+    def _hide_recap_error_banner(self):
+        self.recap_banner_frame.grid_forget()
+
+    def _show_actions_error_banner(self, err_msg: str):
+        self.actions_banner_label.configure(
+            text=self._t("actions.banner_error", error=err_msg[:60])
+        )
+        self.actions_banner_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+
+    def _hide_actions_error_banner(self):
+        self.actions_banner_frame.grid_forget()
+
+    def _update_recap_view(self, text: str):
+        self.txt_recap.delete("1.0", "end")
+        self.txt_recap.insert("1.0", text)
+
+    def _update_actions_view(self, text: str):
+        self.txt_actions.delete("1.0", "end")
+        self.txt_actions.insert("1.0", text)
+
     def _set_status(self, message: str):
         self.after(0, lambda: self.status_label.configure(text=message))
 
@@ -2629,12 +2892,6 @@ class STTMeetApp(ctk.CTk):
     def _populate_minutes_tabs(self, sections: Dict[str, str]):
         self.txt_minutes.delete("1.0", "end")
         self.txt_minutes.insert("1.0", sections.get("full_text", ""))
-
-        self.txt_summary.delete("1.0", "end")
-        self.txt_summary.insert("1.0", sections.get("summary", self._t("content.summary_missing")))
-
-        self.txt_actions.delete("1.0", "end")
-        self.txt_actions.insert("1.0", sections.get("action_items", self._t("content.actions_missing")))
 
     def _on_pipeline_finished(self):
         self.is_processing = False
@@ -2733,6 +2990,14 @@ class STTMeetApp(ctk.CTk):
                 self.generated_minutes = apply_speaker_mapping(self.generated_minutes, mapping)
                 sections = parse_minutes_sections(self.generated_minutes)
                 self._populate_minutes_tabs(sections)
+
+            if self.generated_recap:
+                self.generated_recap = apply_speaker_mapping(self.generated_recap, mapping)
+                self._update_recap_view(self.generated_recap)
+
+            if self.generated_actions:
+                self.generated_actions = apply_speaker_mapping(self.generated_actions, mapping)
+                self._update_actions_view(self.generated_actions)
 
             if self.active_file_hash:
                 self._save_full_session(self.active_file_hash)
