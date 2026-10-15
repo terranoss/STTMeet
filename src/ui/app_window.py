@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from ..config import (
@@ -269,6 +270,10 @@ class STTMeetApp(ctk.CTk):
         self.cancel_event = threading.Event()
         self.is_processing = False
 
+        # API Key lives here for the whole session; the entry widget only exists
+        # inside the Settings modal. Seeded from .env so a restart restores it.
+        self.api_key_var: ctk.StringVar = ctk.StringVar(value=get_api_key())
+
         self.selected_audio_file: Optional[str] = None
         self.audio_duration_seconds: float = 0.0
         self.raw_transcript: str = ""
@@ -292,9 +297,17 @@ class STTMeetApp(ctk.CTk):
         self._step_states = {"step1": "pending", "step2": "pending", "step3": "pending", "step4": "pending"}
         self._progress_value: float = 0.0
 
+        # Slide-in menu (created lazily on first open)
+        self._menu_open: bool = False
+        self.menu_overlay = None
+        self.menu_frame = None
+        self.menu_key_badge = None
+        self._menu_slide_job: Optional[str] = None
+
         self._build_ui()
         self._check_initial_environment()
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+        self.bind("<Escape>", self._on_escape_key)
 
     def _build_ui(self):
         # Master Grid Layout
@@ -319,33 +332,26 @@ class STTMeetApp(ctk.CTk):
     def _build_header_and_settings(self):
         top_frame = ctk.CTkFrame(self, corner_radius=10)
         top_frame.grid(row=0, column=0, padx=16, pady=(12, 6), sticky="ew")
-        top_frame.grid_columnconfigure(1, weight=1)
+        top_frame.grid_columnconfigure(2, weight=1)
+
+        # Hamburger toggle — opens the slide-in menu
+        self.menu_btn = ctk.CTkButton(
+            top_frame,
+            text="☰",
+            width=42,
+            font=ctk.CTkFont(size=20),
+            fg_color="transparent",
+            hover_color=("#E0E0E0", "#2B2B2B"),
+            command=self._toggle_menu
+        )
+        self.menu_btn.grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
 
         title_label = ctk.CTkLabel(
             top_frame,
             text="🎙️ STTMeet",
             font=ctk.CTkFont(size=20, weight="bold")
         )
-        title_label.grid(row=0, column=0, padx=(16, 10), pady=10, sticky="w")
-
-        # API Key input
-        key_label = ctk.CTkLabel(top_frame, text="Gemini API Key:", font=ctk.CTkFont(size=12))
-        key_label.grid(row=0, column=1, padx=(10, 4), pady=10, sticky="e")
-
-        self.api_key_entry = ctk.CTkEntry(
-            top_frame,
-            width=260,
-            show="•",
-            placeholder_text="Enter GEMINI_API_KEY..."
-        )
-        self.api_key_entry.grid(row=0, column=2, padx=4, pady=10)
-        
-        saved_key = get_api_key()
-        if saved_key:
-            self.api_key_entry.insert(0, saved_key)
-
-        save_btn = ctk.CTkButton(top_frame, text="Save Key", width=75, command=self._save_api_key)
-        save_btn.grid(row=0, column=3, padx=4, pady=10)
+        title_label.grid(row=0, column=1, padx=(4, 10), pady=10, sticky="w")
 
         # Status Badges
         self.ffmpeg_badge = ctk.CTkLabel(
@@ -354,7 +360,382 @@ class STTMeetApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color="gray"
         )
-        self.ffmpeg_badge.grid(row=0, column=4, padx=(10, 16), pady=10)
+        self.ffmpeg_badge.grid(row=0, column=3, padx=(10, 16), pady=10, sticky="e")
+
+    # -------------------------------------------------------------
+    # Slide-in Menu
+    # -------------------------------------------------------------
+    MENU_WIDTH = 280
+    _MENU_SLIDE_STEPS = 6
+
+    def _toggle_menu(self):
+        if self._menu_open:
+            self._close_menu()
+        else:
+            self._open_menu()
+
+    def _on_escape_key(self, event=None):
+        if self._menu_open:
+            self._close_menu()
+            return "break"
+        return None
+
+    def _open_menu(self):
+        if self._menu_open:
+            return
+        self._menu_open = True
+        self._cancel_menu_slide()
+
+        if self.menu_overlay is None or not self.menu_overlay.winfo_exists():
+            # A stipple-filled Tk Canvas is used as the dim layer: CustomTkinter's
+            # colour parser rejects 8-digit #RRGGBBAA alpha values, so the 50%
+            # dither pattern is the portable way to darken the content behind.
+            self.menu_overlay = tk.Canvas(
+                self,
+                highlightthickness=0,
+                bd=0
+            )
+            self.menu_overlay.create_rectangle(
+                0, 0, 10000, 10000,
+                fill="#000000",
+                stipple="gray50",
+                outline=""
+            )
+            self.menu_overlay.bind("<Button-1>", lambda _e: self._close_menu())
+            self.menu_overlay.bind("<Escape>", self._on_escape_key)
+        self.menu_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # tkraise() on a Canvas is a tag operation, so raise the widget explicitly.
+        self.tk.call("raise", self.menu_overlay._w)
+
+        if self.menu_frame is None or not self.menu_frame.winfo_exists():
+            self._build_menu_panel()
+        self._refresh_menu_key_badge()
+        self.menu_frame.place_configure(y=0, relheight=1)
+        self.menu_frame.tkraise()
+
+        # Slide in from the left edge
+        self._animate_menu(target_x=0)
+
+    def _close_menu(self):
+        if not self._menu_open:
+            return
+        self._menu_open = False
+        self._cancel_menu_slide()
+        self._animate_menu(target_x=-self._menu_width(), then=self._teardown_menu_overlay)
+
+    def _teardown_menu_overlay(self):
+        """Remove the dimming overlay once the drawer is fully off-screen."""
+        if self._menu_open:
+            return
+        if self.menu_overlay is not None and self.menu_overlay.winfo_exists():
+            self.menu_overlay.place_forget()
+
+    def _menu_width(self) -> int:
+        """Actual on-screen width of the drawer, falling back to MENU_WIDTH."""
+        if self.menu_frame is not None and self.menu_frame.winfo_exists():
+            width = self.menu_frame.winfo_width()
+            if width > 1:
+                return width
+        return self.MENU_WIDTH
+
+    def _cancel_menu_slide(self):
+        if self._menu_slide_job is not None:
+            try:
+                self.after_cancel(self._menu_slide_job)
+            except Exception:
+                pass
+            self._menu_slide_job = None
+
+    def _animate_menu(self, target_x: int, then=None):
+        """Step the drawer horizontally toward target_x to fake a slide."""
+        self._cancel_menu_slide()
+        if self.menu_frame is None or not self.menu_frame.winfo_exists():
+            if then:
+                then()
+            return
+
+        try:
+            current_x = int(self.menu_frame.winfo_x())
+        except Exception:
+            current_x = -self.MENU_WIDTH
+
+        step = int((target_x - current_x) / self._MENU_SLIDE_STEPS)
+        new_x = current_x + step if step else target_x
+
+        if (target_x > current_x and new_x >= target_x) or (target_x < current_x and new_x <= target_x):
+            new_x = target_x
+
+        self.menu_frame.place_configure(x=new_x)
+        self.menu_frame.update_idletasks()
+
+        if new_x == target_x:
+            self._menu_slide_job = None
+            if then:
+                self.after(0, then)
+        else:
+            self._menu_slide_job = self.after(14, self._animate_menu, target_x, then)
+
+    def _build_menu_panel(self):
+        self.menu_frame = ctk.CTkFrame(self, width=self.MENU_WIDTH, corner_radius=0)
+        self.menu_frame.grid_rowconfigure(4, weight=1)
+        self.menu_frame.grid_columnconfigure(0, weight=1)
+
+        menu_title = ctk.CTkLabel(
+            self.menu_frame,
+            text="🎙️ STTMeet",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        menu_title.grid(row=0, column=0, padx=18, pady=(22, 2), sticky="w")
+
+        menu_version = ctk.CTkLabel(
+            self.menu_frame,
+            text=get_display_version(),
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        menu_version.grid(row=1, column=0, padx=18, pady=(0, 10), sticky="w")
+
+        self.menu_key_badge = ctk.CTkLabel(
+            self.menu_frame,
+            text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            anchor="w",
+            corner_radius=6,
+            padx=10,
+            pady=5
+        )
+        self.menu_key_badge.grid(row=2, column=0, padx=18, pady=(0, 14), sticky="ew")
+
+        self._add_menu_item("⚙️  Settings / Tetapan", self._menu_action_settings, row=3)
+        self._add_menu_item("💾  Save Session / Simpan Sesi", self._menu_action_save_session, row=5)
+        self._add_menu_item("📂  Open Log Folder / Buka Folder Log", self._menu_action_open_log_folder, row=6)
+        self._add_menu_item("ℹ️  About / Tentang", self._menu_action_about, row=7)
+
+        hint = ctk.CTkLabel(
+            self.menu_frame,
+            text="Press Esc or click outside to close",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        )
+        hint.grid(row=8, column=0, padx=18, pady=(16, 18), sticky="w")
+
+    def _add_menu_item(self, text: str, command, row: int):
+        if row == 5:
+            ctk.CTkFrame(self.menu_frame, height=1, fg_color=("gray85", "gray25")).grid(
+                row=4, column=0, padx=18, pady=(2, 10), sticky="ew"
+            )
+        btn = ctk.CTkButton(
+            self.menu_frame,
+            text=text,
+            anchor="w",
+            height=42,
+            fg_color="transparent",
+            hover_color=("#E0E0E0", "#2B2B2B"),
+            font=ctk.CTkFont(size=13),
+            command=command
+        )
+        btn.grid(row=row, column=0, padx=8, pady=3, sticky="ew")
+
+    def _refresh_menu_key_badge(self):
+        if self.menu_key_badge is None or not self.menu_key_badge.winfo_exists():
+            return
+        if self.api_key_var.get().strip():
+            self.menu_key_badge.configure(
+                text="✅  API Key configured",
+                text_color=("#1B5E20", "#A5D6A7"),
+                fg_color=("#E8F5E9", "#1B2A1B")
+            )
+        else:
+            self.menu_key_badge.configure(
+                text="⚠️  No API Key — open Settings",
+                text_color=("#C62828", "#FFCDD2"),
+                fg_color=("#FFEBEE", "#2B1A1A")
+            )
+
+    # -------------------------------------------------------------
+    # Menu Actions
+    # -------------------------------------------------------------
+    def _menu_action_settings(self):
+        self._close_menu()
+        self.after(160, self._open_settings_dialog)
+
+    def _menu_action_save_session(self):
+        self._close_menu()
+        self.after(160, self._save_session_manually)
+
+    def _menu_action_open_log_folder(self):
+        self._close_menu()
+        folder = LOG_FILE.parent
+        try:
+            os.startfile(str(folder))
+            self._set_status(f"Opened log folder: {folder}")
+        except Exception as e:
+            log.warning("Could not open log folder: %s", e)
+            messagebox.showinfo("Log Folder", f"Open this folder manually:\n\n{folder}")
+
+    def _menu_action_about(self):
+        self._close_menu()
+        self.after(160, self._open_about_dialog)
+
+    def _open_settings_dialog(self):
+        """Modal holding the Gemini API Key entry. Persists to .env on Save."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Settings / Tetapan")
+        dialog.geometry("500x330")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+        body.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            body,
+            text="🔑  Gemini API Key / Kunci API Gemini",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            anchor="w"
+        ).grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkLabel(
+            body,
+            text=(
+                "Create a key at https://aistudio.google.com/apikey\n"
+                "Stored locally in .env — never written into session files.\n"
+                "Kunci disimpan secara lokal dan tidak dikongsi."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            justify="left",
+            anchor="w"
+        ).grid(row=1, column=0, pady=(6, 14), sticky="ew")
+
+        entry_row = ctk.CTkFrame(body, fg_color="transparent")
+        entry_row.grid(row=2, column=0, sticky="ew")
+        entry_row.grid_columnconfigure(0, weight=1)
+
+        show_state = {"visible": False}
+        key_entry = ctk.CTkEntry(
+            entry_row,
+            textvariable=self.api_key_var,
+            show="•",
+            placeholder_text="Enter GEMINI_API_KEY..."
+        )
+        key_entry.grid(row=0, column=0, sticky="ew")
+
+        def close_dialog(_event=None):
+            """Detach the entry's trace on the shared api_key_var, then close.
+
+            CTkEntry registers a StringVar trace that its own destroy() never
+            removes, which would leave a callback pointing at dead widgets.
+            """
+            trace = getattr(key_entry, "_textvariable_callback_name", "")
+            if trace:
+                try:
+                    self.api_key_var.trace_remove("write", trace)
+                except Exception:
+                    pass
+            dialog.destroy()
+
+        def toggle_visibility():
+            show_state["visible"] = not show_state["visible"]
+            key_entry.configure(show="" if show_state["visible"] else "•")
+            toggle_btn.configure(text="🙈" if show_state["visible"] else "👁")
+
+        toggle_btn = ctk.CTkButton(
+            entry_row,
+            text="👁",
+            width=42,
+            command=toggle_visibility
+        )
+        toggle_btn.grid(row=0, column=1, padx=(6, 0))
+
+        ctk.CTkLabel(
+            body,
+            text=f"Saved to: {ENV_PATH}",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+            anchor="w"
+        ).grid(row=3, column=0, pady=(8, 0), sticky="w")
+
+        def do_save():
+            if self._save_api_key(notify=False):
+                messagebox.showinfo("Success", "Gemini API Key saved successfully.", parent=dialog)
+                close_dialog()
+
+        def do_clear():
+            save_api_key("")
+            close_dialog()
+            self.api_key_var.set("")
+            self._refresh_menu_key_badge()
+            self._set_status("Gemini API Key cleared.")
+            messagebox.showinfo("Cleared", "Gemini API Key removed from .env.")
+
+        btn_row = ctk.CTkFrame(body, fg_color="transparent")
+        btn_row.grid(row=4, column=0, pady=(20, 0), sticky="ew")
+        btn_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkButton(
+            btn_row, text="🗑  Clear Key", width=110, fg_color=("#C62828", "#B71C1C"),
+            hover_color=("#B71C1C", "#8E0000"), command=do_clear
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkButton(btn_row, text="Cancel", width=100, command=close_dialog).grid(
+            row=0, column=2, padx=6, sticky="e"
+        )
+        ctk.CTkButton(
+            btn_row, text="💾  Save", width=110, fg_color="#2E7D32", hover_color="#1B5E20",
+            font=ctk.CTkFont(weight="bold"), command=do_save
+        ).grid(row=0, column=3, sticky="e")
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.after(50, key_entry.focus_set)
+
+    def _open_about_dialog(self):
+        ffmpeg_ok, _ = check_ffmpeg()
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("About / Tentang STTMeet")
+        dialog.geometry("480x420")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+        body.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            body, text="🎙️  STTMeet", font=ctk.CTkFont(size=20, weight="bold"), anchor="w"
+        ).grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkLabel(
+            body,
+            text=f"Version {get_display_version()}\nMalaysian Meeting Transcription & Minutes Generator",
+            font=ctk.CTkFont(size=12),
+            text_color="gray",
+            justify="left",
+            anchor="w"
+        ).grid(row=1, column=0, pady=(4, 16), sticky="ew")
+
+        rows = [
+            ("FFmpeg", "✅ Installed" if ffmpeg_ok else "❌ Not found in PATH"),
+            ("Transcript model", MODEL_NAME),
+            ("Minutes model", MINUTES_MODEL_NAME),
+            ("Data folder", str(BASE_DIR)),
+            ("Session cache", str(CACHE_DIR)),
+            ("Log file", str(LOG_FILE)),
+        ]
+        for idx, (label, value) in enumerate(rows, start=2):
+            ctk.CTkLabel(
+                body, text=label, font=ctk.CTkFont(size=11, weight="bold"), anchor="w"
+            ).grid(row=idx, column=0, pady=(0, 8), sticky="w")
+            ctk.CTkLabel(
+                body, text=value, font=ctk.CTkFont(size=11), anchor="w", wraplength=280, justify="left"
+            ).grid(row=idx, column=1, pady=(0, 8), sticky="w")
+        body.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkButton(body, text="Close", width=100, command=dialog.destroy).grid(
+            row=len(rows) + 2, column=0, columnspan=2, pady=(18, 0), sticky="e"
+        )
 
     def _build_file_section(self):
         file_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -676,13 +1057,18 @@ class STTMeetApp(ctk.CTk):
                 "FFmpeg was not detected in your system PATH.\nPlease ensure FFmpeg is installed to support all audio formats."
             )
 
-    def _save_api_key(self):
-        new_key = self.api_key_entry.get().strip()
+    def _save_api_key(self, notify: bool = True) -> bool:
+        """Persist self.api_key_var to .env. Returns True when a key was saved."""
+        new_key = self.api_key_var.get().strip()
         if not new_key:
             messagebox.showwarning("Warning", "Please enter a valid Gemini API Key.")
-            return
+            return False
         save_api_key(new_key)
-        messagebox.showinfo("Success", "Gemini API Key saved successfully to .env.")
+        self._refresh_menu_key_badge()
+        self._set_status("Gemini API Key saved successfully.")
+        if notify:
+            messagebox.showinfo("Success", "Gemini API Key saved successfully to .env.")
+        return True
 
     def _browse_audio_file(self):
         filetypes = [
@@ -747,9 +1133,9 @@ class STTMeetApp(ctk.CTk):
             messagebox.showerror("Error", "Please select a valid meeting audio file first.")
             return
 
-        api_key = self.api_key_entry.get().strip()
+        api_key = self.api_key_var.get().strip()
         if not api_key:
-            messagebox.showerror("Error", "Gemini API Key is required. Please enter and save your key.")
+            messagebox.showerror("Error", "Gemini API Key is required. Open \u2630 \u2192 Settings to add your key.")
             return
 
         self.is_processing = True
@@ -1040,9 +1426,9 @@ class STTMeetApp(ctk.CTk):
             messagebox.showerror("Error", f"Chunk metadata for index {chunk_index} not found.")
             return
 
-        api_key = self.api_key_entry.get().strip()
+        api_key = self.api_key_var.get().strip()
         if not api_key:
-            messagebox.showerror("Error", "Gemini API key is required.")
+            messagebox.showerror("Error", "Gemini API key is required. Open \u2630 \u2192 Settings to add your key.")
             return
 
         self._update_chunk_monitor_item(chunk_index, "working")
@@ -1183,9 +1569,9 @@ class STTMeetApp(ctk.CTk):
 
         try:
             if not client:
-                api_key = self.api_key_entry.get().strip()
+                api_key = self.api_key_var.get().strip()
                 if not api_key:
-                    raise ValueError("Gemini API key is required to synthesize minutes and action items.")
+                    raise ValueError("Gemini API key is required. Open \u2630 \u2192 Settings to add your key.")
                 client = get_gemini_client(api_key)
 
             transcript_to_use = self.processed_transcript or self.raw_transcript
@@ -1229,9 +1615,9 @@ class STTMeetApp(ctk.CTk):
             messagebox.showwarning("Notice", "No transcript available. Please transcribe audio first.")
             return
 
-        api_key = self.api_key_entry.get().strip()
+        api_key = self.api_key_var.get().strip()
         if not api_key:
-            messagebox.showerror("Error", "Gemini API key is required for minutes synthesis.")
+            messagebox.showerror("Error", "Gemini API key is required for minutes synthesis. Open \u2630 \u2192 Settings.")
             return
 
         if self.is_processing:
@@ -1717,4 +2103,8 @@ class STTMeetApp(ctk.CTk):
                     transcript=transcript_content
                 )
 
-        messagebox.showinfo("Export Successful", f"Documen
+        messagebox.showinfo("Export Successful", f"Document(s) saved successfully!")
+
+def run_app():
+    app = STTMeetApp()
+    app.mainloop()

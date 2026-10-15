@@ -14,6 +14,15 @@ It automatically generates:
 - 📋 **Action Items Matrix / Matriks Tindakan** (Task, PIC, Deadline, Status).
 - 💾 **Executive-Ready Exports**: Microsoft Word (`.docx`), Markdown (`.md`), and Plain Text (`.txt`).
 
+### 🗂️ Slide-In Menu
+Click the **☰** button in the top-left corner for a slide-in drawer holding:
+- **⚙️ Settings / Tetapan** — Gemini API key entry, saved to your local `.env`.
+- **💾 Save Session / Simpan Sesi** — snapshot the current workspace.
+- **📂 Open Log Folder / Buka Folder Log** — jump straight to `sttmeet.log` for troubleshooting.
+- **ℹ️ About / Tentang** — version, FFmpeg status, model in use, and data/cache/log paths.
+
+The drawer displays a live **API Key configured / No API Key** badge. Press `Esc` or click outside the drawer to close it.
+
 ---
 
 ## 🌟 Key Architecture & Features
@@ -135,7 +144,7 @@ python main.py
 ```
 
 ### Usage Steps:
-1. **Enter API Key:** Paste your **Gemini API Key** into the top field and click **Save Key** (saved securely to `.env`, never committed).
+1. **Enter API Key:** Click the **☰** menu in the top-left, choose **⚙️ Settings / Tetapan**, paste your **Gemini API Key**, and click **Save** (saved securely to `.env`, never committed). The menu shows an **API Key configured** badge so you always know the app is ready.
 2. **Select Audio:** Click **📂 Select Audio File** (`.mp3`, `.m4a`, `.wav`, `.aac`, `.ogg`, `.flac`, `.mp4`). The app displays:
    - Total duration
    - File size
