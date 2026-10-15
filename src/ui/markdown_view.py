@@ -12,6 +12,7 @@ Supports toggling between formatted 'Preview' and 'Raw' Markdown.
 import re
 import tkinter as tk
 import customtkinter as ctk
+import textwrap
 from typing import Optional, List, Tuple
 
 
@@ -194,7 +195,7 @@ class MarkdownViewer(ctk.CTkTextbox):
                 self.insert("end", token, base_tag)
 
     def _render_table(self, table_lines: List[str]):
-        """Format and print Markdown tables into neatly aligned column text."""
+        """Format and print Markdown tables into neatly aligned multi-line column text."""
         if not table_lines:
             return
 
@@ -210,39 +211,95 @@ class MarkdownViewer(ctk.CTkTextbox):
         if not rows:
             return
 
-        # Determine column count and max length per column
         num_cols = max(len(r) for r in rows)
-        col_widths = [0] * num_cols
+        if num_cols == 0:
+            return
 
+        # Calculate max natural width across cells (splitting by <br>)
+        natural_widths = [0] * num_cols
         for row_idx, r in enumerate(rows):
             if is_sep_row[row_idx]:
                 continue
-            for col_idx, cell in enumerate(r):
-                # Clean markdown bold/italic tags when computing visible cell width
-                clean_cell = re.sub(r"[*`]", "", cell)
-                if len(clean_cell) > col_widths[col_idx]:
-                    col_widths[col_idx] = len(clean_cell)
-
-        # Cap max column width to keep display bounded
-        col_widths = [max(min(w, 40), 4) for w in col_widths]
-
-        # Render rows
-        for row_idx, r in enumerate(rows):
-            if is_sep_row[row_idx]:
-                # Draw separator line
-                sep_parts = ["─" * (col_widths[c] + 2) for c in range(min(len(r), num_cols))]
-                self.insert("end", "├" + "┼".join(sep_parts) + "┤\n", "table_sep")
-                continue
-
-            row_cells = []
             for col_idx in range(num_cols):
-                raw_val = r[col_idx] if col_idx < len(r) else ""
-                clean_val = re.sub(r"[*`]", "", raw_val)
-                # Left align and pad
-                padded = clean_val[:col_widths[col_idx]].ljust(col_widths[col_idx])
-                row_cells.append(padded)
+                cell = r[col_idx] if col_idx < len(r) else ""
+                parts = re.split(r"<br\s*/?>", cell, flags=re.I)
+                for p in parts:
+                    clean = re.sub(r"[*`]", "", p.strip())
+                    natural_widths[col_idx] = max(natural_widths[col_idx], len(clean))
 
+        # Minimum width based on header length or at least 4 characters
+        header_row = rows[0] if rows else []
+        min_widths = [
+            max(4, len(re.sub(r"[*`]", "", header_row[c].strip()))) if c < len(header_row) else 4
+            for c in range(num_cols)
+        ]
+
+        # Target available width for standard desktop text widget display (~112 chars)
+        target_width = 112
+        border_overhead = 4 + 3 * (num_cols - 1)
+        avail_content_width = max(target_width - border_overhead, sum(min_widths))
+
+        total_natural = sum(natural_widths)
+        actual_widths = list(natural_widths)
+
+        # Scale down large columns proportionally to fit target width with wrapping
+        if total_natural > avail_content_width:
+            small_cols = [c for c in range(num_cols) if natural_widths[c] <= 12]
+            rem = avail_content_width - sum(natural_widths[c] for c in small_cols)
+            flexible_cols = [c for c in range(num_cols) if c not in small_cols]
+            flex_sum = sum(natural_widths[c] for c in flexible_cols)
+
+            for c in range(num_cols):
+                if c in small_cols:
+                    actual_widths[c] = max(min_widths[c], natural_widths[c])
+                else:
+                    ratio = natural_widths[c] / flex_sum if flex_sum > 0 else (1.0 / len(flexible_cols))
+                    allocated = int(rem * ratio)
+                    actual_widths[c] = max(min_widths[c], allocated)
+        else:
+            actual_widths = [max(min_widths[c], natural_widths[c]) for c in range(num_cols)]
+
+        def make_separator(left_ch: str, mid_ch: str, right_ch: str) -> str:
+            sep_parts = ["─" * (actual_widths[c] + 2) for c in range(num_cols)]
+            return left_ch + mid_ch.join(sep_parts) + right_ch + "\n"
+
+        # Top border
+        self.insert("end", make_separator("┌", "┬", "┐"), "table_sep")
+
+        for row_idx, r in enumerate(rows):
+            if is_sep_row[row_idx]:
+                self.insert("end", make_separator("├", "┼", "┤"), "table_sep")
+                continue
+
+            # Break and word-wrap each cell into sublines
+            cell_sublines: List[List[str]] = []
+            for col_idx in range(num_cols):
+                cell_raw = r[col_idx] if col_idx < len(r) else ""
+                parts = re.split(r"<br\s*/?>", cell_raw, flags=re.I)
+                wrapped_lines = []
+                for part in parts:
+                    clean_part = re.sub(r"[*`]", "", part.strip())
+                    if not clean_part:
+                        wrapped_lines.append("")
+                    else:
+                        sub_wrapped = textwrap.wrap(clean_part, width=actual_widths[col_idx])
+                        wrapped_lines.extend(sub_wrapped if sub_wrapped else [""])
+                cell_sublines.append(wrapped_lines if wrapped_lines else [""])
+
+            max_lines_in_row = max(len(sl) for sl in cell_sublines)
             tag = "table_header" if row_idx == 0 else "table_row"
-            self.insert("end", "│ " + " │ ".join(row_cells) + " │\n", tag)
 
+            for line_idx in range(max_lines_in_row):
+                row_cells = []
+                for col_idx in range(num_cols):
+                    cell_val = cell_sublines[col_idx][line_idx] if line_idx < len(cell_sublines[col_idx]) else ""
+                    row_cells.append(cell_val.ljust(actual_widths[col_idx]))
+                self.insert("end", "│ " + " │ ".join(row_cells) + " │\n", tag)
+
+            # Draw a subtle divider between table rows (except after header which already gets separator)
+            if row_idx > 0 and row_idx < len(rows) - 1 and not is_sep_row[row_idx + 1]:
+                self.insert("end", make_separator("├", "┼", "┤"), "table_sep")
+
+        # Bottom border
+        self.insert("end", make_separator("└", "┴", "┘"), "table_sep")
         self.insert("end", "\n")

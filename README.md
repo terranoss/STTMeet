@@ -24,12 +24,14 @@ Click the **☰** button in the top-left corner for a slide-in drawer holding:
 
 The drawer displays a live **API Key configured / No API Key** badge. Press `Esc` or click outside the drawer to close it.
 
-### 🌍 Bilingual Interface / Antara Muka Dwibahasa
-Switch **English**, **Bahasa Melayu**, or **Both** (Malay / English combined) from the drawer's language row. Changes apply **instantly** with no restart, and the choice is remembered in `.sttmeet_cache/prefs.json`. The default is **Both**, so upgrading looks exactly as before until you switch.
+### 🌍 Interface Language / Antara Muka
+Switch **English** or **Bahasa Melayu** from the drawer's language row. Changes apply **instantly** with no restart, and the choice is remembered in `.sttmeet_cache/prefs.json`. The default is **Bahasa Melayu**.
 
-The language selection also drives the **output**: minutes, summary, and action items are generated in the matching language (`English` / `Bahasa Melayu` / `Bilingual`). A read-only **🌐 Output** chip next to **📝 Generate Minutes** always shows which language will be used — click it to jump to the language toggle. The former "Minutes Lang" dropdown has been removed; the menu is the single source of truth.
+The language selection also drives the **output**: minutes, summary, and action items are generated in the matching language (`English` / `Bahasa Melayu`). A read-only **🌐 Output** chip next to **📝 Generate Minutes** always shows which language will be used — click it to jump to the language toggle. The former "Minutes Lang" dropdown has been removed; the menu is the single source of truth.
 
-Exported `.docx` / `.md` / `.txt` documents are intentionally **not** localized and remain bilingual, since Malaysian government bodies commonly require bilingual paperwork.
+Exported `.docx` / `.md` / `.txt` documents are localized to match, including their metadata labels (`Date` / `Tarikh`) and date month names. Filename prefixes stay fixed in Malay (`Minit_`, `Tindakan_`, …) so saved filenames remain stable regardless of the interface language.
+
+> A combined "Malay / English" mode existed in earlier builds and was removed. Interleaved bilingual output degraded both languages and made the exported documents read as mixed-language.
 
 ---
 
@@ -106,7 +108,7 @@ STTMeet/
 │   ├── audio_processor.py      # Preprocessing (16kHz MP3), silence detection, hybrid chunking
 │   ├── gemini_transcriber.py   # Google GenAI Files API upload, polling, prompting, failover, cleanup
 │   ├── transcript_processor.py # Continuous timestamp shifting, overlap dedup, speaker mapping
-│   ├── minutes_generator.py    # Multi-language synthesis (Malay, English, Bilingual)
+│   ├── minutes_generator.py    # Multi-language synthesis (Malay, English)
 │   ├── exporter.py             # Formatted Word (.docx), Markdown (.md), and Text (.txt) exports
 │   ├── session_store.py        # Session save/restore (settings, status, output)
 │   ├── i18n.py                 # UI chrome translations (English / Bahasa Melayu / Both)

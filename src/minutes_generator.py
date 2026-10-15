@@ -6,7 +6,9 @@ Generates Meeting Minutes based on specialized templates from docs/meeting_minut
 - three_column: Item # | Discussion & Deliberation | Action Required & Decision | Responsibility & Deadline table.
 - board_governance: Call to Order & Quorum, Approval of Previous Minutes, Matters for Resolution, Reports, Adjournment & Signatures.
 
-Supports Bahasa Melayu, English, and Bilingual modes.
+Supports Bahasa Melayu and English. A bilingual mode used to exist here but
+was removed: interleaved Malay/English output degraded both languages and made
+the exported documents read as mixed-language.
 """
 from typing import Dict, Any, Callable, Optional, List
 from google import genai
@@ -127,52 +129,6 @@ Based on the meeting transcript below, generate professional Action Minutes in E
 TRANSCRIPT:
 {transcript}
 """,
-        "Bilingual": """Anda adalah setiausaha mesyuarat profesional.
-Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Tindakan Dwibahasa (Action Minutes - Bahasa Melayu & English) mengikut struktur berikut:
-
-# Minit Tindakan Mesyuarat / Action Minutes
-
-**Tajuk / Meeting Title:** [Tajuk Mesyuarat / Meeting Title]  
-**Tarikh & Masa / Date & Time:** [Tarikh & Masa / Date & Time]  
-**Tempat / Pautan / Location:** [Tempat / Location]  
-**Pengerusi / Chairperson:** [Nama / Name]  
-**Pencatat Minit / Minute Taker:** [Nama / Name]  
-**Kehadiran / Attendees:** [Senarai / List]  
-
----
-
-## 1. Objektif Mesyuarat / Meeting Objective
-[Ringkasan 1-2 ayat objektif mesyuarat / 1-2 sentence statement of goal.]
-
----
-
-## 2. Semakan Tindakan Terdahulu / Prior Action Items
-* **[Perkara / Item]:** [Status] — *Nota / Notes:* [Konteks / Context]
-
----
-
-## 3. Agenda & Keputusan / Agenda Items & Decisions Reached
-
-### Agenda 1: [Topik / Topic]
-* **Ringkasan / Summary:** [Ringkasan apa yang dipersetujui / summary of outcome]
-* **Keputusan / Decision:** [Keputusan muktamad / formal decision]
-
----
-
-## 4. Daftar Tindakan / Action Item Register
-
-| Bil / # | Tindakan / Action Item | PIC / Owner | Tarikh Akhir / Target Date | Status |
-| :- | :--- | :--- | :--- | :--- |
-| 1 | [Penerangan / Description] | [Nama / Name] | [Tarikh / Date] | Terbuka / Open |
-
----
-
-## 5. Mesyuarat Seterusnya / Next Meeting
-* **Tarikh & Masa / Date & Time:** [Jika ada / if mentioned]  
-
-TRANSKRIP / TRANSCRIPT:
-{transcript}
-"""
     },
 
     "discussion_minutes": {
@@ -295,49 +251,6 @@ The meeting adjourned at [HH:MM AM/PM].
 TRANSCRIPT:
 {transcript}
 """,
-        "Bilingual": """Anda adalah setiausaha mesyuarat profesional.
-Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Perbincangan Dwibahasa (Discussion Minutes - Bahasa Melayu & English) mengikut format berikut:
-
-# Minit Perbincangan Mesyuarat / Discussion Minutes
-
-**Kumpulan / Committee:** [Nama / Name]  
-**Tarikh & Masa / Date & Time:** [Tarikh & Masa / Date & Time]  
-**Tempat / Platform:** [Bilik / Platform]  
-**Pengerusi / Chairperson:** [Nama / Name]  
-**Kehadiran / Members Present:** [Senarai / List]  
-
----
-
-## 1. Pembukaan & Aluan / Call to Order & Welcome
-[Maklumat pembukaan mesyuarat / Call to order details.]
-
----
-
-## 2. Rekod Perbincangan / Discussion Records by Agenda Item
-
-### Perkara 1 / Item 1: [Topik / Topic]
-* **Latar Belakang / Background:** [Ringkasan pembentangan / Summary of background]
-* **Hujah Utama / Key Arguments:**  
-  * Pandangan menyokong / Points in favor: [...]
-  * Kebimbangan / Concerns: [...]
-* **Konsensus / Consensus & Resolution:** [Ketetapan / Resolution]
-
----
-
-## 3. Arahan & Langkah Seterusnya / Directives & Next Steps
-
-| Rujukan / Ref | Arahan / Directive | PIC / Lead | Tarikh Akhir / Deadline |
-| :--- | :--- | :--- | :--- |
-| Item 1 | [Arahan / Directive] | [Nama / Dept] | [Tarikh / Date] |
-
----
-
-## 4. Penangguhan / Adjournment
-Mesyuarat ditangguhkan pada / Meeting adjourned at [Masa / Time].  
-
-TRANSKRIP / TRANSCRIPT:
-{transcript}
-"""
     },
 
     "three_column": {
@@ -395,31 +308,6 @@ Based on the meeting transcript below, generate structured Three-Column Meeting 
 TRANSCRIPT:
 {transcript}
 """,
-        "Bilingual": """Anda adalah setiausaha mesyuarat profesional.
-Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Mesyuarat Tiga Lajur Dwibahasa (Three-Column Minutes - Bahasa Melayu & English) mengikut format matriks berikut:
-
-# Minit Tiga Lajur / Three-Column Meeting Minutes
-
-**Projek / Project:** [Nama / Name]  
-**Tarikh & Masa / Date & Time:** [Tarikh & Masa / Date & Time]  
-**Tempat / Location:** [Tempat / Location]  
-**Fasilitator / Pengerusi:** [Nama / Name]  
-**Kehadiran / Attendees:** [Senarai Hadir / Attendees List]  
-
----
-
-| Bil / Item # | Perbincangan / Discussion & Deliberation | Tindakan & Keputusan / Action & Decision | Tanggungjawab & Tarikh / Responsibility & Due |
-| :---: | :--- | :--- | :---: |
-| **1.0** | **[Topik / Topic 1]**<br>[Ringkasan perbincangan / Discussion summary]. | [Tindakan dan keputusan / Action required and decision]. | **[PIC]**<br>*Tarikh / Due: DD/MM/YYYY* |
-| **2.0** | **[Topik / Topic 2]**<br>[Perbincangan / Discussion details]. | [Tindakan / Action item]. | **[PIC]**<br>*Tarikh / Due: DD/MM/YYYY* |
-
----
-
-**Mesyuarat Seterusnya / Next Meeting:** [Maklumat jika ada / Details if mentioned]
-
-TRANSKRIP / TRANSCRIPT:
-{transcript}
-"""
     },
 
     "board_governance": {
@@ -571,50 +459,6 @@ Date: [DD/MM/YYYY]
 TRANSCRIPT:
 {transcript}
 """,
-        "Bilingual": """Anda adalah setiausaha korporat profesional.
-Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Rasmi Lembaga Pengarah Dwibahasa (Board Governance Minutes - Bahasa Melayu & English) mengikut struktur rasmi tadbir urus berikut:
-
-# Minit Lembaga Pengarah / Board of Directors Meeting Minutes
-
-**Nama Organisasi / Organization Name:** [Nama / Name]  
-**Jenis Mesyuarat / Meeting Type:** Mesyuarat Lembaga Pengarah / Board of Directors Meeting  
-**Tarikh & Masa / Date & Time:** [Tarikh & Masa / Date & Time]  
-**Tempat / Location:** [Tempat / Location]  
-
----
-
-## 1. Pembukaan & Kehadiran / Opening & Attendance
-* **Panggilan / Call to Order:** Mesyuarat dimulakan pada / Called to order at [Masa / Time] oleh / by [Nama / Name].
-* **Korum / Quorum:** Korum disahkan mencukupi / Quorum confirmed present.
-* **Kehadiran / Present:** [Senarai / List]  
-
----
-
-## 2. Pengesahan Minit Lalu / Approval of Previous Minutes
-* **Ketetapan / Resolution:** Minit mesyuarat lalu diluluskan / Approved as circulated.
-
----
-
-## 3. Resolusi & Usul Rasmi / Matters for Resolution & Formal Motions
-
-### Resolusi 1 / Resolution 1: [Tajuk / Subject]
-* **Usul / Motion:** Dicadangkan oleh / Moved by [Nama] dan disokong oleh / seconded by [Nama] bahawa:
-  > *"DIPERSETUJUI / RESOLVED, bahawa Lembaga Pengarah meluluskan / that the Board approves [butiran / details]."*
-* **Keputusan / Disposition:** Usul diluluskan / Motion carried.
-
----
-
-## 4. Laporan / Reports Received
-* [Laporan Kewangan / CFO Report & Prestasi / CEO Report]
-
----
-
-## 5. Penangguhan & Tandatangan / Adjournment & Signatures
-Ditangguhkan pada / Adjourned at [Masa / Time].  
-
-TRANSKRIP / TRANSCRIPT:
-{transcript}
-"""
     }
 }
 
@@ -758,26 +602,6 @@ Berdasarkan transkrip mesyuarat di bawah, kenal pasti dan susun semua tindakan, 
 TRANSKRIP MESYUARAT:
 {transcript}
 """,
-    "Bilingual": """Anda adalah pengurus projek dan setiausaha mesyuarat dwibahasa profesional.
-Berdasarkan transkrip mesyuarat di bawah, hasilkan Daftar Tindakan Dwibahasa (Action Items Register - Bahasa Melayu & English) mengikut struktur berikut:
-
-# Senarai Tindakan Mesyuarat / Action Items Register
-
-## Daftar Tindakan / Action Items
-
-| Bil / # | Tindakan / Task | PIC / Owner | Tarikh / Target Date | Status |
-| :- | :--- | :--- | :--- | :--- |
-| 1 | [Penerangan tindakan / Action description] | [Nama / Name] | [Tarikh / Date] | Belum Mula / Open |
-
-## Kebergantungan & Kekangan / Dependencies & Blockers
-* **[Perkara / Item 1]:** [Keterangan / Description].
-
-## Keperluan Susulan / Follow-up Requirements
-* **[Susulan / Follow-up 1]:** [Keterangan / Description].
-
-TRANSKRIP MESYUARAT / TRANSCRIPT:
-{transcript}
-"""
 }
 
 

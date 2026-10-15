@@ -5,7 +5,7 @@ Features:
 - Slide-in hamburger menu: Settings (API Key), Save Session, Log folder, About
 - Settings modal: API Key configuration & verification, FFmpeg check
 - Audio File Picker with duration, size, and cost estimation
-- Language Selection (Bahasa Melayu, English, Bilingual)
+- Language Selection (Bahasa Melayu, English)
 - Chunking controls & Audio Pre-processing toggle
 - Live chunk-by-chunk progress bar & status updates
 - Threaded execution with non-freezing UI and Cancel capability
@@ -82,6 +82,7 @@ from ..minutes_generator import (
 from ..recap_generator import generate_meeting_recap
 from .markdown_view import MarkdownViewer
 from ..exporter import (
+    DocxUnavailableError,
     export_to_docx,
     export_to_markdown,
     export_to_text
@@ -380,6 +381,7 @@ class STTMeetApp(ctk.CTk):
         self.generated_minutes: str = ""
         self.generated_recap: str = ""
         self.generated_actions: str = ""
+        self.cached_minutes_by_template: Dict[str, str] = {}
         self.detected_speakers: List[str] = []
         self.speaker_entries: Dict[str, ctk.CTkEntry] = {}
         self.speaker_mapping: Dict[str, str] = {}
@@ -507,10 +509,7 @@ class STTMeetApp(ctk.CTk):
         chip_var = getattr(self, "_output_lang_var", None)
         if chip_var is None:
             return
-        # In combined mode the chip label already carries both languages, so the
-        # value stays a single name instead of expanding to "Bilingual / Dwibahasa".
-        value_locale = "en" if self.ui_locale == "both" else self.ui_locale
-        display = display_minutes_lang(self.lang_var.get(), value_locale)
+        display = display_minutes_lang(self.lang_var.get(), self.ui_locale)
         chip_var.set(self._t("control.output_lang", value=display))
 
     def _open_menu_for_language(self):
@@ -595,9 +594,6 @@ class STTMeetApp(ctk.CTk):
         known = set()
         for entry in translate_module.STRINGS.values():
             known.update(v for v in entry.values())
-            # The combined mode renders an auto-joined string that is not stored
-            # verbatim, so include the rendered form to avoid false positives.
-            known.add(translate_module._resolve_mode(entry, "both"))
             known.add(translate_module._resolve_mode(entry, "en"))
             known.add(translate_module._resolve_mode(entry, "ms"))
         known.update(translate_module.MODE_NAMES.values())
@@ -960,7 +956,7 @@ class STTMeetApp(ctk.CTk):
         self._i18n_widgets.append((btn, key, fmt))
 
     def _refresh_locale_toggle(self):
-        """Highlight the active language button and re-label all three."""
+        """Highlight the active language button and re-label all of them."""
         for mode, btn in getattr(self, "_locale_buttons", {}).items():
             if not btn.winfo_exists():
                 continue
@@ -1769,6 +1765,23 @@ class STTMeetApp(ctk.CTk):
                 self.template_var.set(k)
                 save_pref("template", k)
                 log.info("Meeting minute template changed to: %s", k)
+
+                # If this template was already generated and cached, load it instantly into view
+                cached_text = self.cached_minutes_by_template.get(k)
+                if cached_text:
+                    self.generated_minutes = cached_text
+                    sections = parse_minutes_sections(cached_text)
+                    self._populate_minutes_tabs(sections)
+                    self._hide_minutes_error_banner()
+                else:
+                    # Switch to empty view for this template so user can click Generate
+                    self.generated_minutes = ""
+                    self.txt_minutes.delete("1.0", "end")
+
+                # If transcript is available and pipeline is not busy, enable Generate Minutes button
+                has_transcript = bool((self.processed_transcript or self.raw_transcript).strip())
+                if has_transcript and not self.is_processing:
+                    self.gen_minutes_btn.configure(state="normal")
                 break
 
     def _chunk_display_values(self):
@@ -2323,6 +2336,7 @@ class STTMeetApp(ctk.CTk):
             )
 
             sections = parse_minutes_sections(self.generated_minutes)
+            self.cached_minutes_by_template[template] = self.generated_minutes
             self.after(0, lambda secs=sections: self._populate_minutes_tabs(secs))
             self.after(0, self._hide_minutes_error_banner)
             self._update_step_badge("step4", "done")
@@ -2369,6 +2383,17 @@ class STTMeetApp(ctk.CTk):
         if self.is_processing:
             messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
             return
+
+        current_template = self.template_var.get()
+        # If this template was already generated, warn the user before overwriting
+        if current_template in self.cached_minutes_by_template or (self.generated_minutes and self.generated_minutes.strip()):
+            template_label = display_template_name(current_template, self.ui_locale)
+            confirm = messagebox.askyesno(
+                self._t("msg.notice"),
+                self._t("msg.minutes_already_generated", template=template_label)
+            )
+            if not confirm:
+                return
 
         self.is_processing = True
         self.cancel_event.clear()
@@ -2604,7 +2629,8 @@ class STTMeetApp(ctk.CTk):
             generated_recap=self.generated_recap,
             generated_actions=self.generated_actions,
             detected_speakers=self.detected_speakers,
-            speaker_mapping=self.speaker_mapping
+            speaker_mapping=self.speaker_mapping,
+            cached_minutes_by_template=self.cached_minutes_by_template
         )
 
         session_file = session_path(CACHE_DIR, audio_hash)
@@ -2671,6 +2697,12 @@ class STTMeetApp(ctk.CTk):
             self.generated_minutes = data["generated_minutes"]
             self.generated_recap = data.get("generated_recap", "") or ""
             self.generated_actions = data.get("generated_actions", "") or ""
+            self.cached_minutes_by_template = dict(data.get("cached_minutes_by_template", {}) or {})
+            # If a legacy session has generated_minutes but empty cached_minutes_by_template, backfill it
+            saved_template = data.get("settings", {}).get("template", "action_minutes")
+            if self.generated_minutes and saved_template not in self.cached_minutes_by_template:
+                self.cached_minutes_by_template[saved_template] = self.generated_minutes
+
             self.detected_speakers = data["detected_speakers"]
             self.speaker_mapping = data["speaker_mapping"]
             self.active_file_hash = audio_hash
@@ -2783,6 +2815,7 @@ class STTMeetApp(ctk.CTk):
         self.generated_minutes = ""
         self.generated_recap = ""
         self.generated_actions = ""
+        self.cached_minutes_by_template = {}
         self.detected_speakers = []
         self.speaker_mapping = {}
         self.active_chunks_meta = []
@@ -2886,6 +2919,9 @@ class STTMeetApp(ctk.CTk):
         self.is_processing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+        self.gen_minutes_btn.configure(state="normal")
+        self.gen_recap_btn.configure(state="normal")
+        self.gen_actions_btn.configure(state="normal")
         messagebox.showinfo(
             self._t("msg.completed"),
             self._t("msg.completed_body")
@@ -3005,29 +3041,27 @@ class STTMeetApp(ctk.CTk):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = Path(self.selected_audio_file).stem if self.selected_audio_file else "Meeting"
 
-        # Determine content, title, and filename prefix based on the active tab
+        # Determine content, title, and filename prefix based on the active tab.
+        # Titles follow the interface language; filename prefixes deliberately
+        # stay fixed so saved filenames are stable across a language switch.
         if active_tab == "tab_transcript":
             content = self.processed_transcript or self.raw_transcript
-            tab_name = "Transkrip"
-            title = f"Transkrip Audio - {base_name}"
+            title = self._t("export.title_transcript", name=base_name)
             prefix = "Transkrip"
             include_appendix = False
         elif active_tab == "tab_recap":
             content = self.generated_recap
-            tab_name = "Recap"
-            title = f"Executive Meeting Recap - {base_name}"
+            title = self._t("export.title_recap", name=base_name)
             prefix = "Recap"
             include_appendix = False
         elif active_tab == "tab_actions":
             content = self.generated_actions
-            tab_name = "Tindakan"
-            title = f"Tindakan & Keputusan - {base_name}"
+            title = self._t("export.title_actions", name=base_name)
             prefix = "Tindakan"
             include_appendix = False
         else:  # "tab_minutes"
             content = self.generated_minutes
-            tab_name = "Minit"
-            title = f"Minit Mesyuarat - {base_name}"
+            title = self._t("export.title_minutes", name=base_name)
             prefix = "Minit"
             include_appendix = True
 
@@ -3048,13 +3082,18 @@ class STTMeetApp(ctk.CTk):
                 filetypes=[(self._t("filepicker.word_doc"), "*.docx")]
             )
             if save_path:
-                export_to_docx(
-                    file_path=save_path,
-                    title=title,
-                    minutes_text=content,
-                    raw_transcript=self.processed_transcript if include_appendix else None
-                )
-                exported_any = True
+                try:
+                    export_to_docx(
+                        file_path=save_path,
+                        title=title,
+                        minutes_text=content,
+                        raw_transcript=self.processed_transcript if include_appendix else None,
+                        locale=self.ui_locale
+                    )
+                except DocxUnavailableError as exc:
+                    messagebox.showerror(self._t("msg.error"), exc.message)
+                else:
+                    exported_any = True
 
         if fmt in ["txt", "all"]:
             save_path = filedialog.asksaveasfilename(
@@ -3068,7 +3107,8 @@ class STTMeetApp(ctk.CTk):
                     file_path=save_path,
                     title=title,
                     minutes_text=content,
-                    transcript=self.processed_transcript if include_appendix else None
+                    transcript=self.processed_transcript if include_appendix else None,
+                    locale=self.ui_locale
                 )
                 exported_any = True
 

@@ -9,7 +9,9 @@ Generates Executive Meeting Recaps based on docs/executive_meeting_recap_templat
 - Open Items & Parking Lot
 - Next Scheduled Meeting
 
-Supports English, Bahasa Melayu, and Bilingual modes.
+Supports English and Bahasa Melayu. A bilingual mode used to exist here but
+was removed: interleaved Malay/English output degraded both languages and made
+the exported documents read as mixed-language.
 """
 from typing import Dict, Any, Callable, Optional, List
 from google import genai
@@ -172,71 +174,6 @@ Berdasarkan transkrip mesyuarat di bawah, hasilkan Rekap Mesyuarat Eksekutif (Ex
 TRANSKRIP MESYUARAT:
 {transcript}
 """,
-    "Bilingual": """Anda adalah pembantu eksekutif dan setiausaha mesyuarat dwibahasa profesional.
-Berdasarkan transkrip mesyuarat di bawah, hasilkan Rekap Mesyuarat Eksekutif Dwibahasa (Executive Meeting Recap - Bahasa Melayu & English) mengikut struktur berikut:
-
-# Rekap Mesyuarat Eksekutif / Executive Meeting Recap
-
-**Tajuk Mesyuarat / Meeting Title:** [Nama Projek / Project Name]  
-**Tarikh & Masa / Date & Time:** [Tarikh & Masa / Date & Time]  
-**Tempoh / Duration:** [cth., 45 minit / e.g., 45 mins]  
-**Fasilitator / Facilitator:** [Nama / Name]  
-**Kehadiran / Attendees:** [Senarai Kehadiran / List of Attendees]  
-**Tidak Hadir / Absent / Apologies:** [Nama / Name]  
-
----
-
-## 1. Ringkasan Eksekutif (TL;DR) / Executive Summary
-> Gambaran ringkas 2–3 ayat mengenai objektif utama mesyuarat, persetujuan bersama yang dicapai, dan hala tuju keseluruhan / A concise 2–3 sentence overview.
-
-* [Ayat 1 / Sentence 1: Tujuan mesyuarat / Purpose and updates]
-* [Ayat 2 / Sentence 2: Konsensus utama yang dicapai / Major consensus reached]
-* [Ayat 3 / Sentence 3: Keutamaan serta-merta / Immediate priority]
-
----
-
-## 2. Keputusan Utama / Key Decisions Made
-*Keputusan berimpak tinggi yang dimuktamadkan / High-impact decisions finalized.*
-
-* **Keputusan 1 / Decision 1:** [Kenyataan keputusan / Statement of decision] — *Rasional / Rationale:* [Sebab ringkas / Brief reason].
-* **Keputusan 2 / Decision 2:** [Kenyataan keputusan / Statement of decision] — *Rasional / Rationale:* [Sebab ringkas / Brief reason].
-
----
-
-## 3. Tindakan & Penyerahan / Action Items & Deliverables
-
-| Tugasan / Task | PIC / Owner | Tarikh / Target Date | Status |
-| :--- | :--- | :--- | :--- |
-| [Penerangan tindakan / Action description] | [Nama / Name] | [Tarikh / Date] | Belum Mula / Not Started |
-| [Penerangan tindakan / Action description] | [Nama / Name] | [Tarikh / Date] | Dalam Tindakan / In Progress |
-
----
-
-## 4. Perbincangan Strategik / Strategic Discussion Highlights
-
-### Topik A / Topic A: [Tema Agenda / Agenda Theme]
-* **Konteks & Dapatan / Context & Findings:** [Ringkasan konteks / Summary of findings].
-* **Pandangan / Key Perspectives:** [Pandangan peserta / Perspectives raised].
-* **Hasil / Outcome:** [Keputusan atau tindakan / Outcome reached].
-
----
-
-## 5. Risiko & Kebergantungan / Risks & Dependencies
-* **[Risiko / Risk 1]:** [Penerangan / Description] — *Mitigasi / Mitigation:* [PIC].
-* **[Kebergantungan / Dependency 2]:** [Keterangan / Description].
-
----
-
-## 6. Perkara Tertangguh / Open Items & Parking Lot
-* **Perkara / Item 1:** [Topik ditangguhkan / Deferred topic].
-
----
-
-**Mesyuarat Seterusnya / Next Meeting:** [Tarikh & Masa / Date & Time]
-
-TRANSKRIP MESYUARAT / TRANSCRIPT:
-{transcript}
-"""
 }
 
 
