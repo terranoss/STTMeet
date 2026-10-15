@@ -165,7 +165,7 @@ python main.py
    - **Minutes language:** follows the interface language set in the **☰** menu; the **🌐 Output** chip shows the current value.
    - **Chunk:** 15 / 20 / 25 (recommended) / 30 / 45 minutes.
    - **Pre-process (16kHz Mono):** Checked by default for ~10x faster uploads.
-4. **Click ▶ Transcribe Audio:**
+4. **Click ▶ Start:**
    - Watch live progress on the step badges and progress bar.
    - Click **📊 Monitor Chunks** to see per-chunk status; use **↻ Reprocess** on any failed chunk, then **Extract Transcript** to pull completed chunks into the workspace.
 5. **Generate Minutes:**

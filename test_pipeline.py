@@ -199,7 +199,7 @@ def test_translate_explicit_both_overrides_auto_join():
     assert translate("tab.summary", "both") == "Ringkasan / Summary"
     # Entries without an explicit variant are auto-joined English / Bahasa.
     assert "both" not in STRINGS["btn.transcribe"]
-    assert translate("btn.transcribe", "both").endswith("Transcribe Audio / Transkrip Audio")
+    assert translate("btn.transcribe", "both").endswith("Start / Mula")
 
 def test_translate_both_does_not_duplicate_leading_emoji():
     for key, entry in STRINGS.items():

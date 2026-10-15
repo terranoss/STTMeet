@@ -165,7 +165,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "control.template": {"en": "Meeting Minute Format:", "ms": "Format Minit Mesyuarat:"},
     "control.preprocess": {"en": "Pre-process (16kHz Mono)", "ms": "Praproses (16kHz Mono)"},
     "control.output_lang": {"en": "🌐 Output: {value}", "ms": "🌐 Keluaran: {value}"},
-    "btn.transcribe": {"en": "▶ Transcribe Audio", "ms": "▶ Transkrip Audio"},
+    "btn.transcribe": {"en": "▶ Start", "ms": "▶ Mula"},
     "btn.generate_minutes": {"en": "📝 Generate Minutes", "ms": "📝 Jana Minit"},
     "btn.cancel": {"en": "⏹ Cancel", "ms": "⏹ Batal"},
     "btn.monitor": {"en": "📊 Monitor Chunks", "ms": "📊 Pantau Potongan"},
@@ -207,8 +207,8 @@ STRINGS: Dict[str, Dict[str, str]] = {
 
     # --- Status bar ---------------------------------------------------
     "status.ready": {
-        "en": "Ready. Select an audio file and click Transcribe Audio.",
-        "ms": "Sedia. Pilih fail audio dan klik Transkrip Audio.",
+        "en": "Ready. Select an audio file and click Start.",
+        "ms": "Sedia. Pilih fail audio dan klik Mula.",
     },
     "status.log_opened": {"en": "Opened log folder: {folder}", "ms": "Folder log dibuka: {folder}"},
     "status.key_saved": {"en": "Gemini API Key saved successfully.", "ms": "Kunci API Gemini berjaya disimpan."},
@@ -489,7 +489,7 @@ def _join_both(en: str, ms: str) -> str:
     """
     Combine two variants for COMBINED mode.
 
-    A shared leading emoji ("▶ Transcribe Audio" / "▶ Transkrip Audio") is
+    A shared leading emoji ("▶ Start" / "▶ Mula") is
     dropped from the second half so the icon is not rendered twice.
     """
     symbol = _leading_symbol(en)
