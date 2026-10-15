@@ -1833,6 +1833,26 @@ class STTMeetApp(ctk.CTk):
             return "gemini-3-flash"
         return None
 
+    def _is_diarization_supported(
+        self,
+        chunk_mins: Optional[int] = None,
+        engine_choice: Optional[str] = None
+    ) -> bool:
+        """
+        Returns True only if:
+        1. No chunking is selected (chunk_minutes <= 0).
+        2. The engine is not a weak model (e.g. Gemini 3.5 Flash Lite).
+        """
+        if chunk_mins is None:
+            chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
+        if engine_choice is None:
+            engine_choice = self.engine_var.get()
+        if chunk_mins > 0:
+            return False
+        if "Flash Lite" in str(engine_choice) or "lite" in str(engine_choice).lower():
+            return False
+        return True
+
     def _on_engine_changed(self, choice: str):
         """Reset chunking back to the default whenever the engine changes."""
         self.chunk_size_var.set("25 min")
@@ -2124,6 +2144,7 @@ class STTMeetApp(ctk.CTk):
                 try:
                     if not client:
                         raise ValueError("Gemini API Client is required.")
+                    can_diarize = self._is_diarization_supported(chunk_minutes, self.engine_var.get())
                     raw_chunk_text = transcribe_audio_chunk(
                         client=client,
                         chunk_file_path=chunk_info["file_path"],
@@ -2133,7 +2154,7 @@ class STTMeetApp(ctk.CTk):
                         ),
                         model_override=model_override,
                         cancel_event=self.cancel_event,
-                        diarize=(chunk_minutes <= 0)
+                        diarize=can_diarize
                     )
 
                     adjusted_text = adjust_chunk_timestamps(
@@ -2269,13 +2290,14 @@ class STTMeetApp(ctk.CTk):
                 tail_context = "\n".join(lines[-4:]) if lines else ""
 
                 chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
+                can_diarize = self._is_diarization_supported(chunk_mins, self.engine_var.get())
                 raw_text = transcribe_audio_chunk(
                     client=client,
                     chunk_file_path=chunk_info["file_path"],
                     previous_tail_transcript=tail_context,
                     model_override=getattr(self, "active_model_override", None),
                     cancel_event=self.cancel_event,
-                    diarize=(chunk_mins <= 0)
+                    diarize=can_diarize
                 )
 
                 adjusted_text = adjust_chunk_timestamps(raw_text, offset_seconds=chunk_info["offset_seconds"])
@@ -2374,9 +2396,8 @@ class STTMeetApp(ctk.CTk):
         self.gen_recap_btn.configure(state="normal")
         self.gen_actions_btn.configure(state="normal")
 
-        # Speaker identification is only enabled if No Chunking was selected
-        chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
-        if chunk_mins <= 0 and self.detected_speakers:
+        # Speaker identification is only enabled if No Chunking was selected and model is capable
+        if self._is_diarization_supported() and self.detected_speakers:
             self.speaker_btn.configure(state="normal")
         else:
             self.speaker_btn.configure(state="disabled")
@@ -2823,7 +2844,8 @@ class STTMeetApp(ctk.CTk):
                 self.gen_recap_btn.configure(state="normal")
                 self.gen_actions_btn.configure(state="normal")
                 saved_chunk_mins = data.get("settings", {}).get("chunk_minutes", DEFAULT_CHUNK_MINUTES)
-                if saved_chunk_mins <= 0 and self.detected_speakers:
+                saved_engine = data.get("settings", {}).get("engine", "")
+                if self._is_diarization_supported(saved_chunk_mins, saved_engine) and self.detected_speakers:
                     self.speaker_btn.configure(state="normal")
                 else:
                     self.speaker_btn.configure(state="disabled")
@@ -3074,6 +3096,11 @@ class STTMeetApp(ctk.CTk):
     # Speaker Mapping Dialog
     # -------------------------------------------------------------
     def _open_speaker_mapping_dialog(self):
+        engine_choice = self.engine_var.get()
+        if "Flash Lite" in engine_choice or "lite" in engine_choice.lower():
+            messagebox.showinfo(self._t("msg.speaker_mapping"), self._t("msg.speaker_mapping_weak_model"))
+            return
+
         chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
         if chunk_mins > 0:
             messagebox.showinfo(self._t("msg.speaker_mapping"), self._t("msg.speaker_mapping_no_chunk"))

@@ -365,13 +365,17 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "settings.engine": {"en": "Engine:", "ms": "Enjin:"},
     "settings.chunk": {"en": "Chunk duration:", "ms": "Tempoh potongan:"},
     "settings.chunk_note": {
-        "en": "💡 Speaker ID only works with 'No Chunking' (ensures voice consistency).\nRecommended: Use for meetings under 60–90 mins. For longer audio, use chunks (Speaker ID disabled).",
-        "ms": "💡 ID Penceramah hanya berfungsi dengan 'Tiada Pemotongan' (menjamin ketepatan suara).\nDisyorkan: Gunakan untuk mesyuarat bawah 60–90 minit. Untuk audio lebih panjang, gunakan potongan (ID Penceramah dimatikan).",
+        "en": "💡 Speaker ID requires 'No Chunking' and standard Flash models (disabled for Flash Lite & chunked audio).\nRecommended: Use for meetings under 60–90 mins.",
+        "ms": "💡 ID Penceramah memerlukan 'Tiada Pemotongan' dan model Flash standard (dimatikan untuk Flash Lite & audio berpotongan).\nDisyorkan: Gunakan untuk mesyuarat bawah 60–90 minit.",
     },
     "chunk.no_chunk": {"en": "No Chunking (Single File)", "ms": "Tiada Pemotongan (Satu Fail)"},
     "msg.speaker_mapping_no_chunk": {
         "en": "Speaker identification is only available when 'No Chunking' is selected in Settings.",
         "ms": "Pengenalpastian penceramah hanya tersedia apabila 'Tiada Pemotongan' dipilih dalam Tetapan.",
+    },
+    "msg.speaker_mapping_weak_model": {
+        "en": "Speaker identification is not supported for Gemini Flash Lite. Please choose Gemini 3 Flash or Auto-Failover with 'No Chunking'.",
+        "ms": "Pengenalpastian penceramah tidak disokong untuk Gemini Flash Lite. Sila pilih Gemini 3 Flash atau Auto-Failover dengan 'Tiada Pemotongan'.",
     },
     "settings.template": {"en": "Meeting Minute Format:", "ms": "Format Minit Mesyuarat:"},
     "settings.clear": {"en": "🗑  Clear Key", "ms": "🗑  Kosongkan Kunci"},

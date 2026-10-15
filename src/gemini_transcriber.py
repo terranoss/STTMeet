@@ -123,32 +123,6 @@ def transcribe_audio_chunk(
     """
     uploaded_file = None
 
-    if diarize:
-        speaker_rule = "Speaker Diarization: Label speakers consistently based on acoustic voice characteristics as 'Speaker 1', 'Speaker 2', etc."
-        output_format = "[MM:SS] Speaker X: <Spoken content>\n[MM:SS] Speaker Y: <Spoken content>\n..."
-    else:
-        speaker_rule = "Clean Transcription: Do NOT guess or label speaker numbers. Transcribe speech naturally with time markers only."
-        output_format = "[MM:SS] <Spoken content>\n[MM:SS] <Spoken content>\n..."
-
-    # Build speaker continuity guidance if previous chunk context is available
-    if diarize and previous_tail_transcript and previous_tail_transcript.strip():
-        continuity_note = f"""
-SPEAKER CONTINUITY GUIDANCE:
-The immediately preceding segment ended with the following conversation:
----
-{previous_tail_transcript.strip()}
----
-Maintain the same Speaker numbers (Speaker 1, Speaker 2, etc.) for the corresponding voices.
-"""
-    else:
-        continuity_note = ""
-
-    formatted_prompt = MALAY_ROJAK_TRANSCRIPTION_PROMPT.format(
-        speaker_rule=speaker_rule,
-        output_format=output_format,
-        speaker_continuity_context=continuity_note
-    )
-
     # Build candidate models list: preferred model first, followed by remaining fallback models
     preferred = model_override or MODEL_NAME
     models_to_try = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
@@ -158,6 +132,35 @@ Maintain the same Speaker numbers (Speaker 1, Speaker 2, etc.) for the correspon
     for model_candidate in models_to_try:
         raise_if_cancelled(cancel_event)
         log.info("Attempting transcription with model: %s", model_candidate)
+
+        # Disable diarization for weak models (e.g. Gemini 3.5 Flash Lite)
+        effective_diarize = diarize and ("lite" not in model_candidate.lower())
+
+        if effective_diarize:
+            speaker_rule = "Speaker Diarization: Label speakers consistently based on acoustic voice characteristics as 'Speaker 1', 'Speaker 2', etc."
+            output_format = "[MM:SS] Speaker X: <Spoken content>\n[MM:SS] Speaker Y: <Spoken content>\n..."
+        else:
+            speaker_rule = "Clean Transcription: Do NOT guess or label speaker numbers. Transcribe speech naturally with time markers only."
+            output_format = "[MM:SS] <Spoken content>\n[MM:SS] <Spoken content>\n..."
+
+        # Build speaker continuity guidance if previous chunk context is available
+        if effective_diarize and previous_tail_transcript and previous_tail_transcript.strip():
+            continuity_note = f"""
+SPEAKER CONTINUITY GUIDANCE:
+The immediately preceding segment ended with the following conversation:
+---
+{previous_tail_transcript.strip()}
+---
+Maintain the same Speaker numbers (Speaker 1, Speaker 2, etc.) for the corresponding voices.
+"""
+        else:
+            continuity_note = ""
+
+        formatted_prompt = MALAY_ROJAK_TRANSCRIPTION_PROMPT.format(
+            speaker_rule=speaker_rule,
+            output_format=output_format,
+            speaker_continuity_context=continuity_note
+        )
         uploaded_file = None
 
         try:

@@ -555,6 +555,33 @@ def test_action_items_prompts():
         assert "# " in prompt
         assert "Action" in prompt or "Tindakan" in prompt
 
+def test_weak_model_diarization_policy():
+    # Helper policy simulation matching AppWindow._is_diarization_supported
+    def is_diarization_supported(chunk_mins: int, engine_choice: str) -> bool:
+        if chunk_mins > 0:
+            return False
+        if "Flash Lite" in str(engine_choice) or "lite" in str(engine_choice).lower():
+            return False
+        return True
+
+    # 1. Chunked audio must never diarize
+    assert is_diarization_supported(25, "☁️ Gemini 3 Flash") is False
+    assert is_diarization_supported(15, "⚡ Gemini Cloud (Auto-Failover)") is False
+
+    # 2. No chunking with Flash Lite must NOT diarize
+    assert is_diarization_supported(0, "☁️ Gemini 3.5 Flash Lite") is False
+    assert is_diarization_supported(0, "gemini-3.5-flash-lite") is False
+
+    # 3. No chunking with capable models MUST diarize
+    assert is_diarization_supported(0, "☁️ Gemini 3 Flash") is True
+    assert is_diarization_supported(0, "☁️ Gemini 3.8 Flash") is True
+    assert is_diarization_supported(0, "☁️ Gemini 3.5 Flash") is True
+    assert is_diarization_supported(0, "⚡ Gemini Cloud (Auto-Failover)") is True
+
+    # 4. Verify i18n keys exist
+    assert has_key("msg.speaker_mapping_weak_model")
+    assert has_key("settings.chunk_note")
+
 if __name__ == "__main__":
     test_time_conversions()
     test_adjust_chunk_timestamps()
@@ -602,4 +629,6 @@ if __name__ == "__main__":
     test_parse_minutes_sections_for_templates()
     test_recap_prompts()
     test_action_items_prompts()
+    test_weak_model_diarization_policy()
     print("All unit tests passed successfully!")
+
