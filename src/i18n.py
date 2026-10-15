@@ -89,6 +89,8 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "ffmpeg.missing": {"en": "FFmpeg: ❌ Not Found in PATH", "ms": "FFmpeg: ❌ Tidak Dijumpai dalam PATH"},
 
     # --- Drawer menu --------------------------------------------------
+    "menu.section_general": {"en": "GENERAL", "ms": "UTAMA"},
+    "menu.section_tools": {"en": "TOOLS & ABOUT", "ms": "ALAT & TENTANG"},
     "menu.language_label": {"en": "🌐  Language / Bahasa", "ms": "🌐  Bahasa / Language"},
     "menu.settings": {"en": "Settings", "ms": "Tetapan"},
     "menu.save_session": {"en": "Save Session", "ms": "Simpan Sesi"},

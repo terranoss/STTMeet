@@ -381,6 +381,20 @@ class STTMeetApp(ctk.CTk):
         self._check_initial_environment()
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         self.bind("<Escape>", self._on_escape_key)
+        self._start_maximized()
+
+    def _start_maximized(self):
+        """Open the dashboard maximized on the primary display."""
+        try:
+            # Flush the pending geometry request first, otherwise the "zoomed"
+            # state can be applied and then immediately undone by it.
+            self.update_idletasks()
+            self.state("zoomed")
+        except Exception:
+            try:
+                self.attributes("-zoomed", True)
+            except Exception:
+                pass  # Fall back to the 1100x820 geometry set above.
 
     def _build_ui(self):
         # Master Grid Layout
@@ -465,11 +479,18 @@ class STTMeetApp(ctk.CTk):
 
     def _retranslate_ui(self):
         """Re-apply every registered string plus the widgets with custom logic."""
-        for widget, key in self._i18n_widgets:
+        for item in self._i18n_widgets:
             try:
-                if not widget.winfo_exists():
-                    continue
-                widget.configure(text=self._t(key))
+                if len(item) == 3:
+                    widget, key, fmt_fn = item
+                    if not widget.winfo_exists():
+                        continue
+                    widget.configure(text=fmt_fn(self._t(key)))
+                else:
+                    widget, key = item
+                    if not widget.winfo_exists():
+                        continue
+                    widget.configure(text=self._t(key))
             except Exception:
                 # A dialog closed since registration; nothing to update.
                 continue
@@ -592,7 +613,7 @@ class STTMeetApp(ctk.CTk):
     # -------------------------------------------------------------
     # Slide-in Menu
     # -------------------------------------------------------------
-    MENU_WIDTH = 280
+    MENU_WIDTH = 300
     _MENU_SLIDE_STEPS = 6
 
     def _toggle_menu(self):
@@ -643,12 +664,17 @@ class STTMeetApp(ctk.CTk):
         # Slide in from the left edge
         self._animate_menu(target_x=0)
 
-    def _close_menu(self):
+    def _close_menu(self, animate: bool = True):
         if not self._menu_open:
             return
         self._menu_open = False
         self._cancel_menu_slide()
-        self._animate_menu(target_x=-self._menu_width(), then=self._teardown_menu_overlay)
+        if not animate:
+            if self.menu_frame is not None and self.menu_frame.winfo_exists():
+                self.menu_frame.place_configure(x=-self._menu_width())
+            self._teardown_menu_overlay()
+        else:
+            self._animate_menu(target_x=-self._menu_width(), then=self._teardown_menu_overlay)
 
     def _teardown_menu_overlay(self):
         """Remove the dimming overlay once the drawer is fully off-screen."""
@@ -686,78 +712,126 @@ class STTMeetApp(ctk.CTk):
         except Exception:
             current_x = -self.MENU_WIDTH
 
-        step = int((target_x - current_x) / self._MENU_SLIDE_STEPS)
-        new_x = current_x + step if step else target_x
+        diff = target_x - current_x
+        if abs(diff) <= 25:
+            new_x = target_x
+        else:
+            raw_step = int(diff / 2.5)
+            if diff > 0:
+                step = max(raw_step, 60)
+            else:
+                step = min(raw_step, -60)
+            new_x = current_x + step
 
         if (target_x > current_x and new_x >= target_x) or (target_x < current_x and new_x <= target_x):
             new_x = target_x
 
         self.menu_frame.place_configure(x=new_x)
-        self.menu_frame.update_idletasks()
 
         if new_x == target_x:
             self._menu_slide_job = None
             if then:
                 self.after(0, then)
         else:
-            self._menu_slide_job = self.after(14, self._animate_menu, target_x, then)
+            self._menu_slide_job = self.after(16, self._animate_menu, target_x, then)
 
     def _build_menu_panel(self):
-        self.menu_frame = ctk.CTkFrame(self, width=self.MENU_WIDTH, corner_radius=0)
-        self.menu_frame.grid_rowconfigure(7, weight=1)  # spacer before the hint
+        self.menu_frame = ctk.CTkFrame(
+            self,
+            width=self.MENU_WIDTH,
+            corner_radius=0,
+            border_width=1,
+            border_color=("gray80", "gray25")
+        )
         self.menu_frame.grid_columnconfigure(0, weight=1)
 
+        # Row 0: Top Header with App Title, version and Close '✕' button
+        header_row = ctk.CTkFrame(self.menu_frame, fg_color="transparent")
+        header_row.grid(row=0, column=0, padx=16, pady=(18, 6), sticky="ew")
+        header_row.grid_columnconfigure(0, weight=1)
+
+        title_box = ctk.CTkFrame(header_row, fg_color="transparent")
+        title_box.grid(row=0, column=0, sticky="w")
+
         menu_title = ctk.CTkLabel(
-            self.menu_frame,
+            title_box,
             text=self._t("header.title"),
             font=ctk.CTkFont(size=18, weight="bold")
         )
-        menu_title.grid(row=0, column=0, padx=18, pady=(22, 2), sticky="w")
+        menu_title.pack(anchor="w")
         self._i18n_widgets.append((menu_title, "header.title"))
 
         menu_version = ctk.CTkLabel(
-            self.menu_frame,
+            title_box,
             text=get_display_version(),
             font=ctk.CTkFont(size=11),
             text_color="gray"
         )
-        menu_version.grid(row=1, column=0, padx=18, pady=(0, 10), sticky="w")
+        menu_version.pack(anchor="w")
+
+        close_btn = ctk.CTkButton(
+            header_row,
+            text="✕",
+            width=28,
+            height=28,
+            corner_radius=14,
+            fg_color="transparent",
+            text_color=TRANSPARENT_TEXT,
+            hover_color=TRANSPARENT_HOVER,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._close_menu
+        )
+        close_btn.grid(row=0, column=1, sticky="e")
+
+        # Row 1: Status Card
+        status_card = ctk.CTkFrame(
+            self.menu_frame,
+            corner_radius=8,
+            fg_color=("#F3F4F6", "#27272A"),
+            border_width=1,
+            border_color=("#E5E7EB", "#3F3F46")
+        )
+        status_card.grid(row=1, column=0, padx=14, pady=(6, 12), sticky="ew")
+        status_card.grid_columnconfigure(0, weight=1)
 
         self.menu_key_badge = ctk.CTkLabel(
-            self.menu_frame,
+            status_card,
             text="",
             font=ctk.CTkFont(size=11, weight="bold"),
             anchor="w",
-            wraplength=self.MENU_WIDTH - 40,
-            corner_radius=6,
             padx=10,
-            pady=5
+            pady=8
         )
-        self.menu_key_badge.grid(row=2, column=0, padx=18, pady=(0, 14), sticky="ew")
+        self.menu_key_badge.grid(row=0, column=0, sticky="ew")
 
-        # --- Language toggle ---
+        # Row 2 & 3: Language Toggle (Pill container)
         lang_label = ctk.CTkLabel(
             self.menu_frame,
             text=self._t("menu.language_label"),
-            font=ctk.CTkFont(size=11),
-            text_color="gray",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray40", "gray60"),
             anchor="w"
         )
-        lang_label.grid(row=3, column=0, padx=18, pady=(0, 6), sticky="w")
+        lang_label.grid(row=2, column=0, padx=18, pady=(2, 4), sticky="w")
         self._i18n_widgets.append((lang_label, "menu.language_label"))
 
-        locale_row = ctk.CTkFrame(self.menu_frame, fg_color="transparent")
-        locale_row.grid(row=4, column=0, padx=14, pady=(0, 14), sticky="ew")
+        locale_container = ctk.CTkFrame(
+            self.menu_frame,
+            corner_radius=8,
+            fg_color=("#E5E7EB", "#27272A"),
+            border_width=1,
+            border_color=("#D1D5DB", "#3F3F46")
+        )
+        locale_container.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="ew")
         for i in range(len(ALL_MODES)):
-            locale_row.grid_columnconfigure(i, weight=1)
+            locale_container.grid_columnconfigure(i, weight=1)
 
         self._locale_buttons = {}
         for i, mode in enumerate(ALL_MODES):
             btn = ctk.CTkButton(
-                locale_row,
+                locale_container,
                 text=mode_label(mode, self.ui_locale),
-                height=32,
-                width=92,  # keeps the drawer from stretching to the default 140px
+                height=30,
                 corner_radius=6,
                 font=ctk.CTkFont(size=11),
                 fg_color="transparent",
@@ -765,46 +839,80 @@ class STTMeetApp(ctk.CTk):
                 hover_color=TRANSPARENT_HOVER,
                 command=lambda m=mode: self._set_ui_locale(m)
             )
-            btn.grid(row=0, column=i, padx=2, sticky="ew")
+            btn.grid(row=0, column=i, padx=2, pady=2, sticky="ew")
             self._locale_buttons[mode] = btn
         self._refresh_locale_toggle()
 
-        self._add_menu_item("menu.settings", self._menu_action_settings, row=5)
-        self._add_menu_item("menu.save_session", self._menu_action_save_session, row=8)
-        self._add_menu_item("menu.open_log_folder", self._menu_action_open_log_folder, row=9)
-        self._add_menu_item("menu.about", self._menu_action_about, row=10)
+        # Row 4: Section 1 Header - General
+        sec_general = ctk.CTkLabel(
+            self.menu_frame,
+            text=self._t("menu.section_general"),
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=("gray50", "gray55"),
+            anchor="w"
+        )
+        sec_general.grid(row=4, column=0, padx=18, pady=(4, 2), sticky="w")
+        self._i18n_widgets.append((sec_general, "menu.section_general"))
 
+        # Row 5 & 6: General menu items
+        self._add_menu_item("menu.settings", self._menu_action_settings, row=5, icon="⚙️")
+        self._add_menu_item("menu.save_session", self._menu_action_save_session, row=6, icon="💾")
+
+        # Row 7: Subtle divider line
+        ctk.CTkFrame(self.menu_frame, height=1, fg_color=("gray85", "gray25")).grid(
+            row=7, column=0, padx=18, pady=(8, 8), sticky="ew"
+        )
+
+        # Row 8: Section 2 Header - Tools & Info
+        sec_tools = ctk.CTkLabel(
+            self.menu_frame,
+            text=self._t("menu.section_tools"),
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=("gray50", "gray55"),
+            anchor="w"
+        )
+        sec_tools.grid(row=8, column=0, padx=18, pady=(4, 2), sticky="w")
+        self._i18n_widgets.append((sec_tools, "menu.section_tools"))
+
+        # Row 9 & 10: Tools menu items
+        self._add_menu_item("menu.open_log_folder", self._menu_action_open_log_folder, row=9, icon="📁")
+        self._add_menu_item("menu.about", self._menu_action_about, row=10, icon="ℹ️")
+
+        # Row 11: Spacer row configured with weight=1 to absorb extra height
+        self.menu_frame.grid_rowconfigure(11, weight=1)
+
+        # Row 12: Footer / Close hint
         hint = ctk.CTkLabel(
             self.menu_frame,
             text=self._t("menu.close_hint"),
             font=ctk.CTkFont(size=10),
             text_color="gray",
             wraplength=self.MENU_WIDTH - 40,
-            justify="left",
-            anchor="w"
+            justify="center",
+            anchor="center"
         )
-        hint.grid(row=11, column=0, padx=18, pady=(16, 18), sticky="w")
+        hint.grid(row=12, column=0, padx=18, pady=(10, 16), sticky="ew")
         self._i18n_widgets.append((hint, "menu.close_hint"))
 
-    def _add_menu_item(self, key: str, command, row: int):
-        """Add a drawer row; a divider is inserted above the rows after the first."""
-        if row == 8:
-            ctk.CTkFrame(self.menu_frame, height=1, fg_color=("gray85", "gray25")).grid(
-                row=7, column=0, padx=18, pady=(2, 10), sticky="ew"
-            )
+    def _add_menu_item(self, key: str, command, row: int, icon: str = ""):
+        """Add a drawer row with smooth card hover styling and optional icon."""
+        def fmt(text: str) -> str:
+            return f"{icon}  {text}" if icon else text
+
         btn = ctk.CTkButton(
             self.menu_frame,
-            text=self._t(key),
+            text=fmt(self._t(key)),
             anchor="w",
-            height=42,
+            height=38,
+            corner_radius=8,
             fg_color="transparent",
             text_color=TRANSPARENT_TEXT,
             hover_color=TRANSPARENT_HOVER,
             font=ctk.CTkFont(size=13),
             command=command
         )
-        btn.grid(row=row, column=0, padx=8, pady=3, sticky="ew")
-        self._i18n_widgets.append((btn, key))
+        btn.grid(row=row, column=0, padx=14, pady=2, sticky="ew")
+        self._i18n_widgets.append((btn, key, fmt))
 
     def _refresh_locale_toggle(self):
         """Highlight the active language button and re-label all three."""
@@ -817,6 +925,7 @@ class STTMeetApp(ctk.CTk):
                 fg_color=("#1976D2", "#1565C0") if active else "transparent",
                 text_color=ON_ACCENT_TEXT if active else TRANSPARENT_TEXT,
                 hover_color=("#1565C0", "#0D47A1") if active else TRANSPARENT_HOVER,
+                font=ctk.CTkFont(size=11, weight="bold" if active else "normal"),
             )
 
     def _refresh_menu_key_badge(self):
@@ -825,29 +934,29 @@ class STTMeetApp(ctk.CTk):
         if self.api_key_var.get().strip():
             self.menu_key_badge.configure(
                 text=self._t("menu.key_configured"),
-                text_color=("#1B5E20", "#A5D6A7"),
-                fg_color=("#E8F5E9", "#1B2A1B")
+                text_color=("#15803D", "#4ADE80"),
+                fg_color="transparent"
             )
         else:
             self.menu_key_badge.configure(
                 text=self._t("menu.key_missing"),
-                text_color=("#C62828", "#FFCDD2"),
-                fg_color=("#FFEBEE", "#2B1A1A")
+                text_color=("#DC2626", "#F87171"),
+                fg_color="transparent"
             )
 
     # -------------------------------------------------------------
     # Menu Actions
     # -------------------------------------------------------------
     def _menu_action_settings(self):
-        self._close_menu()
-        self.after(160, self._open_settings_dialog)
+        self._close_menu(animate=False)
+        self._open_settings_dialog()
 
     def _menu_action_save_session(self):
-        self._close_menu()
-        self.after(160, self._save_session_manually)
+        self._close_menu(animate=False)
+        self._save_session_manually()
 
     def _menu_action_open_log_folder(self):
-        self._close_menu()
+        self._close_menu(animate=False)
         folder = LOG_FILE.parent
         try:
             os.startfile(str(folder))
@@ -857,8 +966,8 @@ class STTMeetApp(ctk.CTk):
             messagebox.showinfo(self._t("msg.log_folder"), self._t("msg.log_folder_body", folder=folder))
 
     def _menu_action_about(self):
-        self._close_menu()
-        self.after(160, self._open_about_dialog)
+        self._close_menu(animate=False)
+        self._open_about_dialog()
 
     def _open_settings_dialog(self):
         """Modal holding the Gemini API Key entry. Persists to .env on Save."""
