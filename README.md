@@ -16,12 +16,20 @@ It automatically generates:
 
 ### 🗂️ Slide-In Menu
 Click the **☰** button in the top-left corner for a slide-in drawer holding:
+- **🌐 Language / Bahasa** — switch the interface language (see below).
 - **⚙️ Settings / Tetapan** — Gemini API key entry, saved to your local `.env`.
 - **💾 Save Session / Simpan Sesi** — snapshot the current workspace.
 - **📂 Open Log Folder / Buka Folder Log** — jump straight to `sttmeet.log` for troubleshooting.
 - **ℹ️ About / Tentang** — version, FFmpeg status, model in use, and data/cache/log paths.
 
 The drawer displays a live **API Key configured / No API Key** badge. Press `Esc` or click outside the drawer to close it.
+
+### 🌍 Bilingual Interface / Antara Muka Dwibahasa
+Switch **English**, **Bahasa Melayu**, or **Both** (Malay / English combined) from the drawer's language row. Changes apply **instantly** with no restart, and the choice is remembered in `.sttmeet_cache/prefs.json`. The default is **Both**, so upgrading looks exactly as before until you switch.
+
+The language selection also drives the **output**: minutes, summary, and action items are generated in the matching language (`English` / `Bahasa Melayu` / `Bilingual`). A read-only **🌐 Output** chip next to **📝 Generate Minutes** always shows which language will be used — click it to jump to the language toggle. The former "Minutes Lang" dropdown has been removed; the menu is the single source of truth.
+
+Exported `.docx` / `.md` / `.txt` documents are intentionally **not** localized and remain bilingual, since Malaysian government bodies commonly require bilingual paperwork.
 
 ---
 
@@ -33,7 +41,7 @@ The drawer displays a live **API Key configured / No API Key** badge. Press `Esc
 - **Hybrid Silence-Based Chunking with Cache Manifest:** Slices audio into manageable segments using silence detection with a **5-second boundary overlap**. Chunks are cached via manifest so switching engines never re-slices audio.
 - **Output Token Safety:** Configured with `max_output_tokens=65536` to prevent transcript truncation mid-sentence.
 - **Automatic Checkpointing & Resumption:** Intermediate transcripts are cached locally in `.sttmeet_cache/`. If your internet drops or you cancel midway, the job resumes from the last completed chunk without re-transcribing earlier audio.
-- **Session Persistence:** Press **💾 Save Session** to snapshot the settings used (model, minutes language, chunk size, pre-processing), the pipeline status (step badges + per-chunk state), and the output (transcript, minutes, speaker names) into `.sttmeet_cache/session_<hash>.json`. The app also autosaves on chunk completion, on cancel, on speaker mapping, and on close — re-select the same audio file to pick the workspace back up exactly as you left it. Your API key is never written to the session file.
+- **Session Persistence:** Press **💾 Save Session** to snapshot the settings used (model, minutes language, chunk size, pre-processing), the pipeline status (step badges + per-chunk state), and the output (transcript, minutes, speaker names) into `.sttmeet_cache/session_<hash>.json`. The app also autosaves on chunk completion, on cancel, on speaker mapping, and on close — re-select the same audio file to pick the workspace back up exactly as you left it. Your API key is never written to the session file. Note that the restored session records the minutes language that produced its output, but the **interface language** stays in force: reload will re-apply your current language preference rather than the stored one.
 - **Cloud Hygiene:** Uploaded audio chunks in Google Files API are automatically deleted immediately after transcription to avoid cloud clutter and storage costs.
 
 ### 2. Tuned for Malaysian "Bahasa Rojak"
@@ -101,12 +109,14 @@ STTMeet/
 │   ├── minutes_generator.py    # Multi-language synthesis (Malay, English, Bilingual)
 │   ├── exporter.py             # Formatted Word (.docx), Markdown (.md), and Text (.txt) exports
 │   ├── session_store.py        # Session save/restore (settings, status, output)
+│   ├── i18n.py                 # UI chrome translations (English / Bahasa Melayu / Both)
+│   ├── prefs.py                # Global preferences (interface language)
 │   │
 │   └── ui/
 │       ├── __init__.py
 │       └── app_window.py       # CustomTkinter GUI layout, tabs, chunk monitor, worker threads
 │
-└── .sttmeet_cache/             # Auto-generated local cache for chunks, checkpoints & sessions
+└── .sttmeet_cache/             # Auto-generated local cache for chunks, checkpoints, sessions & prefs
 ```
 
 ---
@@ -152,7 +162,7 @@ python main.py
    - Approximate Gemini API cost
 3. **Choose Options:**
    - **Engine:** **⚡ Gemini Cloud (Auto-Failover)** (recommended) or pin a specific Gemini model.
-   - **Minutes Lang:** Bahasa Melayu, English, or Bilingual.
+   - **Minutes language:** follows the interface language set in the **☰** menu; the **🌐 Output** chip shows the current value.
    - **Chunk:** 15 / 20 / 25 (recommended) / 30 / 45 minutes.
    - **Pre-process (16kHz Mono):** Checked by default for ~10x faster uploads.
 4. **Click ▶ Transcribe Audio:**

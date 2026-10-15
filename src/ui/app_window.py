@@ -20,7 +20,7 @@ import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import customtkinter as ctk
 import tkinter as tk
@@ -38,6 +38,17 @@ from ..config import (
     MINUTES_MODEL_NAME
 )
 from ..logger import LOG_FILE, get_logger
+from ..i18n import (
+    ALL_MODES,
+    DEFAULT_LOCALE,
+    MINUTES_LANG_BY_UI_LOCALE,
+    display_minutes_lang,
+    mode_label,
+    normalize_locale,
+    translate,
+)
+from ..prefs import get_pref, save_pref
+from .. import i18n as translate_module
 
 log = get_logger(__name__)
 from ..utils import (
@@ -83,13 +94,22 @@ from ..version import get_display_version
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
+# CustomTkinter resolves a button's text colour to a fixed light value when
+# fg_color="transparent", regardless of appearance mode, which makes the glyph
+# invisible on the light-theme surface. Text and hover colours for such buttons
+# are therefore always set explicitly as (light, dark) tuples.
+TRANSPARENT_TEXT = ("#1F2937", "#E5E7EB")
+TRANSPARENT_HOVER = ("#D4D4D8", "#3F3F46")
+ON_ACCENT_TEXT = ("#FFFFFF", "#FFFFFF")
+
 class ChunkMonitorDialog(ctk.CTkToplevel):
     """
     Floating dialog panel displaying live status for each audio chunk.
     Enables users to monitor pending/working/done/error states, cancel execution,
     reprocess failed chunks individually, and extract all combined transcripts.
     """
-    def __init__(self, master, chunks_meta: List[Dict], on_cancel_callback, on_reprocess_callback, on_extract_callback):
+    def __init__(self, master, chunks_meta: List[Dict], on_cancel_callback, on_reprocess_callback, on_extract_callback,
+                 t: Optional[Callable[..., str]] = None):
         super().__init__(master)
         self.master_app = master
         self.chunks_meta = chunks_meta
@@ -97,13 +117,40 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         self.on_reprocess_callback = on_reprocess_callback
         self.on_extract_callback = on_extract_callback
 
-        self.title("Audio Chunk Transcription Monitor")
+        # Translation callable supplied by the main window so this dialog follows
+        # language switches. Falls back to English-only if none is given.
+        self._t = t or (lambda key, **fmt: translate(key, "en", **fmt))
+        self._i18n: List[Tuple[Any, str]] = []
+        self._chunk_detail: Dict[int, str] = {}  # chunk index -> last error detail
+
+        self.title(self._t("monitor.title"))
         self.geometry("640x520")
         self.minsize(550, 400)
         self.transient(master)
 
         self.row_widgets: Dict[int, Dict] = {}
         self._build_ui()
+
+    def _label(self, widget, key: str, **fmt):
+        self._i18n.append((widget, key))
+        widget.configure(text=self._t(key, **fmt))
+        return widget
+
+    def retranslate(self):
+        """Re-apply every string after the app's language changes."""
+        for widget, resolver in self._i18n:
+            try:
+                if not widget.winfo_exists():
+                    continue
+                widget.configure(text=resolver(self._t) if callable(resolver) else self._t(resolver))
+            except Exception:
+                continue
+        # Badges carry state-dependent text, so re-render from stored state.
+        for chunk_index, widgets in self.row_widgets.items():
+            state = widgets.get("state", "pending")
+            self.update_chunk_state(chunk_index, state, self._chunk_detail.get(chunk_index, ""))
+        if getattr(self, "_last_summary_args", None):
+            self.update_overall_summary(*self._last_summary_args)
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -116,7 +163,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
 
         self.summary_label = ctk.CTkLabel(
             header_frame,
-            text=f"Total Chunks: {len(self.chunks_meta)} | Status: Processing...",
+            text=self._t("monitor.header", total=len(self.chunks_meta)),
             font=ctk.CTkFont(size=13, weight="bold")
         )
         self.summary_label.grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
@@ -142,16 +189,19 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
 
             lbl_title = ctk.CTkLabel(
                 card,
-                text=f"Chunk {i + 1} ({time_str})",
+                text=self._t("monitor.chunk_title", index=i + 1, time=time_str),
                 font=ctk.CTkFont(size=12, weight="bold"),
                 width=200,
                 anchor="w"
             )
             lbl_title.grid(row=0, column=0, padx=(10, 6), pady=8, sticky="w")
+            self._i18n.append(
+                (lbl_title, lambda i=i + 1, ts=time_str: self._t("monitor.chunk_title", index=i, time=ts))
+            )
 
             badge = ctk.CTkLabel(
                 card,
-                text="Pending ⚪",
+                text=self._t("monitor.state_pending"),
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color="gray",
                 fg_color=("#E0E0E0", "#2B2B2B"),
@@ -163,7 +213,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
 
             btn_reprocess = ctk.CTkButton(
                 card,
-                text="↻ Reprocess",
+                text=self._t("monitor.reprocess"),
                 width=100,
                 height=26,
                 font=ctk.CTkFont(size=11),
@@ -173,11 +223,13 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
                 command=lambda c_idx=idx: self.on_reprocess_callback(c_idx)
             )
             btn_reprocess.grid(row=0, column=2, padx=(6, 10), pady=8, sticky="e")
+            self._i18n.append((btn_reprocess, "monitor.reprocess"))
 
             self.row_widgets[idx] = {
                 "card": card,
                 "badge": badge,
-                "btn_reprocess": btn_reprocess
+                "btn_reprocess": btn_reprocess,
+                "state": "pending",
             }
 
         # Bottom Action Bar
@@ -187,17 +239,18 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
 
         self.btn_cancel = ctk.CTkButton(
             bottom_frame,
-            text="⏹ Cancel",
+            text=self._t("monitor.cancel"),
             fg_color="#C62828",
             hover_color="#B71C1C",
             width=100,
             command=self.on_cancel_callback
         )
         self.btn_cancel.grid(row=0, column=0, padx=(0, 6), pady=6, sticky="w")
+        self._i18n.append((self.btn_cancel, "monitor.cancel"))
 
         self.btn_extract = ctk.CTkButton(
             bottom_frame,
-            text="📥 Extract Transcript",
+            text=self._t("monitor.extract"),
             fg_color="#2E7D32",
             hover_color="#1B5E20",
             font=ctk.CTkFont(weight="bold"),
@@ -206,14 +259,16 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
             command=self.on_extract_callback
         )
         self.btn_extract.grid(row=0, column=2, padx=6, pady=6, sticky="e")
+        self._i18n.append((self.btn_extract, "monitor.extract"))
 
         self.btn_close = ctk.CTkButton(
             bottom_frame,
-            text="Hide Window",
+            text=self._t("monitor.hide"),
             width=100,
             command=self.withdraw
         )
         self.btn_close.grid(row=0, column=3, padx=(6, 0), pady=6, sticky="e")
+        self._i18n.append((self.btn_close, "monitor.hide"))
 
     def update_chunk_state(self, chunk_index: int, state: str, detail: str = ""):
         """
@@ -226,13 +281,19 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
 
         badge = widgets["badge"]
         btn_reprocess = widgets["btn_reprocess"]
+        widgets["state"] = state
+        self._chunk_detail[chunk_index] = detail
 
         states_config = {
-            "pending": ("Pending ⚪", "gray", ("#E0E0E0", "#2B2B2B"), "disabled"),
-            "working": ("Transcribing... 🔵", "#1976D2", ("#BBDEFB", "#0D47A1"), "disabled"),
-            "done": ("Completed 🟢", "#2E7D32", ("#C8E6C9", "#1B5E20"), "disabled"),
-            "error": (f"Error: {detail[:25]}... 🔴" if detail else "Error 🔴", "#C62828", ("#FFCDD2", "#B71C1C"), "normal"),
-            "cancelled": ("Cancelled ⚪", "gray", ("#E0E0E0", "#2B2B2B"), "normal")
+            "pending": (self._t("monitor.state_pending"), "gray", ("#E0E0E0", "#2B2B2B"), "disabled"),
+            "working": (self._t("monitor.state_working"), "#1976D2", ("#BBDEFB", "#0D47A1"), "disabled"),
+            "done": (self._t("monitor.state_done"), "#2E7D32", ("#C8E6C9", "#1B5E20"), "disabled"),
+            "error": (
+                self._t("monitor.state_error_detail", detail=detail[:25]) if detail
+                else self._t("monitor.state_error"),
+                "#C62828", ("#FFCDD2", "#B71C1C"), "normal"
+            ),
+            "cancelled": (self._t("monitor.state_cancelled"), "gray", ("#E0E0E0", "#2B2B2B"), "normal"),
         }
 
         text, fg_col, bg_col, btn_state = states_config.get(state, states_config["pending"])
@@ -242,14 +303,15 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
     def update_overall_summary(self, completed_count: int, total_count: int, has_errors: bool = False):
         pct = (completed_count / total_count) if total_count > 0 else 0.0
         self.progress_bar.set(pct)
+        self._last_summary_args = (completed_count, total_count, has_errors)
 
-        status_text = f"Total Chunks: {total_count} | Completed: {completed_count}/{total_count}"
+        status_text = self._t("monitor.summary_base", done=completed_count, total=total_count)
         if completed_count == total_count:
-            status_text += " | All Chunks Done! Click 'Extract Transcript'"
+            status_text += self._t("monitor.summary_all_done")
             self.btn_extract.configure(state="normal")
             self.btn_cancel.configure(state="disabled")
         elif has_errors:
-            status_text += " | Some chunks failed. Click '↻ Reprocess' on red items."
+            status_text += self._t("monitor.summary_errors")
             self.btn_extract.configure(state="disabled")
         else:
             self.btn_extract.configure(state="disabled")
@@ -261,7 +323,17 @@ class STTMeetApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title(f"STTMeet {get_display_version()} — Malaysian Meeting STT & Minutes Generator")
+        self.ui_locale: str = normalize_locale(get_pref("ui_locale", DEFAULT_LOCALE))
+        self._i18n_widgets: List[Tuple[Any, str]] = []  # (widget, i18n key)
+        self._step_labels: Dict[str, str] = {}         # step key -> base label
+        self._locale_buttons: Dict[str, Any] = {}
+
+        # Minutes language is derived from the UI locale rather than edited by
+        # the user. Values stay canonical: they are validated by
+        # session_store.VALID_LANGUAGES and key the Gemini prompt table.
+        self.lang_var = ctk.StringVar(value=MINUTES_LANG_BY_UI_LOCALE[self.ui_locale])
+
+        self.title(self._t("window.title", version=get_display_version()))
         self.geometry("1100x820")
         self.minsize(950, 750)
 
@@ -305,6 +377,7 @@ class STTMeetApp(ctk.CTk):
         self._menu_slide_job: Optional[str] = None
 
         self._build_ui()
+        self._refresh_output_lang_chip()
         self._check_initial_environment()
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         self.bind("<Escape>", self._on_escape_key)
@@ -329,6 +402,159 @@ class STTMeetApp(ctk.CTk):
         # 5. Bottom Section: Speaker Mapping & Export Bar
         self._build_bottom_bar()
 
+    # -------------------------------------------------------------
+    # Localization
+    # -------------------------------------------------------------
+    def _t(self, key: str, **fmt) -> str:
+        """Translate a UI string in the active locale."""
+        return translate(key, self.ui_locale, **fmt)
+
+    def _i18n_label(self, widget, key: str, **fmt):
+        """
+        Register a widget for live re-translation and set its initial text.
+
+        Used at every construction site so no label can be missed by a switch.
+        """
+        self._i18n_widgets.append((widget, key))
+        widget.configure(text=self._t(key, **fmt))
+        return widget
+
+    def _set_ui_locale(self, locale: str):
+        """Switch UI language, cascade the output language, and re-label everything."""
+        locale = normalize_locale(locale)
+        if locale == self.ui_locale:
+            self._refresh_locale_toggle()
+            return
+
+        self.ui_locale = locale
+        save_pref("ui_locale", locale)
+        self._cascade_minutes_lang()
+        self._retranslate_ui()
+        self._refresh_locale_toggle()
+        self._refresh_output_lang_chip()
+        self._set_status(self._t("status.ready"))
+
+    def _cascade_minutes_lang(self):
+        """
+        Derive lang_var from the UI locale.
+
+        lang_var is no longer user-editable: its values are validated by
+        session_store.VALID_LANGUAGES and used as keys to pick a Gemini prompt,
+        so the UI locale is the single source of truth.
+        """
+        self.lang_var.set(MINUTES_LANG_BY_UI_LOCALE[self.ui_locale])
+
+    def _refresh_output_lang_chip(self):
+        """Update the read-only chip that shows which language minutes use."""
+        chip_var = getattr(self, "_output_lang_var", None)
+        if chip_var is None:
+            return
+        # In combined mode the chip label already carries both languages, so the
+        # value stays a single name instead of expanding to "Bilingual / Dwibahasa".
+        value_locale = "en" if self.ui_locale == "both" else self.ui_locale
+        display = display_minutes_lang(self.lang_var.get(), value_locale)
+        chip_var.set(self._t("control.output_lang", value=display))
+
+    def _open_menu_for_language(self):
+        """Open the drawer so the language toggle is reachable from the chip."""
+        self._open_menu()
+        try:
+            self.menu_frame.lift()
+        except Exception:
+            pass
+
+    def _retranslate_ui(self):
+        """Re-apply every registered string plus the widgets with custom logic."""
+        for widget, key in self._i18n_widgets:
+            try:
+                if not widget.winfo_exists():
+                    continue
+                widget.configure(text=self._t(key))
+            except Exception:
+                # A dialog closed since registration; nothing to update.
+                continue
+
+        self._retranslate_tabs()
+        self._retranslate_steps()
+        self._refresh_locale_toggle()
+        if self.monitor_dialog is not None and self.monitor_dialog.winfo_exists():
+            try:
+                self.monitor_dialog.retranslate()
+            except Exception:
+                log.warning("Could not retranslate chunk monitor", exc_info=True)
+
+    def _retranslate_tabs(self):
+        """
+        Re-label the tab buttons.
+
+        CTkTabview.rename() changes the tab's identity, not its visible text, so
+        the segmented button's buttons_dict is updated directly. Tabs are created
+        under locale-independent names, so this only touches the caption.
+        """
+        for internal, key in (
+            ("tab_transcript", "tab.transcript"),
+            ("tab_minutes", "tab.minutes"),
+            ("tab_summary", "tab.summary"),
+            ("tab_actions", "tab.actions"),
+        ):
+            try:
+                button = self.tabview._segmented_button._buttons_dict.get(internal)
+                if button is not None:
+                    button.configure(text=self._t(key))
+            except Exception:
+                pass  # Private API unavailable; leave captions as-is.
+
+    def _retranslate_steps(self):
+        """Re-render step badges with labels in the new language."""
+        for s_idx, (s_key, s_i18n) in enumerate(
+            [("step1", "step.step1"), ("step2", "step.step2"),
+             ("step3", "step.step3"), ("step4", "step.step4")]
+        ):
+            self._step_labels[s_key] = self._t(s_i18n)
+            badge = self.step_badges.get(s_key)
+            if badge is None or not badge.winfo_exists():
+                continue
+            state = self._step_states.get(s_key, "pending")
+            icons = {"pending": "⚪", "working": "🔵", "done": "🟢", "error": "🔴"}
+            badge.configure(text=f"{self._step_labels[s_key]} {icons.get(state, '⚪')}")
+
+    def _audit_untranslated(self) -> List[str]:
+        """
+        Dev helper: report labelled widgets whose text is not in the i18n table.
+        Returns a list of human-readable findings.
+
+        Skips widgets whose text comes from a StringVar (cget returns the widget
+        default for those) and icon-only labels like the hamburger glyph.
+        """
+        known = set()
+        for entry in translate_module.STRINGS.values():
+            known.update(v for v in entry.values())
+            # The combined mode renders an auto-joined string that is not stored
+            # verbatim, so include the rendered form to avoid false positives.
+            known.add(translate_module._resolve_mode(entry, "both"))
+            known.add(translate_module._resolve_mode(entry, "en"))
+            known.add(translate_module._resolve_mode(entry, "ms"))
+        known.update(translate_module.MODE_NAMES.values())
+        found = []
+        for widget in self.winfo_children():
+            for child in widget.winfo_children():
+                if not isinstance(child, (ctk.CTkLabel, ctk.CTkButton)):
+                    continue
+                try:
+                    text = child.cget("text")
+                    textvariable = child.cget("textvariable")
+                except Exception:
+                    continue
+                if textvariable is not None:
+                    continue
+                if not isinstance(text, str) or text in known:
+                    continue
+                # Icon-only buttons (☰, etc.) have nothing to translate.
+                if not any(ch.isalnum() for ch in text):
+                    continue
+                found.append(text)
+        return found
+
     def _build_header_and_settings(self):
         top_frame = ctk.CTkFrame(self, corner_radius=10)
         top_frame.grid(row=0, column=0, padx=16, pady=(12, 6), sticky="ew")
@@ -341,14 +567,15 @@ class STTMeetApp(ctk.CTk):
             width=42,
             font=ctk.CTkFont(size=20),
             fg_color="transparent",
-            hover_color=("#E0E0E0", "#2B2B2B"),
+            text_color=TRANSPARENT_TEXT,
+            hover_color=TRANSPARENT_HOVER,
             command=self._toggle_menu
         )
         self.menu_btn.grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
 
         title_label = ctk.CTkLabel(
             top_frame,
-            text="🎙️ STTMeet",
+            text=self._t("header.title"),
             font=ctk.CTkFont(size=20, weight="bold")
         )
         title_label.grid(row=0, column=1, padx=(4, 10), pady=10, sticky="w")
@@ -356,7 +583,7 @@ class STTMeetApp(ctk.CTk):
         # Status Badges
         self.ffmpeg_badge = ctk.CTkLabel(
             top_frame,
-            text="FFmpeg: Checking...",
+            text=self._t("ffmpeg.checking"),
             font=ctk.CTkFont(size=11),
             text_color="gray"
         )
@@ -477,15 +704,16 @@ class STTMeetApp(ctk.CTk):
 
     def _build_menu_panel(self):
         self.menu_frame = ctk.CTkFrame(self, width=self.MENU_WIDTH, corner_radius=0)
-        self.menu_frame.grid_rowconfigure(4, weight=1)
+        self.menu_frame.grid_rowconfigure(7, weight=1)  # spacer before the hint
         self.menu_frame.grid_columnconfigure(0, weight=1)
 
         menu_title = ctk.CTkLabel(
             self.menu_frame,
-            text="🎙️ STTMeet",
+            text=self._t("header.title"),
             font=ctk.CTkFont(size=18, weight="bold")
         )
         menu_title.grid(row=0, column=0, padx=18, pady=(22, 2), sticky="w")
+        self._i18n_widgets.append((menu_title, "header.title"))
 
         menu_version = ctk.CTkLabel(
             self.menu_frame,
@@ -500,54 +728,109 @@ class STTMeetApp(ctk.CTk):
             text="",
             font=ctk.CTkFont(size=11, weight="bold"),
             anchor="w",
+            wraplength=self.MENU_WIDTH - 40,
             corner_radius=6,
             padx=10,
             pady=5
         )
         self.menu_key_badge.grid(row=2, column=0, padx=18, pady=(0, 14), sticky="ew")
 
-        self._add_menu_item("⚙️  Settings / Tetapan", self._menu_action_settings, row=3)
-        self._add_menu_item("💾  Save Session / Simpan Sesi", self._menu_action_save_session, row=5)
-        self._add_menu_item("📂  Open Log Folder / Buka Folder Log", self._menu_action_open_log_folder, row=6)
-        self._add_menu_item("ℹ️  About / Tentang", self._menu_action_about, row=7)
+        # --- Language toggle ---
+        lang_label = ctk.CTkLabel(
+            self.menu_frame,
+            text=self._t("menu.language_label"),
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            anchor="w"
+        )
+        lang_label.grid(row=3, column=0, padx=18, pady=(0, 6), sticky="w")
+        self._i18n_widgets.append((lang_label, "menu.language_label"))
+
+        locale_row = ctk.CTkFrame(self.menu_frame, fg_color="transparent")
+        locale_row.grid(row=4, column=0, padx=14, pady=(0, 14), sticky="ew")
+        for i in range(len(ALL_MODES)):
+            locale_row.grid_columnconfigure(i, weight=1)
+
+        self._locale_buttons = {}
+        for i, mode in enumerate(ALL_MODES):
+            btn = ctk.CTkButton(
+                locale_row,
+                text=mode_label(mode, self.ui_locale),
+                height=32,
+                width=92,  # keeps the drawer from stretching to the default 140px
+                corner_radius=6,
+                font=ctk.CTkFont(size=11),
+                fg_color="transparent",
+                text_color=TRANSPARENT_TEXT,
+                hover_color=TRANSPARENT_HOVER,
+                command=lambda m=mode: self._set_ui_locale(m)
+            )
+            btn.grid(row=0, column=i, padx=2, sticky="ew")
+            self._locale_buttons[mode] = btn
+        self._refresh_locale_toggle()
+
+        self._add_menu_item("menu.settings", self._menu_action_settings, row=5)
+        self._add_menu_item("menu.save_session", self._menu_action_save_session, row=8)
+        self._add_menu_item("menu.open_log_folder", self._menu_action_open_log_folder, row=9)
+        self._add_menu_item("menu.about", self._menu_action_about, row=10)
 
         hint = ctk.CTkLabel(
             self.menu_frame,
-            text="Press Esc or click outside to close",
+            text=self._t("menu.close_hint"),
             font=ctk.CTkFont(size=10),
-            text_color="gray"
+            text_color="gray",
+            wraplength=self.MENU_WIDTH - 40,
+            justify="left",
+            anchor="w"
         )
-        hint.grid(row=8, column=0, padx=18, pady=(16, 18), sticky="w")
+        hint.grid(row=11, column=0, padx=18, pady=(16, 18), sticky="w")
+        self._i18n_widgets.append((hint, "menu.close_hint"))
 
-    def _add_menu_item(self, text: str, command, row: int):
-        if row == 5:
+    def _add_menu_item(self, key: str, command, row: int):
+        """Add a drawer row; a divider is inserted above the rows after the first."""
+        if row == 8:
             ctk.CTkFrame(self.menu_frame, height=1, fg_color=("gray85", "gray25")).grid(
-                row=4, column=0, padx=18, pady=(2, 10), sticky="ew"
+                row=7, column=0, padx=18, pady=(2, 10), sticky="ew"
             )
         btn = ctk.CTkButton(
             self.menu_frame,
-            text=text,
+            text=self._t(key),
             anchor="w",
             height=42,
             fg_color="transparent",
-            hover_color=("#E0E0E0", "#2B2B2B"),
+            text_color=TRANSPARENT_TEXT,
+            hover_color=TRANSPARENT_HOVER,
             font=ctk.CTkFont(size=13),
             command=command
         )
         btn.grid(row=row, column=0, padx=8, pady=3, sticky="ew")
+        self._i18n_widgets.append((btn, key))
+
+    def _refresh_locale_toggle(self):
+        """Highlight the active language button and re-label all three."""
+        for mode, btn in getattr(self, "_locale_buttons", {}).items():
+            if not btn.winfo_exists():
+                continue
+            active = (mode == self.ui_locale)
+            btn.configure(
+                text=mode_label(mode, self.ui_locale),
+                fg_color=("#1976D2", "#1565C0") if active else "transparent",
+                text_color=ON_ACCENT_TEXT if active else TRANSPARENT_TEXT,
+                hover_color=("#1565C0", "#0D47A1") if active else TRANSPARENT_HOVER,
+            )
 
     def _refresh_menu_key_badge(self):
         if self.menu_key_badge is None or not self.menu_key_badge.winfo_exists():
             return
         if self.api_key_var.get().strip():
             self.menu_key_badge.configure(
-                text="✅  API Key configured",
+                text=self._t("menu.key_configured"),
                 text_color=("#1B5E20", "#A5D6A7"),
                 fg_color=("#E8F5E9", "#1B2A1B")
             )
         else:
             self.menu_key_badge.configure(
-                text="⚠️  No API Key — open Settings",
+                text=self._t("menu.key_missing"),
                 text_color=("#C62828", "#FFCDD2"),
                 fg_color=("#FFEBEE", "#2B1A1A")
             )
@@ -568,10 +851,10 @@ class STTMeetApp(ctk.CTk):
         folder = LOG_FILE.parent
         try:
             os.startfile(str(folder))
-            self._set_status(f"Opened log folder: {folder}")
+            self._set_status(self._t("status.log_opened", folder=folder))
         except Exception as e:
             log.warning("Could not open log folder: %s", e)
-            messagebox.showinfo("Log Folder", f"Open this folder manually:\n\n{folder}")
+            messagebox.showinfo(self._t("msg.log_folder"), self._t("msg.log_folder_body", folder=folder))
 
     def _menu_action_about(self):
         self._close_menu()
@@ -580,7 +863,7 @@ class STTMeetApp(ctk.CTk):
     def _open_settings_dialog(self):
         """Modal holding the Gemini API Key entry. Persists to .env on Save."""
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Settings / Tetapan")
+        dialog.title(self._t("settings.title"))
         dialog.geometry("500x330")
         dialog.resizable(False, False)
         dialog.transient(self)
@@ -592,18 +875,14 @@ class STTMeetApp(ctk.CTk):
 
         ctk.CTkLabel(
             body,
-            text="🔑  Gemini API Key / Kunci API Gemini",
+            text=self._t("settings.heading"),
             font=ctk.CTkFont(size=17, weight="bold"),
             anchor="w"
         ).grid(row=0, column=0, sticky="ew")
 
         ctk.CTkLabel(
             body,
-            text=(
-                "Create a key at https://aistudio.google.com/apikey\n"
-                "Stored locally in .env — never written into session files.\n"
-                "Kunci disimpan secara lokal dan tidak dikongsi."
-            ),
+            text=self._t("settings.help"),
             font=ctk.CTkFont(size=11),
             text_color="gray",
             justify="left",
@@ -619,7 +898,7 @@ class STTMeetApp(ctk.CTk):
             entry_row,
             textvariable=self.api_key_var,
             show="•",
-            placeholder_text="Enter GEMINI_API_KEY..."
+            placeholder_text=self._t("settings.placeholder")
         )
         key_entry.grid(row=0, column=0, sticky="ew")
 
@@ -652,7 +931,7 @@ class STTMeetApp(ctk.CTk):
 
         ctk.CTkLabel(
             body,
-            text=f"Saved to: {ENV_PATH}",
+            text=self._t("settings.saved_to", path=str(ENV_PATH)),
             font=ctk.CTkFont(size=10),
             text_color="gray",
             anchor="w"
@@ -660,7 +939,7 @@ class STTMeetApp(ctk.CTk):
 
         def do_save():
             if self._save_api_key(notify=False):
-                messagebox.showinfo("Success", "Gemini API Key saved successfully.", parent=dialog)
+                messagebox.showinfo(self._t("msg.success"), self._t("msg.key_saved_body"), parent=dialog)
                 close_dialog()
 
         def do_clear():
@@ -668,23 +947,23 @@ class STTMeetApp(ctk.CTk):
             close_dialog()
             self.api_key_var.set("")
             self._refresh_menu_key_badge()
-            self._set_status("Gemini API Key cleared.")
-            messagebox.showinfo("Cleared", "Gemini API Key removed from .env.")
+            self._set_status(self._t("status.key_cleared"))
+            messagebox.showinfo(self._t("msg.cleared"), self._t("msg.key_cleared_body"))
 
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
         btn_row.grid(row=4, column=0, pady=(20, 0), sticky="ew")
         btn_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
-            btn_row, text="🗑  Clear Key", width=110, fg_color=("#C62828", "#B71C1C"),
+            btn_row, text=self._t("settings.clear"), width=110, fg_color=("#C62828", "#B71C1C"),
             hover_color=("#B71C1C", "#8E0000"), command=do_clear
         ).grid(row=0, column=0, sticky="w")
 
-        ctk.CTkButton(btn_row, text="Cancel", width=100, command=close_dialog).grid(
-            row=0, column=2, padx=6, sticky="e"
-        )
         ctk.CTkButton(
-            btn_row, text="💾  Save", width=110, fg_color="#2E7D32", hover_color="#1B5E20",
+            btn_row, text=self._t("settings.cancel"), width=100, command=close_dialog
+        ).grid(row=0, column=2, padx=6, sticky="e")
+        ctk.CTkButton(
+            btn_row, text=self._t("settings.save"), width=110, fg_color="#2E7D32", hover_color="#1B5E20",
             font=ctk.CTkFont(weight="bold"), command=do_save
         ).grid(row=0, column=3, sticky="e")
 
@@ -694,7 +973,7 @@ class STTMeetApp(ctk.CTk):
     def _open_about_dialog(self):
         ffmpeg_ok, _ = check_ffmpeg()
         dialog = ctk.CTkToplevel(self)
-        dialog.title("About / Tentang STTMeet")
+        dialog.title(self._t("about.title"))
         dialog.geometry("480x420")
         dialog.resizable(False, False)
         dialog.transient(self)
@@ -704,12 +983,12 @@ class STTMeetApp(ctk.CTk):
         body.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            body, text="🎙️  STTMeet", font=ctk.CTkFont(size=20, weight="bold"), anchor="w"
+            body, text=self._t("header.title"), font=ctk.CTkFont(size=20, weight="bold"), anchor="w"
         ).grid(row=0, column=0, sticky="ew")
 
         ctk.CTkLabel(
             body,
-            text=f"Version {get_display_version()}\nMalaysian Meeting Transcription & Minutes Generator",
+            text=f"{self._t('about.version', version=get_display_version())}\n{self._t('about.subtitle')}",
             font=ctk.CTkFont(size=12),
             text_color="gray",
             justify="left",
@@ -717,12 +996,13 @@ class STTMeetApp(ctk.CTk):
         ).grid(row=1, column=0, pady=(4, 16), sticky="ew")
 
         rows = [
-            ("FFmpeg", "✅ Installed" if ffmpeg_ok else "❌ Not found in PATH"),
-            ("Transcript model", MODEL_NAME),
-            ("Minutes model", MINUTES_MODEL_NAME),
-            ("Data folder", str(BASE_DIR)),
-            ("Session cache", str(CACHE_DIR)),
-            ("Log file", str(LOG_FILE)),
+            (self._t("about.row_ffmpeg"),
+             self._t("about.ffmpeg_installed") if ffmpeg_ok else self._t("about.ffmpeg_missing")),
+            (self._t("about.row_transcript_model"), MODEL_NAME),
+            (self._t("about.row_minutes_model"), MINUTES_MODEL_NAME),
+            (self._t("about.row_data_folder"), str(BASE_DIR)),
+            (self._t("about.row_cache"), str(CACHE_DIR)),
+            (self._t("about.row_log"), str(LOG_FILE)),
         ]
         for idx, (label, value) in enumerate(rows, start=2):
             ctk.CTkLabel(
@@ -733,7 +1013,7 @@ class STTMeetApp(ctk.CTk):
             ).grid(row=idx, column=1, pady=(0, 8), sticky="w")
         body.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkButton(body, text="Close", width=100, command=dialog.destroy).grid(
+        ctk.CTkButton(body, text=self._t("about.close"), width=100, command=dialog.destroy).grid(
             row=len(rows) + 2, column=0, columnspan=2, pady=(18, 0), sticky="e"
         )
 
@@ -744,16 +1024,17 @@ class STTMeetApp(ctk.CTk):
 
         browse_btn = ctk.CTkButton(
             file_frame,
-            text="📂 Select Audio File",
+            text=self._t("file.select"),
             command=self._browse_audio_file,
             width=160,
             font=ctk.CTkFont(weight="bold")
         )
         browse_btn.grid(row=0, column=0, padx=16, pady=12, sticky="w")
+        self._i18n_label(browse_btn, "file.select")
 
         self.file_label = ctk.CTkLabel(
             file_frame,
-            text="No audio file selected (Supports .mp3, .m4a, .wav, .aac, .flac, .mp4)",
+            text=self._t("file.no_selection"),
             anchor="w",
             font=ctk.CTkFont(size=13)
         )
@@ -762,7 +1043,7 @@ class STTMeetApp(ctk.CTk):
         # Audio Info Row
         self.audio_stats_label = ctk.CTkLabel(
             file_frame,
-            text="Duration: --:--:--  |  File Size: -- MB  |  Estimated Cost: $0.00",
+            text=self._t("file.stats_placeholder"),
             font=ctk.CTkFont(size=11),
             text_color="gray"
         )
@@ -771,11 +1052,12 @@ class STTMeetApp(ctk.CTk):
     def _build_controls_section(self):
         ctrl_frame = ctk.CTkFrame(self, corner_radius=10)
         ctrl_frame.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
-        ctrl_frame.grid_columnconfigure(4, weight=1)
+        ctrl_frame.grid_columnconfigure(2, weight=1)
 
         # Engine Selector
-        engine_lbl = ctk.CTkLabel(ctrl_frame, text="Engine:")
+        engine_lbl = ctk.CTkLabel(ctrl_frame, text=self._t("control.engine"))
         engine_lbl.grid(row=0, column=0, padx=(16, 6), pady=10, sticky="w")
+        self._i18n_label(engine_lbl, "control.engine")
 
         self.engine_var = ctk.StringVar(value="⚡ Gemini Cloud (Auto-Failover)")
         self.engine_dropdown = ctk.CTkOptionMenu(
@@ -793,22 +1075,10 @@ class STTMeetApp(ctk.CTk):
         )
         self.engine_dropdown.grid(row=0, column=1, padx=6, pady=10, sticky="w")
 
-        # Language Selector
-        lang_lbl = ctk.CTkLabel(ctrl_frame, text="Minutes Lang:")
-        lang_lbl.grid(row=0, column=2, padx=(16, 6), pady=10, sticky="w")
-
-        self.lang_var = ctk.StringVar(value="Bahasa Melayu")
-        self.lang_dropdown = ctk.CTkOptionMenu(
-            ctrl_frame,
-            values=["Bahasa Melayu", "English", "Bilingual"],
-            variable=self.lang_var,
-            width=130
-        )
-        self.lang_dropdown.grid(row=0, column=3, padx=6, pady=10, sticky="w")
-
         # Chunk Size Selector
-        chunk_lbl = ctk.CTkLabel(ctrl_frame, text="Chunk:")
-        chunk_lbl.grid(row=0, column=4, padx=(16, 6), pady=10, sticky="w")
+        chunk_lbl = ctk.CTkLabel(ctrl_frame, text=self._t("control.chunk"))
+        chunk_lbl.grid(row=0, column=2, padx=(16, 6), pady=10, sticky="w")
+        self._i18n_label(chunk_lbl, "control.chunk")
 
         self.chunk_size_var = ctk.StringVar(value="25 min")
         self.chunk_dropdown = ctk.CTkOptionMenu(
@@ -817,32 +1087,51 @@ class STTMeetApp(ctk.CTk):
             variable=self.chunk_size_var,
             width=90
         )
-        self.chunk_dropdown.grid(row=0, column=5, padx=6, pady=10, sticky="w")
+        self.chunk_dropdown.grid(row=0, column=3, padx=6, pady=10, sticky="w")
 
         # Pre-process checkbox
         self.preprocess_var = ctk.BooleanVar(value=True)
         self.preprocess_chk = ctk.CTkCheckBox(
             ctrl_frame,
-            text="Pre-process (16kHz Mono)",
+            text=self._t("control.preprocess"),
             variable=self.preprocess_var
         )
-        self.preprocess_chk.grid(row=0, column=6, padx=16, pady=10, sticky="w")
+        self.preprocess_chk.grid(row=0, column=4, padx=16, pady=10, sticky="w")
+        self._i18n_label(self.preprocess_chk, "control.preprocess")
 
         # Action Buttons
         self.start_btn = ctk.CTkButton(
             ctrl_frame,
-            text="▶ Transcribe Audio",
+            text=self._t("btn.transcribe"),
             fg_color="#2E7D32",
             hover_color="#1B5E20",
             font=ctk.CTkFont(weight="bold"),
             command=self._start_processing_pipeline,
             width=150
         )
-        self.start_btn.grid(row=0, column=7, padx=4, pady=10, sticky="e")
+        self.start_btn.grid(row=0, column=5, padx=4, pady=10, sticky="e")
+        self._i18n_label(self.start_btn, "btn.transcribe")
+
+        # Read-only output-language chip. lang_var is derived from the UI locale,
+        # so this shows the result rather than offering a second control.
+        self._output_lang_var = ctk.StringVar()
+        self.output_lang_chip = ctk.CTkButton(
+            ctrl_frame,
+            textvariable=self._output_lang_var,
+            width=170,
+            height=30,
+            corner_radius=6,
+            fg_color=("#E8EAF6", "#2A2A3D"),
+            hover_color=("#C5CAE9", "#3A3A52"),
+            font=ctk.CTkFont(size=11),
+            text_color=("#3949AB", "#9FA8DA"),
+            command=self._open_menu_for_language,
+        )
+        self.output_lang_chip.grid(row=0, column=6, padx=4, pady=10, sticky="e")
 
         self.gen_minutes_btn = ctk.CTkButton(
             ctrl_frame,
-            text="📝 Generate Minutes",
+            text=self._t("btn.generate_minutes"),
             fg_color="#1976D2",
             hover_color="#1565C0",
             font=ctk.CTkFont(weight="bold"),
@@ -850,22 +1139,24 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=150
         )
-        self.gen_minutes_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
+        self.gen_minutes_btn.grid(row=0, column=7, padx=4, pady=10, sticky="e")
+        self._i18n_label(self.gen_minutes_btn, "btn.generate_minutes")
 
         self.cancel_btn = ctk.CTkButton(
             ctrl_frame,
-            text="⏹ Cancel",
+            text=self._t("btn.cancel"),
             fg_color="#C62828",
             hover_color="#B71C1C",
             command=self._cancel_processing,
             state="disabled",
             width=75
         )
-        self.cancel_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
+        self.cancel_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
+        self._i18n_label(self.cancel_btn, "btn.cancel")
 
         self.monitor_btn = ctk.CTkButton(
             ctrl_frame,
-            text="📊 Monitor Chunks",
+            text=self._t("btn.monitor"),
             fg_color=("#455A64", "#37474F"),
             hover_color=("#37474F", "#263238"),
             font=ctk.CTkFont(weight="bold"),
@@ -873,22 +1164,24 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.monitor_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
+        self.monitor_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
+        self._i18n_label(self.monitor_btn, "btn.monitor")
 
         self.reset_btn = ctk.CTkButton(
             ctrl_frame,
-            text="🔄 Reset",
+            text=self._t("btn.reset"),
             fg_color=("#78909C", "#455A64"),
             hover_color=("#546E7A", "#37474F"),
             font=ctk.CTkFont(weight="bold"),
             command=self._reset_workspace,
             width=85
         )
-        self.reset_btn.grid(row=0, column=11, padx=4, pady=10, sticky="e")
+        self.reset_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
+        self._i18n_label(self.reset_btn, "btn.reset")
 
         self.save_session_btn = ctk.CTkButton(
             ctrl_frame,
-            text="💾 Save Session",
+            text=self._t("btn.save_session"),
             fg_color=("#00897B", "#00695C"),
             hover_color=("#00796B", "#004D40"),
             font=ctk.CTkFont(weight="bold"),
@@ -896,27 +1189,29 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.save_session_btn.grid(row=0, column=12, padx=(4, 16), pady=10, sticky="e")
+        self.save_session_btn.grid(row=0, column=11, padx=(4, 16), pady=10, sticky="e")
+        self._i18n_label(self.save_session_btn, "btn.save_session")
 
         # Visual Stepper Bar
         self.stepper_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
-        self.stepper_frame.grid(row=1, column=0, columnspan=13, padx=16, pady=(4, 4), sticky="ew")
+        self.stepper_frame.grid(row=1, column=0, columnspan=12, padx=16, pady=(4, 4), sticky="ew")
         for col_idx in range(7):
             self.stepper_frame.grid_columnconfigure(col_idx, weight=1 if col_idx % 2 == 0 else 0)
 
         self.step_badges = {}
         steps_def = [
-            ("step1", "① Preprocess"),
-            ("step2", "② Chunking"),
-            ("step3", "③ Transcribe"),
-            ("step4", "④ Minutes & Actions")
+            ("step1", "step.step1"),
+            ("step2", "step.step2"),
+            ("step3", "step.step3"),
+            ("step4", "step.step4"),
         ]
 
-        for s_idx, (s_key, s_label) in enumerate(steps_def):
+        for s_idx, (s_key, s_i18n) in enumerate(steps_def):
             grid_col = s_idx * 2
+            self._step_labels[s_key] = self._t(s_i18n)
             badge = ctk.CTkLabel(
                 self.stepper_frame,
-                text=f"{s_label} ⚪",
+                text=f"{self._step_labels[s_key]} ⚪",
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color="gray",
                 fg_color=("#E0E0E0", "#2B2B2B"),
@@ -934,25 +1229,28 @@ class STTMeetApp(ctk.CTk):
 
         # Progress bar & Status text
         self.progress_bar = ctk.CTkProgressBar(ctrl_frame)
-        self.progress_bar.grid(row=2, column=0, columnspan=13, padx=16, pady=(4, 4), sticky="ew")
+        self.progress_bar.grid(row=2, column=0, columnspan=12, padx=16, pady=(4, 4), sticky="ew")
         self.progress_bar.set(0.0)
 
         self.status_label = ctk.CTkLabel(
             ctrl_frame,
-            text="Ready. Select an audio file and click Transcribe Audio.",
+            text=self._t("status.ready"),
             font=ctk.CTkFont(size=12),
             anchor="w"
         )
-        self.status_label.grid(row=3, column=0, columnspan=13, padx=16, pady=(0, 10), sticky="w")
+        self.status_label.grid(row=3, column=0, columnspan=12, padx=16, pady=(0, 10), sticky="w")
 
     def _build_tabs_section(self):
         self.tabview = ctk.CTkTabview(self, corner_radius=10)
         self.tabview.grid(row=3, column=0, padx=16, pady=6, sticky="nsew")
 
-        self.tab_transcript = self.tabview.add("Transkrip Penuh / Transcript")
-        self.tab_minutes = self.tabview.add("Minit Mesyuarat / Minutes")
-        self.tab_summary = self.tabview.add("Ringkasan / Summary")
-        self.tab_actions = self.tabview.add("Senarai Tindakan / Action Items")
+        # Tabs are added under locale-independent names so switching language
+        # never changes tab identity; only the captions are re-labelled.
+        self.tab_transcript = self.tabview.add("tab_transcript")
+        self.tab_minutes = self.tabview.add("tab_minutes")
+        self.tab_summary = self.tabview.add("tab_summary")
+        self.tab_actions = self.tabview.add("tab_actions")
+        self._retranslate_tabs()
 
         # Setup textboxes in each tab
         self.txt_transcript = self._create_textbox(self.tab_transcript)
@@ -964,7 +1262,7 @@ class STTMeetApp(ctk.CTk):
         self.minutes_banner_frame = ctk.CTkFrame(self.tab_minutes, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
         self.minutes_banner_label = ctk.CTkLabel(
             self.minutes_banner_frame,
-            text="⚠️ Server spike encountered. Your transcript is safe.",
+            text=self._t("minutes.banner_idle"),
             text_color=("#C62828", "#FFCDD2"),
             font=ctk.CTkFont(size=12, weight="bold")
         )
@@ -972,13 +1270,14 @@ class STTMeetApp(ctk.CTk):
 
         self.retry_minutes_btn = ctk.CTkButton(
             self.minutes_banner_frame,
-            text="↻ Retry Generation",
+            text=self._t("btn.retry_minutes"),
             fg_color="#D32F2F",
             hover_color="#B71C1C",
             width=140,
             command=self._start_minutes_generation_only
         )
         self.retry_minutes_btn.pack(side="right", padx=12, pady=6)
+        self._i18n_label(self.retry_minutes_btn, "btn.retry_minutes")
         # Note: self.minutes_banner_frame starts hidden (not gridded until error occurs)
 
         self.txt_minutes = ctk.CTkTextbox(self.tab_minutes, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
@@ -1002,46 +1301,51 @@ class STTMeetApp(ctk.CTk):
         # Speaker mapping trigger
         speaker_btn = ctk.CTkButton(
             bottom_frame,
-            text="👥 Map Speaker Names",
+            text=self._t("btn.map_speakers"),
             command=self._open_speaker_mapping_dialog,
             width=160
         )
         speaker_btn.grid(row=0, column=0, padx=16, pady=10, sticky="w")
+        self._i18n_label(speaker_btn, "btn.map_speakers")
 
         # Export Buttons
         export_docx_btn = ctk.CTkButton(
             bottom_frame,
-            text="📄 Export Word (.docx)",
+            text=self._t("btn.export_docx"),
             command=lambda: self._export_document("docx"),
             width=150
         )
         export_docx_btn.grid(row=0, column=2, padx=4, pady=10)
+        self._i18n_label(export_docx_btn, "btn.export_docx")
 
         export_md_btn = ctk.CTkButton(
             bottom_frame,
-            text="📝 Export Markdown (.md)",
+            text=self._t("btn.export_md"),
             command=lambda: self._export_document("md"),
             width=150
         )
         export_md_btn.grid(row=0, column=3, padx=4, pady=10)
+        self._i18n_label(export_md_btn, "btn.export_md")
 
         export_txt_btn = ctk.CTkButton(
             bottom_frame,
-            text="📃 Export Text (.txt)",
+            text=self._t("btn.export_txt"),
             command=lambda: self._export_document("txt"),
             width=130
         )
         export_txt_btn.grid(row=0, column=4, padx=4, pady=10)
+        self._i18n_label(export_txt_btn, "btn.export_txt")
 
         export_all_btn = ctk.CTkButton(
             bottom_frame,
-            text="📦 Export All",
+            text=self._t("btn.export_all"),
             fg_color="#1565C0",
             hover_color="#0D47A1",
             command=lambda: self._export_document("all"),
             width=110
         )
         export_all_btn.grid(row=0, column=5, padx=(4, 16), pady=10)
+        self._i18n_label(export_all_btn, "btn.export_all")
 
     # -------------------------------------------------------------
     # Helpers & Validation
@@ -1049,33 +1353,35 @@ class STTMeetApp(ctk.CTk):
     def _check_initial_environment(self):
         is_ok, msg = check_ffmpeg()
         if is_ok:
-            self.ffmpeg_badge.configure(text="FFmpeg: ✅ Installed", text_color="#2E7D32")
+            self.ffmpeg_badge.configure(text=self._t("ffmpeg.installed"), text_color="#2E7D32")
         else:
-            self.ffmpeg_badge.configure(text="FFmpeg: ❌ Not Found in PATH", text_color="#C62828")
+            self.ffmpeg_badge.configure(text=self._t("ffmpeg.missing"), text_color="#C62828")
             messagebox.showwarning(
-                "FFmpeg Warning",
-                "FFmpeg was not detected in your system PATH.\nPlease ensure FFmpeg is installed to support all audio formats."
+                self._t("msg.ffmpeg_warning"),
+                self._t("msg.ffmpeg_missing_body")
             )
 
     def _save_api_key(self, notify: bool = True) -> bool:
         """Persist self.api_key_var to .env. Returns True when a key was saved."""
         new_key = self.api_key_var.get().strip()
         if not new_key:
-            messagebox.showwarning("Warning", "Please enter a valid Gemini API Key.")
+            messagebox.showwarning(self._t("msg.warning"), self._t("msg.key_invalid"))
             return False
         save_api_key(new_key)
         self._refresh_menu_key_badge()
-        self._set_status("Gemini API Key saved successfully.")
+        self._set_status(self._t("status.key_saved"))
         if notify:
-            messagebox.showinfo("Success", "Gemini API Key saved successfully to .env.")
+            messagebox.showinfo(self._t("msg.success"), self._t("msg.key_saved_env"))
         return True
 
     def _browse_audio_file(self):
         filetypes = [
-            ("Supported Audio Files", "*.mp3 *.m4a *.wav *.aac *.ogg *.flac *.mp4"),
-            ("All Files", "*.*")
+            (self._t("filepicker.supported"), "*.mp3 *.m4a *.wav *.aac *.ogg *.flac *.mp4"),
+            (self._t("filepicker.all"), "*.*")
         ]
-        chosen = filedialog.askopenfilename(title="Select Meeting Audio", filetypes=filetypes)
+        chosen = filedialog.askopenfilename(
+            title=self._t("filepicker.audio_title"), filetypes=filetypes
+        )
         if not chosen:
             return
 
@@ -1086,17 +1392,20 @@ class STTMeetApp(ctk.CTk):
         try:
             self.audio_duration_seconds = get_audio_duration(chosen)
             cost_info = estimate_cost_and_tokens(self.audio_duration_seconds)
-            
-            self.file_label.configure(text=f"Selected: {file_name}")
+
+            self.file_label.configure(text=self._t("file.selected", name=file_name))
             self.audio_stats_label.configure(
-                text=f"Duration: {cost_info['formatted_duration']}  |  "
-                     f"File Size: {file_size_mb:.1f} MB  |  "
-                     f"Est. Tokens: ~{cost_info['estimated_input_tokens']:,}  |  "
-                     f"Est. Cost: ~${cost_info['estimated_cost_usd']:.2f}"
+                text=self._t(
+                    "file.stats",
+                    duration=cost_info['formatted_duration'],
+                    size=f"{file_size_mb:.1f}",
+                    tokens=f"{cost_info['estimated_input_tokens']:,}",
+                    cost=f"{cost_info['estimated_cost_usd']:.2f}",
+                )
             )
         except Exception as e:
-            self.file_label.configure(text=f"Selected: {file_name}")
-            self.audio_stats_label.configure(text=f"Could not calculate audio duration: {e}")
+            self.file_label.configure(text=self._t("file.selected", name=file_name))
+            self.audio_stats_label.configure(text=self._t("file.stats_error", error=e))
 
         # A valid file is now loaded: the session can be saved even if none exists yet
         self._set_save_session_enabled(True)
@@ -1121,21 +1430,21 @@ class STTMeetApp(ctk.CTk):
         self.chunk_size_var.set("25 min")
         self.chunk_dropdown.configure(values=["15 min", "20 min", "25 min", "30 min", "45 min"])
         if "Auto" in choice:
-            self._set_status("Smart Cloud Mode: Auto-fails over between Gemini 3, 3.8, and 3.5 if free quotas fill up.")
+            self._set_status(self._t("status.engine_auto"))
         else:
-            self._set_status(f"Cloud mode selected: Uses {choice.strip()} with automatic quota failover protection.")
+            self._set_status(self._t("status.engine_selected", choice=choice.strip()))
 
     # -------------------------------------------------------------
     # Processing Pipeline (Threaded)
     # -------------------------------------------------------------
     def _start_processing_pipeline(self):
         if not self.selected_audio_file or not os.path.exists(self.selected_audio_file):
-            messagebox.showerror("Error", "Please select a valid meeting audio file first.")
+            messagebox.showerror(self._t("msg.error"), self._t("msg.no_audio"))
             return
 
         api_key = self.api_key_var.get().strip()
         if not api_key:
-            messagebox.showerror("Error", "Gemini API Key is required. Open \u2630 \u2192 Settings to add your key.")
+            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required"))
             return
 
         self.is_processing = True
@@ -1173,9 +1482,9 @@ class STTMeetApp(ctk.CTk):
         self.worker_thread.start()
 
     def _cancel_processing(self):
-        if messagebox.askyesno("Cancel", "Are you sure you want to cancel the ongoing transcription?"):
+        if messagebox.askyesno(self._t("msg.cancel_title"), self._t("msg.cancel_confirm")):
             self.cancel_event.set()
-            self._set_status("Cancelling... finishing active operation.")
+            self._set_status(self._t("status.cancelling"))
 
     def _open_or_focus_chunk_monitor(self):
         """Bring chunk monitor dialog to front or recreate it if closed."""
@@ -1195,7 +1504,8 @@ class STTMeetApp(ctk.CTk):
             chunks_meta=chunks_meta,
             on_cancel_callback=self._cancel_processing,
             on_reprocess_callback=self._reprocess_single_chunk,
-            on_extract_callback=self._extract_transcript_from_monitor
+            on_extract_callback=self._extract_transcript_from_monitor,
+            t=self._t,
         )
         self.monitor_btn.configure(state="normal")
         # Sync existing status into monitor
@@ -1235,15 +1545,17 @@ class STTMeetApp(ctk.CTk):
             self._update_step_badge("step1", "working")
             target_audio = audio_path
             if do_preprocess:
-                self._set_status("[Step 1/4] Pre-processing audio (16kHz mono MP3)...")
+                self._set_status(self._t("status.step1_start"))
                 target_audio = preprocess_audio(
                     audio_path,
-                    progress_callback=lambda msg: self._set_status(f"[Step 1/4] {msg}")
+                    progress_callback=lambda msg: self._set_status(
+                        f"{self._t('status.step_prefix', n=1)} {msg}"
+                    )
                 )
                 self._update_step_badge("step1", "done")
             else:
-                self._set_status("[Step 1/4] Audio preprocessing skipped.")
-                self._update_step_badge("step1", "done", "(skipped)")
+                self._set_status(self._t("status.step1_done"))
+                self._update_step_badge("step1", "done", self._t("step.skipped"))
 
             if self.cancel_event.is_set():
                 self._on_pipeline_cancelled()
@@ -1251,15 +1563,19 @@ class STTMeetApp(ctk.CTk):
 
             # Step 2: Slicing into Chunks
             self._update_step_badge("step2", "working")
-            self._set_status("[Step 2/4] Preparing audio chunks (checking cache)...")
+            self._set_status(self._t("status.step2_start"))
             chunks = split_audio_into_chunks(
                 target_audio,
                 chunk_minutes=chunk_minutes,
-                progress_callback=lambda msg, pct: self._set_progress(pct * 0.2, f"[Step 2/4] {msg}")
+                progress_callback=lambda msg, pct: self._set_progress(
+                    pct * 0.2, f"{self._t('status.step_prefix', n=2)} {msg}"
+                )
             )
             total_chunks = len(chunks)
             self.active_chunks_meta = chunks
-            self._update_step_badge("step2", "done", f"({total_chunks} chunks)")
+            self._update_step_badge(
+                "step2", "done", self._t("step.chunk_count", count=total_chunks)
+            )
 
             # Initialize chunk statuses
             completed_transcripts = {}
@@ -1315,13 +1631,19 @@ class STTMeetApp(ctk.CTk):
                     chunk_text = self.active_chunk_status[idx]["text"]
                     lines = [l for l in chunk_text.splitlines() if l.strip()]
                     previous_tail_context = "\n".join(lines[-4:]) if lines else ""
-                    self._set_progress(base_pct, f"[Step 3/4] Loaded {chunk_display} from cache.")
+                    self._set_progress(
+                        base_pct, self._t("status.step3_cached", chunks=chunk_display)
+                    )
                     continue
 
                 # Mark chunk as working in monitor & main status
                 self._update_chunk_monitor_item(idx, "working")
                 engine_display_name = model_override or "Gemini Auto-Failover"
-                self._set_progress(base_pct, f"[Step 3/4] Transcribing {chunk_display} ({engine_display_name})...")
+                self._set_progress(
+                    base_pct,
+                    self._t("status.step3_transcribing",
+                            chunks=chunk_display, engine=engine_display_name)
+                )
                 self._update_step_badge("step3", "working", f"({i+1}/{total_chunks})")
 
                 try:
@@ -1331,7 +1653,9 @@ class STTMeetApp(ctk.CTk):
                         client=client,
                         chunk_file_path=chunk_info["file_path"],
                         previous_tail_transcript=previous_tail_context,
-                        progress_callback=lambda msg: self._set_status(f"[Step 3/4] {chunk_display}: {msg}"),
+                        progress_callback=lambda msg: self._set_status(
+                            self._t("status.step_chunk", chunk=chunk_display, msg=msg)
+                        ),
                         model_override=model_override
                     )
 
@@ -1388,10 +1712,15 @@ class STTMeetApp(ctk.CTk):
 
             if completed_count == total_chunks:
                 self._update_step_badge("step3", "done", f"({total_chunks}/{total_chunks})")
-                self._set_progress(0.80, "All chunks completed! Click 'Extract Transcript' in the Monitor window.")
+                self._set_progress(0.80, self._t("status.all_chunks_done"))
             else:
-                self._update_step_badge("step3", "error", f"({completed_count}/{total_chunks} done)")
-                self._set_progress(0.80, f"Batch finished: {completed_count}/{total_chunks} chunks completed. Please click '↻ Reprocess' on failed chunks.")
+                self._update_step_badge(
+                    "step3", "error",
+                    f"({self._t('status.chunks_done_suffix', done=completed_count, total=total_chunks)})"
+                )
+                self._set_progress(
+                    0.80, self._t("status.batch_finished", done=completed_count, total=total_chunks)
+                )
 
             # Autosave so settings + partial progress survive a restart
             # even when the user never clicks "Extract Transcript".
@@ -1423,16 +1752,18 @@ class STTMeetApp(ctk.CTk):
         """Reprocess an individual failed or pending chunk in an isolated background thread."""
         chunk_info = next((c for c in self.active_chunks_meta if c["chunk_index"] == chunk_index), None)
         if not chunk_info:
-            messagebox.showerror("Error", f"Chunk metadata for index {chunk_index} not found.")
+            messagebox.showerror(
+                self._t("msg.error"), self._t("msg.chunk_meta_missing", index=chunk_index)
+            )
             return
 
         api_key = self.api_key_var.get().strip()
         if not api_key:
-            messagebox.showerror("Error", "Gemini API key is required. Open \u2630 \u2192 Settings to add your key.")
+            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required"))
             return
 
         self._update_chunk_monitor_item(chunk_index, "working")
-        self._set_status(f"Reprocessing Chunk {chunk_index + 1}...")
+        self._set_status(self._t("status.reprocessing_chunk", index=chunk_index + 1))
 
         def worker():
             try:
@@ -1491,7 +1822,7 @@ class STTMeetApp(ctk.CTk):
                 self.after(0, lambda c=completed, t=total, e=has_err: (
                     self.monitor_dialog.update_overall_summary(c, t, e) if self.monitor_dialog and self.monitor_dialog.winfo_exists() else None
                 ))
-                self._set_status(f"Chunk {chunk_index + 1} reprocessed successfully!")
+                self._set_status(self._t("status.reprocess_done", index=chunk_index + 1))
                 if self.active_file_hash:
                     self._save_full_session(self.active_file_hash)
 
@@ -1504,7 +1835,9 @@ class STTMeetApp(ctk.CTk):
                     "error": err_str
                 }
                 self._update_chunk_monitor_item(chunk_index, "error", err_str)
-                self._set_status(f"Reprocess of Chunk {chunk_index + 1} failed: {err_str[:40]}")
+                self._set_status(
+                    self._t("status.reprocess_failed", index=chunk_index + 1, error=err_str[:40])
+                )
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -1515,8 +1848,8 @@ class STTMeetApp(ctk.CTk):
         missing = [c["chunk_index"] for c in self.active_chunks_meta if self.active_chunk_status.get(c["chunk_index"], {}).get("status") != "done"]
 
         if missing:
-            msg = f"Chunks {[m + 1 for m in missing]} are not completed yet.\nExtract available completed chunks anyway?"
-            if not messagebox.askyesno("Partial Extraction", msg):
+            msg = self._t("msg.partial_chunks", indexes=[m + 1 for m in missing])
+            if not messagebox.askyesno(self._t("msg.partial_extraction"), msg):
                 return
 
         # Combine transcripts in strict sequential order
@@ -1544,8 +1877,11 @@ class STTMeetApp(ctk.CTk):
         if self.monitor_dialog and self.monitor_dialog.winfo_exists():
             self.monitor_dialog.withdraw()
 
-        self._set_progress(1.0, f"Extracted transcript ({len(ordered_parts)} chunks). Ready to generate minutes!")
-        messagebox.showinfo("Extraction Complete", f"Successfully extracted {len(ordered_parts)} chunk(s) into the Transcript tab!\nYou can now click '📝 Generate Minutes'.")
+        self._set_progress(1.0, self._t("status.extracted", count=len(ordered_parts)))
+        messagebox.showinfo(
+            self._t("msg.extraction_complete"),
+            self._t("msg.extracted_body", count=len(ordered_parts))
+        )
 
     def _save_checkpoint_file(self, checkpoint_path, file_hash, chunks_dict):
         try:
@@ -1565,13 +1901,17 @@ class STTMeetApp(ctk.CTk):
         Safeguards transcript so a minutes failure never marks the transcript as failed or crashes the session.
         """
         self._update_step_badge("step4", "working")
-        self._set_progress(0.85, f"[Step 4/4] Generating Meeting Minutes & Action Items ({language})...")
+        self._set_progress(
+            0.85,
+            self._t("status.step4_start",
+                    language=display_minutes_lang(language, self.ui_locale))
+        )
 
         try:
             if not client:
                 api_key = self.api_key_var.get().strip()
                 if not api_key:
-                    raise ValueError("Gemini API key is required. Open \u2630 \u2192 Settings to add your key.")
+                    raise ValueError(self._t("msg.key_required"))
                 client = get_gemini_client(api_key)
 
             transcript_to_use = self.processed_transcript or self.raw_transcript
@@ -1582,7 +1922,9 @@ class STTMeetApp(ctk.CTk):
                 client=client,
                 full_transcript=transcript_to_use,
                 language=language,
-                progress_callback=lambda msg: self._set_status(f"[Step 4/4] {msg}"),
+                progress_callback=lambda msg: self._set_status(
+                    f"{self._t('status.step_prefix', n=4)} {msg}"
+                ),
                 model_override=self._get_selected_model_override()
             )
 
@@ -1591,15 +1933,15 @@ class STTMeetApp(ctk.CTk):
             self.after(0, self._hide_minutes_error_banner)
             self._update_step_badge("step4", "done")
             self._save_full_session(file_hash)
-            self._set_progress(1.0, "Ready. Transcription and meeting minutes completed successfully!")
+            self._set_progress(1.0, self._t("status.all_complete"))
             self.after(0, self._on_pipeline_finished)
 
         except Exception as err:
             err_msg = str(err)
             log.warning("Minutes synthesis failed (transcript remains protected): %s", err_msg)
-            self._update_step_badge("step4", "error", "(Failed)")
+            self._update_step_badge("step4", "error", self._t("step.failed"))
             self.after(0, lambda msg=err_msg: self._show_minutes_error_banner(msg))
-            self._set_progress(0.80, "Transcript completed. Minutes generation failed (click Retry).")
+            self._set_progress(0.80, self._t("status.minutes_failed"))
             self.is_processing = False
             self.after(0, lambda: self.start_btn.configure(state="normal"))
             self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
@@ -1612,16 +1954,16 @@ class STTMeetApp(ctk.CTk):
         """
         transcript_to_use = self.processed_transcript or self.raw_transcript
         if not transcript_to_use.strip():
-            messagebox.showwarning("Notice", "No transcript available. Please transcribe audio first.")
+            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
             return
 
         api_key = self.api_key_var.get().strip()
         if not api_key:
-            messagebox.showerror("Error", "Gemini API key is required for minutes synthesis. Open \u2630 \u2192 Settings.")
+            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
             return
 
         if self.is_processing:
-            messagebox.showinfo("Busy", "A task is already running. Please wait for it to complete.")
+            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
             return
 
         self.is_processing = True
@@ -1667,7 +2009,9 @@ class STTMeetApp(ctk.CTk):
         fg_text, bg_col, icon = colors.get(state, colors["pending"])
         if step_key in self._step_states:
             self._step_states[step_key] = state
-        base_name = badge.cget("text").split()[0]
+        # Read the base label from _step_labels rather than re-parsing the badge's
+        # rendered text: split()[0] would discard the label word entirely.
+        base_name = self._step_labels.get(step_key, "")
         label_text = f"{base_name} {extra}".strip() if extra else base_name
         self.after(0, lambda: badge.configure(
             text=f"{label_text} {icon}",
@@ -1752,21 +2096,24 @@ class STTMeetApp(ctk.CTk):
     def _save_session_manually(self):
         """Explicit user-triggered save from the 💾 Save Session button."""
         if not self.selected_audio_file or not os.path.exists(self.selected_audio_file):
-            messagebox.showwarning("Save Session", "Please select a valid audio file first.")
+            messagebox.showwarning(self._t("msg.save_session"), self._t("msg.save_no_file"))
             return
 
         if self.is_processing:
             if not messagebox.askyesno(
-                "Save Session",
-                "A task is currently running. Save the session in its current state anyway?"
+                self._t("msg.save_session"),
+                self._t("msg.save_while_running")
             ):
                 return
 
         audio_hash = compute_file_hash(self.selected_audio_file)
         if self._save_full_session(audio_hash):
-            messagebox.showinfo("Session Saved", f"Session saved for:\n{Path(self.selected_audio_file).name}")
+            messagebox.showinfo(
+                self._t("msg.session_saved"),
+                self._t("msg.session_saved_body", name=Path(self.selected_audio_file).name)
+            )
         else:
-            messagebox.showerror("Save Session", "Could not write the session file. Check sttmeet.log for details.")
+            messagebox.showerror(self._t("msg.save_session"), self._t("msg.session_save_failed"))
 
     def _on_app_close(self):
         """Autosave the active session when the window is closed."""
@@ -1808,9 +2155,12 @@ class STTMeetApp(ctk.CTk):
 
             chunk_summary = self._describe_restored_chunks(data["status"])
             if chunk_summary:
-                message = f"Restored session for {Path(audio_path).name} ({chunk_summary})."
+                message = self._t(
+                    "status.session_restored",
+                    name=Path(audio_path).name, chunks=chunk_summary
+                )
             else:
-                message = "Restored previous session from cache!"
+                message = self._t("status.session_restored_plain")
             self._set_progress(data["status"]["progress"], message)
             return True
         except Exception as e:
@@ -1824,9 +2174,16 @@ class STTMeetApp(ctk.CTk):
         # set() does not fire the option menu command callback, so this will not
         # reset the chunk dropdown values or emit a misleading status message.
         self.engine_var.set(clean["engine"])
-        self.lang_var.set(clean["language"])
         self.chunk_size_var.set(f"{clean['chunk_minutes']} min")
         self.preprocess_var.set(clean["preprocess"])
+        self._session_settings_snapshot = dict(clean)
+
+        # The UI locale governs the minutes language. A session records the
+        # language that produced its output, but that no longer overrides the
+        # current preference, so re-cascade after the stored value is applied.
+        self._cascade_minutes_lang()
+        self._refresh_output_lang_chip()
+        clean["language"] = self.lang_var.get()
         self._session_settings_snapshot = dict(clean)
 
     def _apply_saved_status(self, status: Dict):
@@ -1855,7 +2212,7 @@ class STTMeetApp(ctk.CTk):
         if not chunks:
             return ""
         done = sum(1 for c in chunks if c["status"] == "done")
-        return f"{done}/{len(chunks)} chunks done"
+        return self._t("status.chunks_done_suffix", done=done, total=len(chunks))
 
     def _reset_workspace(self):
         """
@@ -1863,7 +2220,7 @@ class STTMeetApp(ctk.CTk):
         cached progress, chunks, manifests, and session checkpoints so the next run is 100% fresh.
         """
         if self.is_processing:
-            messagebox.showwarning("Notice", "Cannot reset while a transcription task is currently running.")
+            messagebox.showwarning(self._t("msg.notice"), self._t("msg.reset_running"))
             return
 
         # Clear text in all 4 tabs
@@ -1917,10 +2274,12 @@ class STTMeetApp(ctk.CTk):
         except Exception as e:
             log.warning("Could not clear cache files: %s", e)
 
-        self._set_status("Workspace reset & cache completely cleared. Ready for fresh transcription.")
+        self._set_status(self._t("status.workspace_reset"))
 
     def _show_minutes_error_banner(self, err_msg: str):
-        self.minutes_banner_label.configure(text=f"⚠️ Minutes failed ({err_msg[:60]}...). Transcript is safe.")
+        self.minutes_banner_label.configure(
+            text=self._t("minutes.banner_error", error=err_msg[:60])
+        )
         self.minutes_banner_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
 
     def _hide_minutes_error_banner(self):
@@ -1945,26 +2304,25 @@ class STTMeetApp(ctk.CTk):
         self.txt_minutes.insert("1.0", sections.get("full_text", ""))
 
         self.txt_summary.delete("1.0", "end")
-        self.txt_summary.insert("1.0", sections.get("summary", "Summary not generated."))
+        self.txt_summary.insert("1.0", sections.get("summary", self._t("content.summary_missing")))
 
         self.txt_actions.delete("1.0", "end")
-        self.txt_actions.insert("1.0", sections.get("action_items", "No action items extracted."))
+        self.txt_actions.insert("1.0", sections.get("action_items", self._t("content.actions_missing")))
 
     def _on_pipeline_finished(self):
         self.is_processing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         messagebox.showinfo(
-            "Completed",
-            "Meeting transcription, minutes, and action items have been generated!\n"
-            "You can now review the tabs or map speaker names before exporting."
+            self._t("msg.completed"),
+            self._t("msg.completed_body")
         )
 
     def _on_pipeline_cancelled(self):
         self.is_processing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
-        self._set_status("Operation cancelled by user. Partial progress saved in cache.")
+        self._set_status(self._t("status.cancelled"))
         if self.active_file_hash:
             self._save_full_session(self.active_file_hash)
 
@@ -1972,31 +2330,34 @@ class STTMeetApp(ctk.CTk):
         self.is_processing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
-        self._set_status(f"Error: {error_message}")
-        messagebox.showerror("Transcription Error", f"An error occurred:\n{error_message}")
+        self._set_status(self._t("status.error", error=error_message))
+        messagebox.showerror(
+            self._t("msg.transcription_error"),
+            self._t("msg.transcription_error_body", error=error_message)
+        )
 
     # -------------------------------------------------------------
     # Speaker Mapping Dialog
     # -------------------------------------------------------------
     def _open_speaker_mapping_dialog(self):
         if not self.raw_transcript:
-            messagebox.showinfo("Speaker Mapping", "Please transcribe an audio file first to detect speakers.")
+            messagebox.showinfo(self._t("msg.speaker_mapping"), self._t("msg.no_speakers_yet"))
             return
 
         speakers = self.detected_speakers or extract_speakers(self.raw_transcript)
         if not speakers:
-            messagebox.showinfo("Speaker Mapping", "No speakers were detected in the transcript.")
+            messagebox.showinfo(self._t("msg.speaker_mapping"), self._t("msg.no_speakers"))
             return
 
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Map Speaker Names")
+        dialog.title(self._t("speakers.title"))
         dialog.geometry("450x380")
         dialog.transient(self)
         dialog.grab_set()
 
         lbl = ctk.CTkLabel(
             dialog,
-            text="Assign real names to detected voice tags:",
+            text=self._t("speakers.assign"),
             font=ctk.CTkFont(weight="bold")
         )
         lbl.pack(padx=16, pady=(16, 10), anchor="w")
@@ -2012,7 +2373,7 @@ class STTMeetApp(ctk.CTk):
             spk_lbl = ctk.CTkLabel(row_frame, text=f"{spk}:", width=90, anchor="w")
             spk_lbl.pack(side="left", padx=4)
 
-            name_entry = ctk.CTkEntry(row_frame, placeholder_text=f"e.g. En. Ahmad / Sarah")
+            name_entry = ctk.CTkEntry(row_frame, placeholder_text=self._t("speakers.placeholder"))
             name_entry.pack(side="left", fill="x", expand=True, padx=4)
             saved_name = self.speaker_mapping.get(spk, "")
             if saved_name:
@@ -2038,9 +2399,9 @@ class STTMeetApp(ctk.CTk):
                 self._save_full_session(self.active_file_hash)
 
             dialog.destroy()
-            messagebox.showinfo("Applied", "Speaker names updated across transcript and minutes!")
+            messagebox.showinfo(self._t("msg.applied"), self._t("msg.speakers_applied"))
 
-        apply_btn = ctk.CTkButton(dialog, text="Apply Speaker Names", command=apply_mapping)
+        apply_btn = ctk.CTkButton(dialog, text=self._t("speakers.apply"), command=apply_mapping)
         apply_btn.pack(padx=16, pady=12)
 
     # -------------------------------------------------------------
@@ -2048,22 +2409,24 @@ class STTMeetApp(ctk.CTk):
     # -------------------------------------------------------------
     def _export_document(self, fmt: str):
         if not self.processed_transcript and not self.generated_minutes:
-            messagebox.showwarning("Export", "No transcribed content or minutes available to export.")
+            messagebox.showwarning(self._t("msg.export"), self._t("msg.export_nothing"))
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = Path(self.selected_audio_file).stem if self.selected_audio_file else "Meeting"
 
+        # Export title and filenames stay as-is: they are document content, not UI
+        # chrome, and the exported documents remain bilingual by design.
         title = f"Minit Mesyuarat - {base_name}"
         minutes_content = self.generated_minutes or self.processed_transcript
         transcript_content = self.processed_transcript
 
         if fmt in ["docx", "all"]:
             save_path = filedialog.asksaveasfilename(
-                title="Save Word Document",
+                title=self._t("filepicker.save_docx"),
                 initialfile=f"Minit_{base_name}_{timestamp}.docx",
                 defaultextension=".docx",
-                filetypes=[("Word Document", "*.docx")]
+                filetypes=[(self._t("filepicker.word_doc"), "*.docx")]
             )
             if save_path:
                 export_to_docx(
@@ -2075,10 +2438,10 @@ class STTMeetApp(ctk.CTk):
 
         if fmt in ["md", "all"]:
             save_path = filedialog.asksaveasfilename(
-                title="Save Markdown Document",
+                title=self._t("filepicker.save_md"),
                 initialfile=f"Minit_{base_name}_{timestamp}.md",
                 defaultextension=".md",
-                filetypes=[("Markdown Document", "*.md")]
+                filetypes=[(self._t("filepicker.markdown_doc"), "*.md")]
             )
             if save_path:
                 export_to_markdown(
@@ -2090,10 +2453,10 @@ class STTMeetApp(ctk.CTk):
 
         if fmt in ["txt", "all"]:
             save_path = filedialog.asksaveasfilename(
-                title="Save Plain Text Document",
+                title=self._t("filepicker.save_txt"),
                 initialfile=f"Minit_{base_name}_{timestamp}.txt",
                 defaultextension=".txt",
-                filetypes=[("Text File", "*.txt")]
+                filetypes=[(self._t("filepicker.text_file"), "*.txt")]
             )
             if save_path:
                 export_to_text(
@@ -2103,7 +2466,7 @@ class STTMeetApp(ctk.CTk):
                     transcript=transcript_content
                 )
 
-        messagebox.showinfo("Export Successful", f"Document(s) saved successfully!")
+        messagebox.showinfo(self._t("msg.export_success"), self._t("msg.export_done"))
 
 def run_app():
     app = STTMeetApp()
