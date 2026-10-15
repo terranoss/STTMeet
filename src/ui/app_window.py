@@ -83,6 +83,9 @@ from ..exporter import (
     export_to_text
 )
 from ..session_store import (
+    DEFAULT_SETTINGS,
+    VALID_CHUNK_MINUTES,
+    VALID_ENGINES,
     VALID_TEMPLATES,
     build_session_payload,
     load_session,
@@ -1001,10 +1004,10 @@ class STTMeetApp(ctk.CTk):
         self._open_about_dialog()
 
     def _open_settings_dialog(self):
-        """Modal holding Gemini API Key entry and Audio Preprocessing options."""
+        """Modal holding Gemini API Key entry, processing options and audio preprocessing."""
         dialog = ctk.CTkToplevel(self)
         dialog.title(self._t("settings.title"))
-        dialog.geometry("520x460")
+        dialog.geometry("520x700")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
@@ -1109,11 +1112,83 @@ class STTMeetApp(ctk.CTk):
             anchor="w"
         ).grid(row=7, column=0, pady=(0, 6), sticky="ew")
 
+        # Processing Section: engine, chunk duration and minutes format
+        ctk.CTkFrame(body, height=1, fg_color=("gray85", "gray25")).grid(
+            row=8, column=0, pady=(16, 12), sticky="ew"
+        )
+
+        ctk.CTkLabel(
+            body,
+            text=self._t("settings.processing_heading"),
+            font=ctk.CTkFont(size=16, weight="bold"),
+            anchor="w"
+        ).grid(row=9, column=0, sticky="ew")
+
+        proc_frame = ctk.CTkFrame(body, fg_color="transparent")
+        proc_frame.grid(row=10, column=0, pady=(10, 0), sticky="ew")
+        proc_frame.grid_columnconfigure(1, weight=1)
+
+        def add_proc_row(row_idx, i18n_key):
+            ctk.CTkLabel(proc_frame, text=self._t(i18n_key), anchor="w").grid(
+                row=row_idx, column=0, pady=6, sticky="w"
+            )
+
+        # Engine
+        add_proc_row(0, "settings.engine")
+        temp_engine_var = ctk.StringVar(value=self.engine_var.get())
+        temp_chunk_var = ctk.StringVar(value=self.chunk_size_var.get())
+        temp_template_var = ctk.StringVar(value=self.template_display_var.get())
+
+        def on_engine_choice(choice):
+            temp_chunk_var.set("25 min")
+            chunk_menu.configure(values=self._chunk_display_values())
+            if "Auto" in choice:
+                self._set_status(self._t("status.engine_auto"))
+            else:
+                self._set_status(self._t("status.engine_selected", choice=choice.strip()))
+
+        engine_menu = ctk.CTkOptionMenu(
+            proc_frame,
+            values=list(VALID_ENGINES),
+            variable=temp_engine_var,
+            command=on_engine_choice
+        )
+        engine_menu.grid(row=0, column=1, padx=(10, 0), pady=6, sticky="ew")
+
+        # Chunk duration
+        add_proc_row(1, "settings.chunk")
+        chunk_menu = ctk.CTkOptionMenu(
+            proc_frame,
+            values=self._chunk_display_values(),
+            variable=temp_chunk_var
+        )
+        chunk_menu.grid(row=1, column=1, padx=(10, 0), pady=6, sticky="ew")
+
+        # Meeting minute format
+        add_proc_row(2, "settings.template")
+        ctk.CTkOptionMenu(
+            proc_frame,
+            values=[display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES],
+            variable=temp_template_var
+        ).grid(row=2, column=1, padx=(10, 0), pady=6, sticky="ew")
+
         def do_save():
             if self._save_api_key(notify=False):
                 new_prep = bool(temp_preprocess_var.get())
                 self.preprocess_var.set(new_prep)
                 save_pref("preprocess", new_prep)
+
+                engine = temp_engine_var.get()
+                self.engine_var.set(engine)
+                save_pref("engine", engine)
+                self._on_engine_changed(engine)
+
+                chunk = temp_chunk_var.get()
+                self.chunk_size_var.set(chunk)
+                save_pref("chunk_minutes", int(chunk.split()[0]))
+
+                self._on_template_selected(temp_template_var.get())
+
                 messagebox.showinfo(self._t("msg.success"), self._t("msg.key_saved_body"), parent=dialog)
                 close_dialog()
 
@@ -1126,7 +1201,7 @@ class STTMeetApp(ctk.CTk):
             messagebox.showinfo(self._t("msg.cleared"), self._t("msg.key_cleared_body"))
 
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.grid(row=8, column=0, pady=(18, 0), sticky="ew")
+        btn_row.grid(row=11, column=0, pady=(18, 0), sticky="ew")
         btn_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
@@ -1229,57 +1304,18 @@ class STTMeetApp(ctk.CTk):
         ctrl_frame.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         ctrl_frame.grid_columnconfigure(2, weight=1)
 
-        # Engine Selector
-        engine_lbl = ctk.CTkLabel(ctrl_frame, text=self._t("control.engine"))
-        engine_lbl.grid(row=0, column=0, padx=(16, 6), pady=10, sticky="w")
-        self._i18n_label(engine_lbl, "control.engine")
-
-        self.engine_var = ctk.StringVar(value="⚡ Gemini Cloud (Auto-Failover)")
-        self.engine_dropdown = ctk.CTkOptionMenu(
-            ctrl_frame,
-            values=[
-                "⚡ Gemini Cloud (Auto-Failover)",
-                "☁️ Gemini 3 Flash",
-                "☁️ Gemini 3.8 Flash",
-                "☁️ Gemini 3.5 Flash",
-                "☁️ Gemini 3.5 Flash Lite"
-            ],
-            variable=self.engine_var,
-            width=230,
-            command=self._on_engine_changed
+        # Engine / chunk / minutes format now live in the Settings modal. Only the
+        # backing variables stay here so the pipeline and session restore keep working.
+        self.engine_var = ctk.StringVar(
+            value=normalize_settings({"engine": get_pref("engine")})["engine"]
         )
-        self.engine_dropdown.grid(row=0, column=1, padx=6, pady=10, sticky="w")
-
-        # Chunk Size Selector
-        chunk_lbl = ctk.CTkLabel(ctrl_frame, text=self._t("control.chunk"))
-        chunk_lbl.grid(row=0, column=2, padx=(16, 6), pady=10, sticky="w")
-        self._i18n_label(chunk_lbl, "control.chunk")
-
-        self.chunk_size_var = ctk.StringVar(value="25 min")
-        self.chunk_dropdown = ctk.CTkOptionMenu(
-            ctrl_frame,
-            values=["15 min", "20 min", "25 min", "30 min", "45 min"],
-            variable=self.chunk_size_var,
-            width=90
+        self.chunk_size_var = ctk.StringVar(
+            value=f"{normalize_settings({'chunk_minutes': get_pref('chunk_minutes')})['chunk_minutes']} min"
         )
-        self.chunk_dropdown.grid(row=0, column=3, padx=6, pady=10, sticky="w")
-
-        # Meeting Minute Template Selector
-        template_lbl = ctk.CTkLabel(ctrl_frame, text=self._t("control.template"))
-        template_lbl.grid(row=0, column=4, padx=(16, 6), pady=10, sticky="w")
-        self._i18n_label(template_lbl, "control.template")
 
         self.template_display_var = ctk.StringVar(
             value=display_template_name(self.template_var.get(), self.ui_locale)
         )
-        self.template_dropdown = ctk.CTkOptionMenu(
-            ctrl_frame,
-            values=[display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES],
-            variable=self.template_display_var,
-            width=170,
-            command=self._on_template_selected
-        )
-        self.template_dropdown.grid(row=0, column=5, padx=6, pady=10, sticky="w")
 
         # Pre-process state: persisted across restarts via prefs.json, edited in Settings modal
         self.preprocess_var = ctk.BooleanVar(value=bool(get_pref("preprocess", True)))
@@ -1633,8 +1669,8 @@ class STTMeetApp(ctk.CTk):
         return None
 
     def _on_engine_changed(self, choice: str):
+        """Reset chunking back to the default whenever the engine changes."""
         self.chunk_size_var.set("25 min")
-        self.chunk_dropdown.configure(values=["15 min", "20 min", "25 min", "30 min", "45 min"])
         if "Auto" in choice:
             self._set_status(self._t("status.engine_auto"))
         else:
@@ -1649,12 +1685,14 @@ class STTMeetApp(ctk.CTk):
                 log.info("Meeting minute template changed to: %s", k)
                 break
 
+    def _chunk_display_values(self):
+        """Chunk options rendered as '<minutes> min' for every option menu."""
+        return [f"{mins} min" for mins in VALID_CHUNK_MINUTES]
+
     def _refresh_template_dropdown(self):
         """Refresh template dropdown labels according to current UI locale."""
         if hasattr(self, "template_display_var"):
             new_values = [display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES]
-            if hasattr(self, "template_dropdown"):
-                self.template_dropdown.configure(values=new_values)
             if hasattr(self, "tab_template_dropdown"):
                 self.tab_template_dropdown.configure(values=new_values)
             self.template_display_var.set(display_template_name(self.template_var.get(), self.ui_locale))

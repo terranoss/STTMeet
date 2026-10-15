@@ -162,8 +162,6 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "filepicker.text_file": {"en": "Text File", "ms": "Fail Teks"},
 
     # --- Controls row -------------------------------------------------
-    "control.engine": {"en": "Engine:", "ms": "Enjin:"},
-    "control.chunk": {"en": "Chunk:", "ms": "Potongan:"},
     "control.template": {"en": "Meeting Minute Format:", "ms": "Format Minit Mesyuarat:"},
     "control.preprocess": {"en": "Pre-process (16kHz Mono)", "ms": "Praproses (16kHz Mono)"},
     "control.output_lang": {"en": "🌐 Output: {value}", "ms": "🌐 Keluaran: {value}"},
@@ -318,6 +316,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "Converts audio to 16kHz mono MP3, reducing upload size by 80–90% without loss of speech clarity.",
         "ms": "Menukar audio kepada MP3 mono 16kHz, mengurangkan saiz muat naik sebanyak 80–90% tanpa menjejaskan kejelasan ucapan.",
     },
+    "settings.processing_heading": {"en": "🧠  Processing", "ms": "🧠  Pemprosesan"},
+    "settings.engine": {"en": "Engine:", "ms": "Enjin:"},
+    "settings.chunk": {"en": "Chunk duration:", "ms": "Tempoh potongan:"},
+    "settings.template": {"en": "Meeting Minute Format:", "ms": "Format Minit Mesyuarat:"},
     "settings.clear": {"en": "🗑  Clear Key", "ms": "🗑  Kosongkan Kunci"},
     "settings.cancel": {"en": "Cancel", "ms": "Batal"},
     "settings.save": {"en": "💾  Save", "ms": "💾  Simpan"},
