@@ -21,6 +21,7 @@ DEFAULT_SETTINGS = {
     "language": "Bahasa Melayu",
     "chunk_minutes": 25,
     "preprocess": True,
+    "template": "action_minutes",
 }
 
 VALID_ENGINES = [
@@ -31,6 +32,12 @@ VALID_ENGINES = [
     "☁️ Gemini 3.5 Flash Lite",
 ]
 VALID_LANGUAGES = ["Bahasa Melayu", "English", "Bilingual"]
+VALID_TEMPLATES = [
+    "action_minutes",
+    "discussion_minutes",
+    "three_column",
+    "board_governance",
+]
 VALID_CHUNK_MINUTES = [15, 20, 25, 30, 45]
 
 VALID_STEP_STATES = ["pending", "working", "done", "error"]
@@ -97,6 +104,10 @@ def normalize_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     preprocess = raw.get("preprocess")
     if isinstance(preprocess, bool):
         result["preprocess"] = preprocess
+
+    template = raw.get("template")
+    if template in VALID_TEMPLATES:
+        result["template"] = template
 
     return result
 

@@ -43,6 +43,7 @@ from ..i18n import (
     DEFAULT_LOCALE,
     MINUTES_LANG_BY_UI_LOCALE,
     display_minutes_lang,
+    display_template_name,
     mode_label,
     normalize_locale,
     translate,
@@ -82,6 +83,7 @@ from ..exporter import (
     export_to_text
 )
 from ..session_store import (
+    VALID_TEMPLATES,
     build_session_payload,
     load_session,
     normalize_settings,
@@ -340,6 +342,12 @@ class STTMeetApp(ctk.CTk):
         # session_store.VALID_LANGUAGES and key the Gemini prompt table.
         self.lang_var = ctk.StringVar(value=MINUTES_LANG_BY_UI_LOCALE[self.ui_locale])
 
+        # Meeting Minute Template selector (Action Minutes, Discussion, Three-Column, Board Governance)
+        saved_template = get_pref("template", "action_minutes")
+        if saved_template not in VALID_TEMPLATES:
+            saved_template = "action_minutes"
+        self.template_var = ctk.StringVar(value=saved_template)
+
         self.title(self._t("window.title", version=get_display_version()))
         self.geometry("1100x820")
         self.minsize(950, 750)
@@ -520,6 +528,7 @@ class STTMeetApp(ctk.CTk):
         self._retranslate_tabs()
         self._retranslate_steps()
         self._refresh_locale_toggle()
+        self._refresh_template_dropdown()
         if self.monitor_dialog is not None and self.monitor_dialog.winfo_exists():
             try:
                 self.monitor_dialog.retranslate()
@@ -1255,6 +1264,23 @@ class STTMeetApp(ctk.CTk):
         )
         self.chunk_dropdown.grid(row=0, column=3, padx=6, pady=10, sticky="w")
 
+        # Meeting Minute Template Selector
+        template_lbl = ctk.CTkLabel(ctrl_frame, text=self._t("control.template"))
+        template_lbl.grid(row=0, column=4, padx=(16, 6), pady=10, sticky="w")
+        self._i18n_label(template_lbl, "control.template")
+
+        self.template_display_var = ctk.StringVar(
+            value=display_template_name(self.template_var.get(), self.ui_locale)
+        )
+        self.template_dropdown = ctk.CTkOptionMenu(
+            ctrl_frame,
+            values=[display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES],
+            variable=self.template_display_var,
+            width=170,
+            command=self._on_template_selected
+        )
+        self.template_dropdown.grid(row=0, column=5, padx=6, pady=10, sticky="w")
+
         # Pre-process state: persisted across restarts via prefs.json, edited in Settings modal
         self.preprocess_var = ctk.BooleanVar(value=bool(get_pref("preprocess", True)))
 
@@ -1268,7 +1294,7 @@ class STTMeetApp(ctk.CTk):
             command=self._start_processing_pipeline,
             width=150
         )
-        self.start_btn.grid(row=0, column=4, padx=4, pady=10, sticky="e")
+        self.start_btn.grid(row=0, column=6, padx=4, pady=10, sticky="e")
         self._i18n_label(self.start_btn, "btn.transcribe")
 
         # Read-only output-language chip. lang_var is derived from the UI locale,
@@ -1286,7 +1312,7 @@ class STTMeetApp(ctk.CTk):
             text_color=("#3949AB", "#9FA8DA"),
             command=self._open_menu_for_language,
         )
-        self.output_lang_chip.grid(row=0, column=5, padx=4, pady=10, sticky="e")
+        self.output_lang_chip.grid(row=0, column=7, padx=4, pady=10, sticky="e")
 
         self.gen_minutes_btn = ctk.CTkButton(
             ctrl_frame,
@@ -1298,7 +1324,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=150
         )
-        self.gen_minutes_btn.grid(row=0, column=6, padx=4, pady=10, sticky="e")
+        self.gen_minutes_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
         self._i18n_label(self.gen_minutes_btn, "btn.generate_minutes")
 
         self.cancel_btn = ctk.CTkButton(
@@ -1310,7 +1336,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=75
         )
-        self.cancel_btn.grid(row=0, column=7, padx=4, pady=10, sticky="e")
+        self.cancel_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
         self._i18n_label(self.cancel_btn, "btn.cancel")
 
         self.monitor_btn = ctk.CTkButton(
@@ -1323,7 +1349,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.monitor_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
+        self.monitor_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
         self._i18n_label(self.monitor_btn, "btn.monitor")
 
         self.reset_btn = ctk.CTkButton(
@@ -1335,7 +1361,7 @@ class STTMeetApp(ctk.CTk):
             command=self._reset_workspace,
             width=85
         )
-        self.reset_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
+        self.reset_btn.grid(row=0, column=11, padx=4, pady=10, sticky="e")
         self._i18n_label(self.reset_btn, "btn.reset")
 
         self.save_session_btn = ctk.CTkButton(
@@ -1348,12 +1374,12 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.save_session_btn.grid(row=0, column=10, padx=(4, 16), pady=10, sticky="e")
+        self.save_session_btn.grid(row=0, column=12, padx=(4, 16), pady=10, sticky="e")
         self._i18n_label(self.save_session_btn, "btn.save_session")
 
         # Visual Stepper Bar
         self.stepper_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
-        self.stepper_frame.grid(row=1, column=0, columnspan=12, padx=16, pady=(4, 4), sticky="ew")
+        self.stepper_frame.grid(row=1, column=0, columnspan=14, padx=16, pady=(4, 4), sticky="ew")
         for col_idx in range(7):
             self.stepper_frame.grid_columnconfigure(col_idx, weight=1 if col_idx % 2 == 0 else 0)
 
@@ -1388,7 +1414,7 @@ class STTMeetApp(ctk.CTk):
 
         # Progress bar & Status text
         self.progress_bar = ctk.CTkProgressBar(ctrl_frame)
-        self.progress_bar.grid(row=2, column=0, columnspan=12, padx=16, pady=(4, 4), sticky="ew")
+        self.progress_bar.grid(row=2, column=0, columnspan=14, padx=16, pady=(4, 4), sticky="ew")
         self.progress_bar.set(0.0)
 
         self.status_label = ctk.CTkLabel(
@@ -1397,7 +1423,7 @@ class STTMeetApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             anchor="w"
         )
-        self.status_label.grid(row=3, column=0, columnspan=12, padx=16, pady=(0, 10), sticky="w")
+        self.status_label.grid(row=3, column=0, columnspan=14, padx=16, pady=(0, 10), sticky="w")
 
     def _build_tabs_section(self):
         self.tabview = ctk.CTkTabview(self, corner_radius=10)
@@ -1436,8 +1462,29 @@ class STTMeetApp(ctk.CTk):
             command=self._start_minutes_generation_only
         )
         self.retry_minutes_btn.pack(side="right", padx=12, pady=6)
-        self._i18n_label(self.retry_minutes_btn, "btn.retry_minutes")
-        # Note: self.minutes_banner_frame starts hidden (not gridded until error occurs)
+        # Template selector toolbar directly inside the Minutes tab
+        minutes_toolbar = ctk.CTkFrame(self.tab_minutes, fg_color="transparent")
+        minutes_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        minutes_toolbar.grid_columnconfigure(2, weight=1)
+
+        tmpl_tab_lbl = ctk.CTkLabel(
+            minutes_toolbar,
+            text=self._t("control.template"),
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        tmpl_tab_lbl.grid(row=0, column=0, padx=(4, 6), sticky="w")
+        self._i18n_label(tmpl_tab_lbl, "control.template")
+
+        self.tab_template_dropdown = ctk.CTkOptionMenu(
+            minutes_toolbar,
+            values=[display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES],
+            variable=self.template_display_var,
+            width=220,
+            command=self._on_template_selected
+        )
+        self.tab_template_dropdown.grid(row=0, column=1, padx=4, sticky="w")
+
+        # Note: self.minutes_banner_frame starts hidden (gridded on row 0 when error occurs)
 
         self.txt_minutes = ctk.CTkTextbox(self.tab_minutes, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
         self.txt_minutes.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
@@ -1592,6 +1639,25 @@ class STTMeetApp(ctk.CTk):
             self._set_status(self._t("status.engine_auto"))
         else:
             self._set_status(self._t("status.engine_selected", choice=choice.strip()))
+
+    def _on_template_selected(self, display_choice: str):
+        """Map localized template selection back to canonical template key and persist."""
+        for k in VALID_TEMPLATES:
+            if display_template_name(k, self.ui_locale) == display_choice:
+                self.template_var.set(k)
+                save_pref("template", k)
+                log.info("Meeting minute template changed to: %s", k)
+                break
+
+    def _refresh_template_dropdown(self):
+        """Refresh template dropdown labels according to current UI locale."""
+        if hasattr(self, "template_display_var"):
+            new_values = [display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES]
+            if hasattr(self, "template_dropdown"):
+                self.template_dropdown.configure(values=new_values)
+            if hasattr(self, "tab_template_dropdown"):
+                self.tab_template_dropdown.configure(values=new_values)
+            self.template_display_var.set(display_template_name(self.template_var.get(), self.ui_locale))
 
     # -------------------------------------------------------------
     # Processing Pipeline (Threaded)
@@ -2077,10 +2143,12 @@ class STTMeetApp(ctk.CTk):
             if not transcript_to_use.strip():
                 raise ValueError("Transcript is empty. Cannot generate minutes.")
 
+            template = self.template_var.get()
             self.generated_minutes = generate_meeting_minutes(
                 client=client,
                 full_transcript=transcript_to_use,
                 language=language,
+                template=template,
                 progress_callback=lambda msg: self._set_status(
                     f"{self._t('status.step_prefix', n=4)} {msg}"
                 ),
@@ -2196,7 +2264,8 @@ class STTMeetApp(ctk.CTk):
             "engine": self.engine_var.get(),
             "language": self.lang_var.get(),
             "chunk_minutes": chunk_mins,
-            "preprocess": bool(self.preprocess_var.get())
+            "preprocess": bool(self.preprocess_var.get()),
+            "template": self.template_var.get(),
         }
 
     def _get_current_status(self) -> Dict:
@@ -2335,6 +2404,9 @@ class STTMeetApp(ctk.CTk):
         self.engine_var.set(clean["engine"])
         self.chunk_size_var.set(f"{clean['chunk_minutes']} min")
         self.preprocess_var.set(clean["preprocess"])
+        if "template" in clean and clean["template"] in VALID_TEMPLATES:
+            self.template_var.set(clean["template"])
+            self._refresh_template_dropdown()
         self._session_settings_snapshot = dict(clean)
 
         # The UI locale governs the minutes language. A session records the

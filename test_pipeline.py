@@ -18,8 +18,10 @@ from src.i18n import (
     LOGIC_COUPLED_LITERALS,
     MINUTES_LANG_BY_UI_LOCALE,
     MINUTES_LANG_DISPLAY,
+    TEMPLATE_DISPLAY,
     STRINGS,
     display_minutes_lang,
+    display_template_name,
     mode_label,
     normalize_locale,
     translate,
@@ -28,11 +30,17 @@ from src.session_store import (
     DEFAULT_SETTINGS,
     SCHEMA_VERSION,
     VALID_LANGUAGES,
+    VALID_TEMPLATES,
     build_session_payload,
     load_session,
     normalize_settings,
     save_session,
     session_path
+)
+from src.minutes_generator import (
+    TEMPLATES_PROMPTS,
+    get_synthesis_prompt,
+    parse_minutes_sections,
 )
 
 def test_time_conversions():
@@ -74,7 +82,8 @@ def _sample_settings():
         "engine": "☁️ Gemini 3.5 Flash",
         "language": "Bilingual",
         "chunk_minutes": 20,
-        "preprocess": False
+        "preprocess": False,
+        "template": "action_minutes",
     }
 
 def _sample_status():
@@ -289,6 +298,28 @@ def test_prefs_roundtrip_and_tolerance():
             prefs_module.PREFS_PATH = original_path
     assert original_dir is not None
 
+def test_template_prompts_and_displays():
+    assert set(VALID_TEMPLATES) == set(TEMPLATE_DISPLAY.keys())
+    assert set(VALID_TEMPLATES) == set(TEMPLATES_PROMPTS.keys())
+    for tmpl in VALID_TEMPLATES:
+        assert display_template_name(tmpl, "en")
+        assert display_template_name(tmpl, "ms")
+        for lang in VALID_LANGUAGES:
+            prompt = get_synthesis_prompt(template=tmpl, language=lang)
+            assert "{transcript}" in prompt
+
+def test_parse_minutes_sections_for_templates():
+    three_col_sample = """# Three-Column Meeting Minutes
+**Project:** Alpha
+
+| Item # | Discussion & Deliberation | Action Required & Decision | Responsibility & Deadline |
+| :---: | :--- | :--- | :---: |
+| 1.0 | Testing line 1 | Fix issue | Lead Due: tomorrow |
+"""
+    sec = parse_minutes_sections(three_col_sample)
+    assert "Testing line 1" in sec["action_items"]
+    assert sec["full_text"] == three_col_sample
+
 if __name__ == "__main__":
     test_time_conversions()
     test_adjust_chunk_timestamps()
@@ -314,4 +345,6 @@ if __name__ == "__main__":
     test_display_minutes_lang_is_display_only()
     test_mode_labels_cover_every_mode()
     test_prefs_roundtrip_and_tolerance()
+    test_template_prompts_and_displays()
+    test_parse_minutes_sections_for_templates()
     print("All unit tests passed successfully!")

@@ -53,6 +53,29 @@ MINUTES_LANG_DISPLAY = {
     "Bilingual": {"en": "Bilingual", "ms": "Dwibahasa"},
 }
 
+TEMPLATE_DISPLAY = {
+    "action_minutes": {
+        "en": "Action Minutes",
+        "ms": "Minit Tindakan",
+        "both": "Minit Tindakan / Action Minutes"
+    },
+    "discussion_minutes": {
+        "en": "Discussion (Topical)",
+        "ms": "Perbincangan (Topikal)",
+        "both": "Perbincangan / Discussion"
+    },
+    "three_column": {
+        "en": "Three-Column",
+        "ms": "Tiga Lajur",
+        "both": "Tiga Lajur / Three-Column"
+    },
+    "board_governance": {
+        "en": "Board / Governance",
+        "ms": "Lembaga Pengarah / Tadbir Urus",
+        "both": "Lembaga Pengarah / Board"
+    },
+}
+
 # Values that are parsed as data or used as lookup keys. These must never be
 # routed through translate(); test_pipeline.py fails if any appears in STRINGS.
 # Note: the literal "GEMINI_API_KEY" is deliberately absent. It is a documented
@@ -141,6 +164,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
     # --- Controls row -------------------------------------------------
     "control.engine": {"en": "Engine:", "ms": "Enjin:"},
     "control.chunk": {"en": "Chunk:", "ms": "Potongan:"},
+    "control.template": {"en": "Meeting Minute Format:", "ms": "Format Minit Mesyuarat:"},
     "control.preprocess": {"en": "Pre-process (16kHz Mono)", "ms": "Praproses (16kHz Mono)"},
     "control.output_lang": {"en": "🌐 Output: {value}", "ms": "🌐 Keluaran: {value}"},
     "btn.transcribe": {"en": "▶ Transcribe Audio", "ms": "▶ Transkrip Audio"},
@@ -505,6 +529,14 @@ def has_key(key: str) -> bool:
 def display_minutes_lang(canonical: str, locale: Optional[str] = None) -> str:
     """Display name for a minutes-language value. Never changes the value."""
     entry = MINUTES_LANG_DISPLAY.get(canonical)
+    if entry is None:
+        return canonical
+    return _resolve_mode(entry, locale)
+
+
+def display_template_name(canonical: str, locale: Optional[str] = None) -> str:
+    """Display name for a meeting minute template. Never changes the value."""
+    entry = TEMPLATE_DISPLAY.get(canonical)
     if entry is None:
         return canonical
     return _resolve_mode(entry, locale)
