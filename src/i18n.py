@@ -176,6 +176,8 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "btn.retry_minutes": {"en": "↻ Retry Generation", "ms": "↻ Cuba Jana Semula"},
     "btn.retry_recap": {"en": "↻ Retry Recap", "ms": "↻ Cuba Semula Rekap"},
     "btn.retry_actions": {"en": "↻ Retry Action Items", "ms": "↻ Cuba Semula Tindakan"},
+    "btn.view_preview": {"en": "👁 Preview", "ms": "👁 Pratonton"},
+    "btn.view_raw": {"en": "📝 Markdown", "ms": "📝 Teks Asal"},
     "btn.map_speakers": {"en": "👥 Map Speaker Names", "ms": "👥 Petakan Nama Penceramah"},
     "btn.export_docx": {"en": "📄 Export Word (.docx)", "ms": "📄 Eksport Word (.docx)"},
     "btn.export_md": {"en": "📝 Export Markdown (.md)", "ms": "📝 Eksport Markdown (.md)"},

@@ -80,6 +80,7 @@ from ..minutes_generator import (
     parse_minutes_sections
 )
 from ..recap_generator import generate_meeting_recap
+from .markdown_view import MarkdownViewer
 from ..exporter import (
     export_to_docx,
     export_to_markdown,
@@ -1533,7 +1534,7 @@ class STTMeetApp(ctk.CTk):
 
         # Note: self.minutes_banner_frame starts hidden (gridded on row 0 when error occurs)
 
-        self.txt_minutes = ctk.CTkTextbox(self.tab_minutes, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_minutes = MarkdownViewer(self.tab_minutes, wrap="word")
         self.txt_minutes.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
 
         # Recap tab with top toolbar and inline error banner
@@ -1576,7 +1577,7 @@ class STTMeetApp(ctk.CTk):
         self.gen_recap_btn.grid(row=0, column=0, padx=4, sticky="w")
         self._i18n_label(self.gen_recap_btn, "btn.generate_recap")
 
-        self.txt_recap = ctk.CTkTextbox(self.tab_recap, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_recap = MarkdownViewer(self.tab_recap, wrap="word")
         self.txt_recap.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
 
         # Action Items tab with top toolbar and inline error banner
@@ -1619,7 +1620,7 @@ class STTMeetApp(ctk.CTk):
         self.gen_actions_btn.grid(row=0, column=0, padx=4, sticky="w")
         self._i18n_label(self.gen_actions_btn, "btn.generate_actions")
 
-        self.txt_actions = ctk.CTkTextbox(self.tab_actions, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_actions = MarkdownViewer(self.tab_actions, wrap="word")
         self.txt_actions.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
 
     def _create_textbox(self, parent_tab):
@@ -1654,22 +1655,13 @@ class STTMeetApp(ctk.CTk):
         export_docx_btn.grid(row=0, column=2, padx=4, pady=10)
         self._i18n_label(export_docx_btn, "btn.export_docx")
 
-        export_md_btn = ctk.CTkButton(
-            bottom_frame,
-            text=self._t("btn.export_md"),
-            command=lambda: self._export_document("md"),
-            width=150
-        )
-        export_md_btn.grid(row=0, column=3, padx=4, pady=10)
-        self._i18n_label(export_md_btn, "btn.export_md")
-
         export_txt_btn = ctk.CTkButton(
             bottom_frame,
             text=self._t("btn.export_txt"),
             command=lambda: self._export_document("txt"),
             width=130
         )
-        export_txt_btn.grid(row=0, column=4, padx=4, pady=10)
+        export_txt_btn.grid(row=0, column=3, padx=4, pady=10)
         self._i18n_label(export_txt_btn, "btn.export_txt")
 
         export_all_btn = ctk.CTkButton(
@@ -1680,7 +1672,7 @@ class STTMeetApp(ctk.CTk):
             command=lambda: self._export_document("all"),
             width=110
         )
-        export_all_btn.grid(row=0, column=5, padx=(4, 16), pady=10)
+        export_all_btn.grid(row=0, column=4, padx=(4, 16), pady=10)
         self._i18n_label(export_all_btn, "btn.export_all")
 
     # -------------------------------------------------------------
@@ -2868,12 +2860,10 @@ class STTMeetApp(ctk.CTk):
         self.actions_banner_frame.grid_forget()
 
     def _update_recap_view(self, text: str):
-        self.txt_recap.delete("1.0", "end")
-        self.txt_recap.insert("1.0", text)
+        self.txt_recap.set_markdown(text)
 
     def _update_actions_view(self, text: str):
-        self.txt_actions.delete("1.0", "end")
-        self.txt_actions.insert("1.0", text)
+        self.txt_actions.set_markdown(text)
 
     def _set_status(self, message: str):
         self.after(0, lambda: self.status_label.configure(text=message))
@@ -2890,8 +2880,7 @@ class STTMeetApp(ctk.CTk):
         self.txt_transcript.insert("1.0", text)
 
     def _populate_minutes_tabs(self, sections: Dict[str, str]):
-        self.txt_minutes.delete("1.0", "end")
-        self.txt_minutes.insert("1.0", sections.get("full_text", ""))
+        self.txt_minutes.set_markdown(sections.get("full_text", ""))
 
     def _on_pipeline_finished(self):
         self.is_processing = False
@@ -3009,26 +2998,52 @@ class STTMeetApp(ctk.CTk):
         apply_btn.pack(padx=16, pady=12)
 
     # -------------------------------------------------------------
-    # Document Export Handler
+    # Document Export Handler (Active Tab Only)
     # -------------------------------------------------------------
     def _export_document(self, fmt: str):
-        if not self.processed_transcript and not self.generated_minutes:
-            messagebox.showwarning(self._t("msg.export"), self._t("msg.export_nothing"))
-            return
-
+        active_tab = self.tabview.get()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = Path(self.selected_audio_file).stem if self.selected_audio_file else "Meeting"
 
-        # Export title and filenames stay as-is: they are document content, not UI
-        # chrome, and the exported documents remain bilingual by design.
-        title = f"Minit Mesyuarat - {base_name}"
-        minutes_content = self.generated_minutes or self.processed_transcript
-        transcript_content = self.processed_transcript
+        # Determine content, title, and filename prefix based on the active tab
+        if active_tab == "tab_transcript":
+            content = self.processed_transcript or self.raw_transcript
+            tab_name = "Transkrip"
+            title = f"Transkrip Audio - {base_name}"
+            prefix = "Transkrip"
+            include_appendix = False
+        elif active_tab == "tab_recap":
+            content = self.generated_recap
+            tab_name = "Recap"
+            title = f"Executive Meeting Recap - {base_name}"
+            prefix = "Recap"
+            include_appendix = False
+        elif active_tab == "tab_actions":
+            content = self.generated_actions
+            tab_name = "Tindakan"
+            title = f"Tindakan & Keputusan - {base_name}"
+            prefix = "Tindakan"
+            include_appendix = False
+        else:  # "tab_minutes"
+            content = self.generated_minutes
+            tab_name = "Minit"
+            title = f"Minit Mesyuarat - {base_name}"
+            prefix = "Minit"
+            include_appendix = True
+
+        if not content or not content.strip():
+            messagebox.showwarning(
+                self._t("msg.export"),
+                self._t("msg.export_nothing")
+            )
+            return
+
+        exported_any = False
 
         if fmt in ["docx", "all"]:
             save_path = filedialog.asksaveasfilename(
                 title=self._t("filepicker.save_docx"),
-                initialfile=f"Minit_{base_name}_{timestamp}.docx",
+                initialfile=f"{prefix}_{base_name}_{timestamp}.docx",
                 defaultextension=".docx",
                 filetypes=[(self._t("filepicker.word_doc"), "*.docx")]
             )
@@ -3036,29 +3051,15 @@ class STTMeetApp(ctk.CTk):
                 export_to_docx(
                     file_path=save_path,
                     title=title,
-                    minutes_text=minutes_content,
-                    raw_transcript=transcript_content
+                    minutes_text=content,
+                    raw_transcript=self.processed_transcript if include_appendix else None
                 )
-
-        if fmt in ["md", "all"]:
-            save_path = filedialog.asksaveasfilename(
-                title=self._t("filepicker.save_md"),
-                initialfile=f"Minit_{base_name}_{timestamp}.md",
-                defaultextension=".md",
-                filetypes=[(self._t("filepicker.markdown_doc"), "*.md")]
-            )
-            if save_path:
-                export_to_markdown(
-                    file_path=save_path,
-                    title=title,
-                    minutes_text=minutes_content,
-                    transcript=transcript_content
-                )
+                exported_any = True
 
         if fmt in ["txt", "all"]:
             save_path = filedialog.asksaveasfilename(
                 title=self._t("filepicker.save_txt"),
-                initialfile=f"Minit_{base_name}_{timestamp}.txt",
+                initialfile=f"{prefix}_{base_name}_{timestamp}.txt",
                 defaultextension=".txt",
                 filetypes=[(self._t("filepicker.text_file"), "*.txt")]
             )
@@ -3066,11 +3067,13 @@ class STTMeetApp(ctk.CTk):
                 export_to_text(
                     file_path=save_path,
                     title=title,
-                    minutes_text=minutes_content,
-                    transcript=transcript_content
+                    minutes_text=content,
+                    transcript=self.processed_transcript if include_appendix else None
                 )
+                exported_any = True
 
-        messagebox.showinfo(self._t("msg.export_success"), self._t("msg.export_done"))
+        if exported_any:
+            messagebox.showinfo(self._t("msg.export_success"), self._t("msg.export_done"))
 
 def run_app():
     app = STTMeetApp()
