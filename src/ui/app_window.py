@@ -102,6 +102,13 @@ TRANSPARENT_TEXT = ("#1F2937", "#E5E7EB")
 TRANSPARENT_HOVER = ("#D4D4D8", "#3F3F46")
 ON_ACCENT_TEXT = ("#FFFFFF", "#FFFFFF")
 
+# The dashboard opens maximized. CustomTkinter runs a DPI scaling pass shortly
+# after startup that re-applies self.geometry() and undoes state("zoomed"), so
+# the zoomed state is re-asserted for a couple of seconds before the window is
+# handed over to the user.
+_MAXIMIZE_POLL_MS = 300
+_MAXIMIZE_RETRY_COUNT = 8
+
 class ChunkMonitorDialog(ctk.CTkToplevel):
     """
     Floating dialog panel displaying live status for each audio chunk.
@@ -384,17 +391,32 @@ class STTMeetApp(ctk.CTk):
         self._start_maximized()
 
     def _start_maximized(self):
-        """Open the dashboard maximized on the primary display."""
+        """Open the dashboard maximized on the primary display.
+
+        CustomTkinter's first DPI scaling pass re-applies the geometry passed to
+        self.geometry() (CTk._set_scaling -> Tk.geometry()), which knocks a
+        window that was maximized during __init__ straight back to 1100x820.
+        So re-assert the zoomed state for a short while after startup, then stop
+        and leave the window under the user's control.
+        """
+        self._maximize_retries_left = _MAXIMIZE_RETRY_COUNT
+        self._maximize_once()
+
+    def _maximize_once(self):
+        """Apply the zoomed state, and keep retrying while retries remain."""
         try:
-            # Flush the pending geometry request first, otherwise the "zoomed"
-            # state can be applied and then immediately undone by it.
             self.update_idletasks()
-            self.state("zoomed")
+            if self.state() != "zoomed":
+                self.state("zoomed")
         except Exception:
             try:
                 self.attributes("-zoomed", True)
             except Exception:
-                pass  # Fall back to the 1100x820 geometry set above.
+                return  # Give up; the 1100x820 geometry set above still applies.
+
+        self._maximize_retries_left -= 1
+        if self._maximize_retries_left > 0:
+            self.after(_MAXIMIZE_POLL_MS, self._maximize_once)
 
     def _build_ui(self):
         # Master Grid Layout
@@ -970,10 +992,10 @@ class STTMeetApp(ctk.CTk):
         self._open_about_dialog()
 
     def _open_settings_dialog(self):
-        """Modal holding the Gemini API Key entry. Persists to .env on Save."""
+        """Modal holding Gemini API Key entry and Audio Preprocessing options."""
         dialog = ctk.CTkToplevel(self)
         dialog.title(self._t("settings.title"))
-        dialog.geometry("500x330")
+        dialog.geometry("520x460")
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
@@ -985,7 +1007,7 @@ class STTMeetApp(ctk.CTk):
         ctk.CTkLabel(
             body,
             text=self._t("settings.heading"),
-            font=ctk.CTkFont(size=17, weight="bold"),
+            font=ctk.CTkFont(size=16, weight="bold"),
             anchor="w"
         ).grid(row=0, column=0, sticky="ew")
 
@@ -996,7 +1018,7 @@ class STTMeetApp(ctk.CTk):
             text_color="gray",
             justify="left",
             anchor="w"
-        ).grid(row=1, column=0, pady=(6, 14), sticky="ew")
+        ).grid(row=1, column=0, pady=(6, 12), sticky="ew")
 
         entry_row = ctk.CTkFrame(body, fg_color="transparent")
         entry_row.grid(row=2, column=0, sticky="ew")
@@ -1044,10 +1066,45 @@ class STTMeetApp(ctk.CTk):
             font=ctk.CTkFont(size=10),
             text_color="gray",
             anchor="w"
-        ).grid(row=3, column=0, pady=(8, 0), sticky="w")
+        ).grid(row=3, column=0, pady=(6, 0), sticky="w")
+
+        # Divider between API Key and Audio Preprocessing
+        ctk.CTkFrame(body, height=1, fg_color=("gray85", "gray25")).grid(
+            row=4, column=0, pady=(16, 12), sticky="ew"
+        )
+
+        # Audio Preprocessing Section
+        ctk.CTkLabel(
+            body,
+            text=self._t("settings.audio_heading"),
+            font=ctk.CTkFont(size=16, weight="bold"),
+            anchor="w"
+        ).grid(row=5, column=0, sticky="ew")
+
+        temp_preprocess_var = ctk.BooleanVar(value=bool(self.preprocess_var.get()))
+        preprocess_chk = ctk.CTkCheckBox(
+            body,
+            text=self._t("settings.preprocess_chk"),
+            variable=temp_preprocess_var,
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        preprocess_chk.grid(row=6, column=0, pady=(10, 4), sticky="w")
+
+        ctk.CTkLabel(
+            body,
+            text=self._t("settings.preprocess_help"),
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            justify="left",
+            wraplength=470,
+            anchor="w"
+        ).grid(row=7, column=0, pady=(0, 6), sticky="ew")
 
         def do_save():
             if self._save_api_key(notify=False):
+                new_prep = bool(temp_preprocess_var.get())
+                self.preprocess_var.set(new_prep)
+                save_pref("preprocess", new_prep)
                 messagebox.showinfo(self._t("msg.success"), self._t("msg.key_saved_body"), parent=dialog)
                 close_dialog()
 
@@ -1060,7 +1117,7 @@ class STTMeetApp(ctk.CTk):
             messagebox.showinfo(self._t("msg.cleared"), self._t("msg.key_cleared_body"))
 
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.grid(row=4, column=0, pady=(20, 0), sticky="ew")
+        btn_row.grid(row=8, column=0, pady=(18, 0), sticky="ew")
         btn_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
@@ -1198,15 +1255,8 @@ class STTMeetApp(ctk.CTk):
         )
         self.chunk_dropdown.grid(row=0, column=3, padx=6, pady=10, sticky="w")
 
-        # Pre-process checkbox
-        self.preprocess_var = ctk.BooleanVar(value=True)
-        self.preprocess_chk = ctk.CTkCheckBox(
-            ctrl_frame,
-            text=self._t("control.preprocess"),
-            variable=self.preprocess_var
-        )
-        self.preprocess_chk.grid(row=0, column=4, padx=16, pady=10, sticky="w")
-        self._i18n_label(self.preprocess_chk, "control.preprocess")
+        # Pre-process state: persisted across restarts via prefs.json, edited in Settings modal
+        self.preprocess_var = ctk.BooleanVar(value=bool(get_pref("preprocess", True)))
 
         # Action Buttons
         self.start_btn = ctk.CTkButton(
@@ -1218,7 +1268,7 @@ class STTMeetApp(ctk.CTk):
             command=self._start_processing_pipeline,
             width=150
         )
-        self.start_btn.grid(row=0, column=5, padx=4, pady=10, sticky="e")
+        self.start_btn.grid(row=0, column=4, padx=4, pady=10, sticky="e")
         self._i18n_label(self.start_btn, "btn.transcribe")
 
         # Read-only output-language chip. lang_var is derived from the UI locale,
@@ -1236,7 +1286,7 @@ class STTMeetApp(ctk.CTk):
             text_color=("#3949AB", "#9FA8DA"),
             command=self._open_menu_for_language,
         )
-        self.output_lang_chip.grid(row=0, column=6, padx=4, pady=10, sticky="e")
+        self.output_lang_chip.grid(row=0, column=5, padx=4, pady=10, sticky="e")
 
         self.gen_minutes_btn = ctk.CTkButton(
             ctrl_frame,
@@ -1248,7 +1298,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=150
         )
-        self.gen_minutes_btn.grid(row=0, column=7, padx=4, pady=10, sticky="e")
+        self.gen_minutes_btn.grid(row=0, column=6, padx=4, pady=10, sticky="e")
         self._i18n_label(self.gen_minutes_btn, "btn.generate_minutes")
 
         self.cancel_btn = ctk.CTkButton(
@@ -1260,7 +1310,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=75
         )
-        self.cancel_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
+        self.cancel_btn.grid(row=0, column=7, padx=4, pady=10, sticky="e")
         self._i18n_label(self.cancel_btn, "btn.cancel")
 
         self.monitor_btn = ctk.CTkButton(
@@ -1273,7 +1323,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.monitor_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
+        self.monitor_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
         self._i18n_label(self.monitor_btn, "btn.monitor")
 
         self.reset_btn = ctk.CTkButton(
@@ -1285,7 +1335,7 @@ class STTMeetApp(ctk.CTk):
             command=self._reset_workspace,
             width=85
         )
-        self.reset_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
+        self.reset_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
         self._i18n_label(self.reset_btn, "btn.reset")
 
         self.save_session_btn = ctk.CTkButton(
@@ -1298,7 +1348,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.save_session_btn.grid(row=0, column=11, padx=(4, 16), pady=10, sticky="e")
+        self.save_session_btn.grid(row=0, column=10, padx=(4, 16), pady=10, sticky="e")
         self._i18n_label(self.save_session_btn, "btn.save_session")
 
         # Visual Stepper Bar

@@ -288,6 +288,12 @@ STRINGS: Dict[str, Dict[str, str]] = {
     },
     "settings.placeholder": {"en": "Enter GEMINI_API_KEY...", "ms": "Masukkan GEMINI_API_KEY..."},
     "settings.saved_to": {"en": "Saved to: {path}", "ms": "Disimpan ke: {path}"},
+    "settings.audio_heading": {"en": "🎵  Audio Preprocessing", "ms": "🎵  Praproses Audio"},
+    "settings.preprocess_chk": {"en": "Pre-process audio (16kHz Mono MP3)", "ms": "Praproses audio (MP3 Mono 16kHz)"},
+    "settings.preprocess_help": {
+        "en": "Converts audio to 16kHz mono MP3, reducing upload size by 80–90% without loss of speech clarity.",
+        "ms": "Menukar audio kepada MP3 mono 16kHz, mengurangkan saiz muat naik sebanyak 80–90% tanpa menjejaskan kejelasan ucapan.",
+    },
     "settings.clear": {"en": "🗑  Clear Key", "ms": "🗑  Kosongkan Kunci"},
     "settings.cancel": {"en": "Cancel", "ms": "Batal"},
     "settings.save": {"en": "💾  Save", "ms": "💾  Simpan"},
