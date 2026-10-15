@@ -295,6 +295,7 @@ if (-not $InstallerOnly) {
         "--collect-all=docx",
         "--collect-all=pydub",
         "--add-data=.env.example;.",
+        "--add-data=$RepoRoot\docs;docs",
         "main.py"
     )
 

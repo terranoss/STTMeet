@@ -79,6 +79,24 @@ CHUNKS_DIR = CACHE_DIR / "chunks"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Documentation Folder (bundled into the frozen build via --add-data=docs;docs)
+def get_docs_dir() -> Path:
+    """Locate the docs/ folder in a source checkout or a PyInstaller build."""
+    candidates = []
+    if is_frozen() and hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "docs")
+    candidates.append(get_base_dir() / "docs")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+DOCS_DIR = get_docs_dir()
+
+# Google AI Studio page where users create a free Gemini API key
+API_KEY_URL = "https://aistudio.google.com/apikey"
+
 # Default Processing Parameters
 DEFAULT_CHUNK_MINUTES = 25          # Target duration for audio chunks
 DEFAULT_MAX_SCAN_MINUTES = 2        # Search forward window for natural silence

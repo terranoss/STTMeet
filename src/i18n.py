@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 # the exported documents read as mixed-language.
 LOCALES = ("en", "ms")
 ALL_MODES = LOCALES
-DEFAULT_LOCALE = "ms"
+DEFAULT_LOCALE = "en"
 
 # Names of the two language modes. These label the toggle buttons themselves,
 # so they are intentionally not localized: "Bahasa Melayu" is the same word in
@@ -119,6 +119,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "menu.settings": {"en": "Settings", "ms": "Tetapan"},
     "menu.save_session": {"en": "Save Session", "ms": "Simpan Sesi"},
     "menu.open_log_folder": {"en": "Open Log Folder", "ms": "Buka Folder Log"},
+    "menu.docs": {"en": "Documentation", "ms": "Dokumentasi"},
     "menu.about": {"en": "About", "ms": "Tentang"},
     "menu.close_hint": {
         "en": "Press Esc or click outside to close",
@@ -216,6 +217,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "status.log_opened": {"en": "Opened log folder: {folder}", "ms": "Folder log dibuka: {folder}"},
     "status.key_saved": {"en": "Gemini API Key saved successfully.", "ms": "Kunci API Gemini berjaya disimpan."},
     "status.key_cleared": {"en": "Gemini API Key cleared.", "ms": "Kunci API Gemini dikosongkan."},
+    "status.key_link_opened": {
+        "en": "Opened the Gemini API key page in your browser.",
+        "ms": "Halaman kunci API Gemini dibuka dalam pelayar anda.",
+    },
     "status.engine_auto": {
         "en": "Smart Cloud Mode: Auto-fails over between Gemini 3, 3.8, and 3.5 if free quotas fill up.",
         "ms": "Mod Awan Pintar: Automatis bertukar antara Gemini 3, 3.8 dan 3.5 jika kuota percuma penuh.",
@@ -340,10 +345,15 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "settings.title": {"en": "Settings", "ms": "Tetapan"},
     "settings.heading": {"en": "🔑  Gemini API Key", "ms": "🔑  Kunci API Gemini"},
     "settings.help": {
-        "en": "Create a key at https://aistudio.google.com/apikey\nStored locally in .env — never written into session files.",
-        "ms": "Cipta kunci di https://aistudio.google.com/apikey\nDisimpan secara lokal dalam .env — tidak pernah ditulis ke fail sesi.",
+        "en": "Stored locally in .env — never written into session files.",
+        "ms": "Disimpan secara lokal dalam .env — tidak pernah ditulis ke fail sesi.",
     },
     "settings.placeholder": {"en": "Enter GEMINI_API_KEY...", "ms": "Masukkan GEMINI_API_KEY..."},
+    "settings.get_key": {"en": "🔑  Get a free API key", "ms": "🔑  Dapatkan kunci API percuma"},
+    "settings.get_key_hint": {
+        "en": "Opens Google AI Studio in your browser",
+        "ms": "Membuka Google AI Studio dalam pelayar anda",
+    },
     "settings.saved_to": {"en": "Saved to: {path}", "ms": "Disimpan ke: {path}"},
     "settings.audio_heading": {"en": "🎵  Audio Preprocessing", "ms": "🎵  Praproses Audio"},
     "settings.preprocess_chk": {"en": "Pre-process audio (16kHz Mono MP3)", "ms": "Praproses audio (MP3 Mono 16kHz)"},
@@ -354,6 +364,15 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "settings.processing_heading": {"en": "🧠  Processing", "ms": "🧠  Pemprosesan"},
     "settings.engine": {"en": "Engine:", "ms": "Enjin:"},
     "settings.chunk": {"en": "Chunk duration:", "ms": "Tempoh potongan:"},
+    "settings.chunk_note": {
+        "en": "💡 Speaker ID only works with 'No Chunking' (ensures voice consistency).\nRecommended: Use for meetings under 60–90 mins. For longer audio, use chunks (Speaker ID disabled).",
+        "ms": "💡 ID Penceramah hanya berfungsi dengan 'Tiada Pemotongan' (menjamin ketepatan suara).\nDisyorkan: Gunakan untuk mesyuarat bawah 60–90 minit. Untuk audio lebih panjang, gunakan potongan (ID Penceramah dimatikan).",
+    },
+    "chunk.no_chunk": {"en": "No Chunking (Single File)", "ms": "Tiada Pemotongan (Satu Fail)"},
+    "msg.speaker_mapping_no_chunk": {
+        "en": "Speaker identification is only available when 'No Chunking' is selected in Settings.",
+        "ms": "Pengenalpastian penceramah hanya tersedia apabila 'Tiada Pemotongan' dipilih dalam Tetapan.",
+    },
     "settings.template": {"en": "Meeting Minute Format:", "ms": "Format Minit Mesyuarat:"},
     "settings.clear": {"en": "🗑  Clear Key", "ms": "🗑  Kosongkan Kunci"},
     "settings.cancel": {"en": "Cancel", "ms": "Batal"},
@@ -423,6 +442,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "msg.cleared": {"en": "Cleared", "ms": "Dikosongkan"},
     "msg.ffmpeg_warning": {"en": "FFmpeg Warning", "ms": "Amaran FFmpeg"},
     "msg.warning": {"en": "Warning", "ms": "Amaran"},
+    "msg.key_link_title": {"en": "Get an API Key", "ms": "Dapatkan Kunci API"},
     "msg.error": {"en": "Error", "ms": "Ralat"},
     "msg.cancel_title": {"en": "Cancel", "ms": "Batal"},
     "msg.partial_extraction": {"en": "Partial Extraction", "ms": "Ekstrakan separa"},
@@ -444,6 +464,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "msg.key_saved_env": {"en": "Gemini API Key saved successfully to .env.", "ms": "Kunci API Gemini berjaya disimpan ke .env."},
     "msg.key_cleared_body": {"en": "Gemini API Key removed from .env.", "ms": "Kunci API Gemini dibuang daripada .env."},
     "msg.key_invalid": {"en": "Please enter a valid Gemini API Key.", "ms": "Sila masukkan Kunci API Gemini yang sah."},
+    "msg.key_link_failed": {
+        "en": "Could not open your browser automatically.\n\nCreate a free API key here:\n\n{url}",
+        "ms": "Pelayar tidak dapat dibuka secara automatik.\n\nCipta kunci API percuma di sini:\n\n{url}",
+    },
     "msg.ffmpeg_missing_body": {
         "en": "FFmpeg was not detected in your system PATH.\nPlease ensure FFmpeg is installed to support all audio formats.",
         "ms": "FFmpeg tidak dikesan dalam PATH sistem anda.\nSila pastikan FFmpeg dipasang untuk menyokong semua format audio.",
@@ -552,6 +576,38 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "Meeting Minutes - {name}",
         "ms": "Minit Mesyuarat - {name}",
     },
+
+    # --- Documentation viewer -----------------------------------------
+    "docs.window.title": {"en": "Documentation", "ms": "Dokumentasi"},
+    "docs.sidebar.title": {"en": "DOCUMENTATION", "ms": "DOKUMENTASI"},
+    "docs.source": {"en": "Source: {path}", "ms": "Sumber: {path}"},
+    "docs.missing": {
+        "en": "No documentation files were found in the docs folder.",
+        "ms": "Tiada fail dokumentasi ditemui dalam folder docs.",
+    },
+    "docs.doc.user_guide": {"en": "User Guide", "ms": "Panduan Pengguna"},
+    "docs.doc.meeting_minute.template_descp": {
+        "en": "Meeting Minute Formats",
+        "ms": "Format Minit Mesyuarat",
+    },
+    "docs.doc.executive_meeting_recap_template": {
+        "en": "Executive Recap",
+        "ms": "Rekap Eksekutif",
+    },
+    "docs.formats.heading": {
+        "en": "Meeting Minute Formats",
+        "ms": "Format Minit Mesyuarat",
+    },
+    "docs.formats.lead": {
+        "en": "Each format below changes what the generated minutes record. "
+              "Pick the one that matches your meeting, then choose it from the "
+              "**Meeting Minute Format** dropdown in the Minutes tab.",
+        "ms": "Setiap format di bawah mengubah apa yang dicatatkan dalam minit yang dijana. "
+              "Pilih format yang sepadan dengan mesyuarat anda, kemudian pilih daripada "
+              "menu lungsur **Format Minit Mesyuarat** dalam tab Minit.",
+    },
+    "docs.formats.short": {"en": "Short Description:", "ms": "Penerangan Ringkas:"},
+    "docs.formats.explanation": {"en": "Explanation:", "ms": "Penjelasan:"},
 }
 
 

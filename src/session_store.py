@@ -38,7 +38,7 @@ VALID_TEMPLATES = [
     "three_column",
     "board_governance",
 ]
-VALID_CHUNK_MINUTES = [15, 20, 25, 30, 45]
+VALID_CHUNK_MINUTES = [0, 15, 20, 25, 30, 45]
 
 VALID_STEP_STATES = ["pending", "working", "done", "error"]
 VALID_CHUNK_STATES = ["pending", "working", "done", "error"]

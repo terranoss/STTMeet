@@ -4,6 +4,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from src.config import API_KEY_URL, DOCS_DIR
+
 from src.transcript_processor import (
     parse_time_to_seconds,
     format_seconds_to_timestamp,
@@ -24,10 +26,28 @@ from src.i18n import (
     STRINGS,
     display_minutes_lang,
     display_template_name,
+    has_key,
     localize_date,
     mode_label,
     normalize_locale,
     translate,
+)
+from src.ui.docs_viewer import (
+    DESCRIPTIVE_DOCS,
+    DOC_ORDER,
+    discover_documents,
+    parse_template_descriptions,
+    template_descriptions_markdown,
+    _slug,
+)
+from src.ui.theme import (
+    ACCENT_FG,
+    ACCENT_HOVER,
+    ACCENT_TEXT,
+    MUTED_TEXT,
+    SIDEBAR_FG,
+    TRANSPARENT_HOVER,
+    TRANSPARENT_TEXT,
 )
 from src.session_store import (
     DEFAULT_SETTINGS,
@@ -204,12 +224,152 @@ def test_translate_each_mode():
     assert translate("menu.settings", "en") == "Settings"
     assert translate("menu.settings", "ms") == "Tetapan"
 
+def test_docs_are_bundled_and_discoverable():
+    """The in-app Documentation reader reads docs/ from disk, not a web link."""
+    assert DOCS_DIR.is_dir(), f"docs folder not found at {DOCS_DIR}"
+    docs = discover_documents(DOCS_DIR)
+    assert docs, "no documentation files discovered"
+    assert docs[0] == "user_guide.md", "user guide must lead the reading order"
+    assert "meeting_minute/template_descp.txt" in docs
+    for rel_path in DOC_ORDER:
+        assert rel_path in docs, f"reading order references a missing file: {rel_path}"
+    for rel_path in docs:
+        assert (DOCS_DIR / rel_path).is_file()
+
+def test_docs_reader_shows_format_descriptions_not_raw_templates():
+    """The raw prompt skeletons stay on disk but must not clutter the sidebar."""
+    docs = discover_documents(DOCS_DIR)
+    for rel_path in docs:
+        assert not rel_path.endswith("_template.md") or rel_path == "executive_meeting_recap_template.md"
+    raw_templates = [
+        p.name for p in (DOCS_DIR / "meeting_minute").glob("*_template.md")
+    ]
+    assert raw_templates, "the prompt specs should still exist for developers"
+    for name in raw_templates:
+        assert f"meeting_minute/{name}" not in docs
+
+def test_template_description_file_parses_into_every_format():
+    """The run-on descriptions file must split into one entry per format."""
+    raw = (DOCS_DIR / "meeting_minute" / "template_descp.txt").read_text(encoding="utf-8")
+    entries = parse_template_descriptions(raw)
+    assert len(entries) == len(VALID_TEMPLATES) == 4
+    assert [e.number for e in entries] == [1, 2, 3, 4]
+    for entry in entries:
+        assert entry.name and "Template" not in entry.name
+        assert entry.short, f"{entry.name} has no short description"
+        assert entry.explanation, f"{entry.name} has no explanation"
+        assert len(entry.short) > 40
+        assert len(entry.explanation) > 200
+        assert "  " not in entry.short and "  " not in entry.explanation
+
+def test_template_descriptions_render_as_markdown_in_both_locales():
+    raw = (DOCS_DIR / "meeting_minute" / "template_descp.txt").read_text(encoding="utf-8")
+    for locale in ALL_MODES:
+        rendered = template_descriptions_markdown(raw, locale)
+        assert rendered.startswith("# ")
+        assert rendered.count("\n## ") == 4
+        assert translate("docs.formats.short", locale) in rendered
+        assert translate("docs.formats.explanation", locale) in rendered
+        assert "A lean, task-driven record" in rendered
+        assert "run-on" not in rendered
+
+def test_template_description_parser_handles_missing_or_empty_input():
+    assert parse_template_descriptions("") == []
+    assert parse_template_descriptions("no sections here at all") == []
+    rendered = template_descriptions_markdown("plain prose only", "en")
+    assert "plain prose only" in rendered
+
+def test_docs_menu_item_is_localized_in_every_mode():
+    for locale in ALL_MODES:
+        assert translate("menu.docs", locale).strip()
+        assert translate("docs.window.title", locale).strip()
+        assert translate("docs.sidebar.title", locale).strip()
+
+def test_every_curated_doc_has_a_localized_title():
+    """Each entry in the reader's reading order needs an en/ms sidebar title."""
+    for rel_path in discover_documents(DOCS_DIR):
+        key = f"docs.doc.{_slug(rel_path)}"
+        assert has_key(key), f"missing localized title for {rel_path}"
+        for locale in ALL_MODES:
+            assert translate(key, locale).strip()
+
+def test_docs_source_line_interpolates_the_path():
+    for locale in ALL_MODES:
+        rendered = translate("docs.source", locale, path="docs/user_guide.md")
+        assert "docs/user_guide.md" in rendered
+        assert "{" not in rendered
+
+def test_api_key_link_points_at_google_ai_studio():
+    """The Settings field links to the page where users create a Gemini key."""
+    assert API_KEY_URL == "https://aistudio.google.com/apikey"
+    assert API_KEY_URL.startswith("https://")
+
+def test_api_key_link_strings_are_localized():
+    for locale in ALL_MODES:
+        assert translate("settings.get_key", locale).strip()
+        assert translate("settings.get_key_hint", locale).strip()
+        assert translate("status.key_link_opened", locale).strip()
+    for locale in ALL_MODES:
+        rendered = translate("msg.key_link_failed", locale, url=API_KEY_URL)
+        assert API_KEY_URL in rendered
+        assert "{" not in rendered
+
+def test_settings_help_no_longer_hardcodes_the_key_url():
+    """The raw URL now lives on the clickable link, not duplicated in prose."""
+    for locale in ALL_MODES:
+        assert "aistudio.google.com" not in translate("settings.help", locale)
+        assert translate("settings.help", locale).strip()
+
+# ---------------------------------------------------------------------------
+# Theme contrast
+# ---------------------------------------------------------------------------
+
+def _relative_luminance(hex_color: str) -> float:
+    channels = [int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    channels = [
+        c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+        for c in channels
+    ]
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+def _contrast_ratio(fg: str, bg: str) -> float:
+    lighter, darker = sorted(
+        (_relative_luminance(fg), _relative_luminance(bg)), reverse=True
+    )
+    return (lighter + 0.05) / (darker + 0.05)
+
+def test_theme_pairs_meet_wcag_aa_contrast():
+    """Transparent widgets need explicit (light, dark) text colours.
+
+    CustomTkinter's default button text (#DCE4EE) is tuned for filled buttons
+    and drops to ~1.07:1 on the light sidebar, making the labels invisible.
+    """
+    pairs = [
+        ("transparent button", TRANSPARENT_TEXT, SIDEBAR_FG),
+        ("transparent button hover", TRANSPARENT_TEXT, TRANSPARENT_HOVER),
+        ("active document", ACCENT_TEXT, ACCENT_FG),
+        ("active document hover", ACCENT_TEXT, ACCENT_HOVER),
+        ("sidebar heading", MUTED_TEXT, SIDEBAR_FG),
+    ]
+    for name, fg, bg in pairs:
+        assert len(fg) == 2 and len(bg) == 2, f"{name} is not a (light, dark) pair"
+        for mode, index in (("light", 0), ("dark", 1)):
+            ratio = _contrast_ratio(fg[index], bg[index])
+            assert ratio >= 4.5, f"{name} in {mode} mode is {ratio:.2f}:1"
+
+def test_docs_sidebar_widgets_use_explicit_theme_colors():
+    """The documentation sidebar must never fall back to CTk's washed-out default."""
+    from src.ui import docs_viewer
+    assert docs_viewer.TRANSPARENT_TEXT is TRANSPARENT_TEXT
+    assert docs_viewer.ACCENT_TEXT is ACCENT_TEXT
+    assert docs_viewer.SIDEBAR_FG is SIDEBAR_FG
+
 def test_translate_has_no_combined_mode():
     # A bilingual "both" mode used to exist; it is gone from both the locale
     # list and every string entry, so it can never be selected again.
     assert ALL_MODES == ("en", "ms")
     assert "both" not in ALL_MODES
-    assert DEFAULT_LOCALE == "ms"
+    assert DEFAULT_LOCALE == "en"
     assert DEFAULT_LOCALE in ALL_MODES
     for key, entry in STRINGS.items():
         assert "both" not in entry, f"{key} still carries a combined-mode variant"
@@ -408,6 +568,19 @@ if __name__ == "__main__":
     test_load_session_missing_and_corrupt()
     test_every_string_has_english_and_malay()
     test_translate_each_mode()
+    test_docs_are_bundled_and_discoverable()
+    test_docs_menu_item_is_localized_in_every_mode()
+    test_every_curated_doc_has_a_localized_title()
+    test_docs_reader_shows_format_descriptions_not_raw_templates()
+    test_template_description_file_parses_into_every_format()
+    test_template_descriptions_render_as_markdown_in_both_locales()
+    test_template_description_parser_handles_missing_or_empty_input()
+    test_docs_source_line_interpolates_the_path()
+    test_api_key_link_points_at_google_ai_studio()
+    test_api_key_link_strings_are_localized()
+    test_settings_help_no_longer_hardcodes_the_key_url()
+    test_theme_pairs_meet_wcag_aa_contrast()
+    test_docs_sidebar_widgets_use_explicit_theme_colors()
     test_translate_has_no_combined_mode()
     test_translate_missing_key_raises()
     test_translate_falls_back_to_english_for_unknown_mode()

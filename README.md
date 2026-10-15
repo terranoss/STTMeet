@@ -25,7 +25,7 @@ Click the **☰** button in the top-left corner for a slide-in drawer holding:
 The drawer displays a live **API Key configured / No API Key** badge. Press `Esc` or click outside the drawer to close it.
 
 ### 🌍 Interface Language / Antara Muka
-Switch **English** or **Bahasa Melayu** from the drawer's language row. Changes apply **instantly** with no restart, and the choice is remembered in `.sttmeet_cache/prefs.json`. The default is **Bahasa Melayu**.
+Switch **English** or **Bahasa Melayu** from the drawer's language row. Changes apply **instantly** with no restart, and the choice is remembered in `.sttmeet_cache/prefs.json`. The default is **English**.
 
 The language selection also drives the **output**: minutes, summary, and action items are generated in the matching language (`English` / `Bahasa Melayu`). A read-only **🌐 Output** chip next to **📝 Generate Minutes** always shows which language will be used — click it to jump to the language toggle. The former "Minutes Lang" dropdown has been removed; the menu is the single source of truth.
 
@@ -92,8 +92,10 @@ STTMeet/
 │   ├── build_windows.ps1       # Nuitka freeze + FFmpeg fetch + Inno Setup compile
 │   └── sttmeet_setup.iss       # Inno Setup 6 installer definition
 │
-├── docs/
-│   └── windows-installer-workflow.md  # Build, smoke-test and release guide
+├── docs/                        # Read in-app via ☰ menu → 📚 Documentation
+│   ├── user_guide.md            # End-user guide (workflow + template selection)
+│   ├── executive_meeting_recap_template.md
+│   └── meeting_minute/          # Action / Discussion / Three-Column / Board templates
 │
 ├── .github/
 │   ├── workflows/tests.yml     # CI: unit tests on Python 3.10 & 3.12
@@ -156,6 +158,7 @@ python main.py
 ```
 
 ### Usage Steps:
+0. **Read the Guide (optional):** Click the **☰** menu and choose **📚 Documentation / Dokumentasi** to open the built-in reader. It ships with the app and contains the full user guide plus every meeting minute template skeleton.
 1. **Enter API Key:** Click the **☰** menu in the top-left, choose **⚙️ Settings / Tetapan**, paste your **Gemini API Key**, and click **Save** (saved securely to `.env`, never committed). The menu shows an **API Key configured** badge so you always know the app is ready.
 2. **Select Audio:** Click **📂 Select Audio File** (`.mp3`, `.m4a`, `.wav`, `.aac`, `.ogg`, `.flac`, `.mp4`). The app displays:
    - Total duration
@@ -197,9 +200,7 @@ This creates/uses `venv\`, downloads FFmpeg into `vendor\ffmpeg\bin\`, freezes t
 
 Requirements on the build machine: Python 3.10+, an `assets\app_icon.ico`, and Inno Setup 6. Nothing else: FFmpeg and Python dependencies are bundled automatically and end users do not need to install anything.
 
-Installed builds write their data to `%LOCALAPPDATA%\STTMeet` (`.env`, `sttmeet.log`, `.sttmeet_cache\`) because `C:\Program Files` is not user-writable.
-
-See [docs/windows-installer-workflow.md](docs/windows-installer-workflow.md) for flags, artefacts, smoke-testing and the release checklist.
+Installed builds write their data to `%LOCALAPPDATA%\STTMeet` (`.env`, `sttmeet.log`, `.sttmeet_cache\`) because `C:\Program Files` is not user-writable. The `docs/` folder is bundled into the installer so **☰ → 📚 Documentation** works offline.
 
 ---
 

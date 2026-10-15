@@ -129,6 +129,27 @@ def split_audio_into_chunks(
     audio = AudioSegment.from_file(audio_path)
     total_len_ms = len(audio)
     log.info("Audio loaded: %.1f seconds total.", total_len_ms / 1000)
+
+    # If chunk_minutes is 0 or negative, treat the entire file as a single un-sliced chunk (No Chunking)
+    if chunk_minutes <= 0:
+        single_chunk = {
+            "chunk_index": 0,
+            "file_path": audio_path,
+            "start_ms": 0,
+            "end_ms": total_len_ms,
+            "duration_ms": total_len_ms,
+            "offset_seconds": 0.0
+        }
+        manifest_data = [single_chunk]
+        try:
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f, indent=2)
+        except Exception as err:
+            log.warning("Could not cache single chunk manifest: %s", err)
+        if progress_callback:
+            progress_callback("Ready (No chunking mode: 1 single file).", 1.0)
+        return manifest_data
+
     target_ms = chunk_minutes * 60 * 1000
     scan_ms = max_scan_minutes * 60 * 1000
     overlap_ms = overlap_seconds * 1000

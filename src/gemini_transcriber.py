@@ -28,15 +28,13 @@ CRITICAL TRANSCRIPTION RULES:
    - "tengok" (keep as is), "dah" (keep as is)
 4. Acronyms & Jargon: Preserve all Malaysian government, business, and tech acronyms accurately (e.g., KPI, SOP, PBT, MOF, KWSP, EPF, SSM, LHDN, HRDF, JKR, IT, AI).
 5. Disfluency Cleaning: Omit hesitation fillers ("uhm", "err", "aa", repeated stuttering) while retaining clear spoken statements.
-6. Speaker Diarization: Label speakers consistently based on acoustic voice characteristics as "Speaker 1", "Speaker 2", etc.
-7. Timestamps: Insert timestamps at the start of each speaker turn in format [MM:SS] (or [HH:MM:SS] if >1 hr).
+6. {speaker_rule}
+7. Timestamps: Insert timestamps at the start of each spoken turn in format [MM:SS] (or [HH:MM:SS] if >1 hr).
 
 {speaker_continuity_context}
 
 OUTPUT FORMAT STRICT REQUIREMENT:
-[MM:SS] Speaker X: <Spoken content>
-[MM:SS] Speaker Y: <Spoken content>
-...
+{output_format}
 
 Transcribe every spoken sentence thoroughly. Do not skip sections or provide summaries in this output.
 """
@@ -111,7 +109,8 @@ def transcribe_audio_chunk(
     progress_callback: Optional[Callable[[str], None]] = None,
     max_retries: int = 3,
     model_override: Optional[str] = None,
-    cancel_event=None
+    cancel_event=None,
+    diarize: bool = True
 ) -> str:
     """
     Transcribes a single audio chunk using the configured Gemini model.
@@ -124,8 +123,15 @@ def transcribe_audio_chunk(
     """
     uploaded_file = None
 
+    if diarize:
+        speaker_rule = "Speaker Diarization: Label speakers consistently based on acoustic voice characteristics as 'Speaker 1', 'Speaker 2', etc."
+        output_format = "[MM:SS] Speaker X: <Spoken content>\n[MM:SS] Speaker Y: <Spoken content>\n..."
+    else:
+        speaker_rule = "Clean Transcription: Do NOT guess or label speaker numbers. Transcribe speech naturally with time markers only."
+        output_format = "[MM:SS] <Spoken content>\n[MM:SS] <Spoken content>\n..."
+
     # Build speaker continuity guidance if previous chunk context is available
-    if previous_tail_transcript and previous_tail_transcript.strip():
+    if diarize and previous_tail_transcript and previous_tail_transcript.strip():
         continuity_note = f"""
 SPEAKER CONTINUITY GUIDANCE:
 The immediately preceding segment ended with the following conversation:
@@ -138,6 +144,8 @@ Maintain the same Speaker numbers (Speaker 1, Speaker 2, etc.) for the correspon
         continuity_note = ""
 
     formatted_prompt = MALAY_ROJAK_TRANSCRIPTION_PROMPT.format(
+        speaker_rule=speaker_rule,
+        output_format=output_format,
         speaker_continuity_context=continuity_note
     )
 

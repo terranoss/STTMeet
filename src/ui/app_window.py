@@ -18,6 +18,7 @@ import sys
 import json
 import threading
 import traceback
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,7 +36,8 @@ from ..config import (
     DEFAULT_CHUNK_MINUTES,
     ENV_PATH,
     MODEL_NAME,
-    MINUTES_MODEL_NAME
+    MINUTES_MODEL_NAME,
+    API_KEY_URL
 )
 from ..logger import LOG_FILE, get_logger
 from ..i18n import (
@@ -81,6 +83,7 @@ from ..minutes_generator import (
 )
 from ..recap_generator import generate_meeting_recap
 from .markdown_view import MarkdownViewer
+from .docs_viewer import DocsWindow
 from ..exporter import (
     DocxUnavailableError,
     export_to_docx,
@@ -107,10 +110,8 @@ ctk.set_default_color_theme("blue")
 # CustomTkinter resolves a button's text colour to a fixed light value when
 # fg_color="transparent", regardless of appearance mode, which makes the glyph
 # invisible on the light-theme surface. Text and hover colours for such buttons
-# are therefore always set explicitly as (light, dark) tuples.
-TRANSPARENT_TEXT = ("#1F2937", "#E5E7EB")
-TRANSPARENT_HOVER = ("#D4D4D8", "#3F3F46")
-ON_ACCENT_TEXT = ("#FFFFFF", "#FFFFFF")
+# are therefore always set explicitly as (light, dark) tuples; see theme.py.
+from .theme import ON_ACCENT_TEXT, TRANSPARENT_HOVER, TRANSPARENT_TEXT
 
 # The dashboard opens maximized. CustomTkinter runs a DPI scaling pass shortly
 # after startup that re-applies self.geometry() and undoes state("zoomed"), so
@@ -542,6 +543,10 @@ class STTMeetApp(ctk.CTk):
         self._retranslate_steps()
         self._refresh_locale_toggle()
         self._refresh_template_dropdown()
+        try:
+            self._refresh_docs_window()
+        except Exception:
+            log.warning("Could not retranslate documentation window", exc_info=True)
         if self.monitor_dialog is not None and self.monitor_dialog.winfo_exists():
             try:
                 self.monitor_dialog.retranslate()
@@ -915,14 +920,15 @@ class STTMeetApp(ctk.CTk):
         sec_tools.grid(row=8, column=0, padx=18, pady=(4, 2), sticky="w")
         self._i18n_widgets.append((sec_tools, "menu.section_tools"))
 
-        # Row 9 & 10: Tools menu items
+        # Row 9, 10 & 11: Tools menu items
         self._add_menu_item("menu.open_log_folder", self._menu_action_open_log_folder, row=9, icon="📁")
-        self._add_menu_item("menu.about", self._menu_action_about, row=10, icon="ℹ️")
+        self._add_menu_item("menu.docs", self._menu_action_open_docs, row=10, icon="📚")
+        self._add_menu_item("menu.about", self._menu_action_about, row=11, icon="ℹ️")
 
-        # Row 11: Spacer row configured with weight=1 to absorb extra height
-        self.menu_frame.grid_rowconfigure(11, weight=1)
+        # Row 12: Spacer row configured with weight=1 to absorb extra height
+        self.menu_frame.grid_rowconfigure(12, weight=1)
 
-        # Row 12: Footer / Close hint
+        # Row 13: Footer / Close hint
         hint = ctk.CTkLabel(
             self.menu_frame,
             text=self._t("menu.close_hint"),
@@ -932,7 +938,7 @@ class STTMeetApp(ctk.CTk):
             justify="center",
             anchor="center"
         )
-        hint.grid(row=12, column=0, padx=18, pady=(10, 16), sticky="ew")
+        hint.grid(row=13, column=0, padx=18, pady=(10, 16), sticky="ew")
         self._i18n_widgets.append((hint, "menu.close_hint"))
 
     def _add_menu_item(self, key: str, command, row: int, icon: str = ""):
@@ -1006,9 +1012,53 @@ class STTMeetApp(ctk.CTk):
             log.warning("Could not open log folder: %s", e)
             messagebox.showinfo(self._t("msg.log_folder"), self._t("msg.log_folder_body", folder=folder))
 
+    def _menu_action_open_docs(self):
+        self._close_menu(animate=False)
+        self._open_docs_window()
+
+    def _open_docs_window(self):
+        """Open (or focus) the in-app documentation reader."""
+        existing = getattr(self, "_docs_window", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return existing
+        self._docs_window = DocsWindow(
+            self,
+            locale=self.ui_locale,
+            on_close=self._forget_docs_window
+        )
+        return self._docs_window
+
+    def _forget_docs_window(self, window=None):
+        if window is None or window is self._docs_window:
+            self._docs_window = None
+
+    def _refresh_docs_window(self):
+        """Re-label the documentation reader after a UI language switch."""
+        window = getattr(self, "_docs_window", None)
+        if window is not None and window.winfo_exists():
+            window.refresh_locale(self.ui_locale)
+
     def _menu_action_about(self):
         self._close_menu(animate=False)
         self._open_about_dialog()
+
+    def _open_api_key_page(self):
+        """Open Google AI Studio so the user can create a Gemini API key."""
+        try:
+            opened = webbrowser.open(API_KEY_URL, new=2)
+        except Exception as e:
+            log.warning("Could not open the API key page: %s", e)
+            opened = False
+        if opened:
+            self._set_status(self._t("status.key_link_opened"))
+        else:
+            messagebox.showinfo(
+                self._t("msg.key_link_title"),
+                self._t("msg.key_link_failed", url=API_KEY_URL)
+            )
 
     def _open_settings_dialog(self):
         """Modal holding Gemini API Key entry, processing options and audio preprocessing."""
@@ -1078,6 +1128,27 @@ class STTMeetApp(ctk.CTk):
             command=toggle_visibility
         )
         toggle_btn.grid(row=0, column=1, padx=(6, 0))
+
+        get_key_link = ctk.CTkLabel(
+            entry_row,
+            text=self._t("settings.get_key"),
+            font=ctk.CTkFont(size=12, underline=True),
+            text_color=("#1976D2", "#64B5F6"),
+            cursor="hand2",
+            anchor="w"
+        )
+        get_key_link.grid(row=1, column=0, columnspan=2, pady=(7, 0), sticky="w")
+        get_key_link.bind("<Button-1>", lambda _e: self._open_api_key_page())
+        get_key_link.bind("<Enter>", lambda _e: get_key_link.configure(text_color=("#0D47A1", "#90CAF9")))
+        get_key_link.bind("<Leave>", lambda _e: get_key_link.configure(text_color=("#1976D2", "#64B5F6")))
+
+        ctk.CTkLabel(
+            entry_row,
+            text=self._t("settings.get_key_hint"),
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+            anchor="w"
+        ).grid(row=2, column=0, columnspan=2, pady=(1, 0), sticky="w")
 
         ctk.CTkLabel(
             body,
@@ -1171,13 +1242,24 @@ class STTMeetApp(ctk.CTk):
         )
         chunk_menu.grid(row=1, column=1, padx=(10, 0), pady=6, sticky="ew")
 
+        # Speaker ID note beneath chunk dropdown
+        lbl_chunk_note = ctk.CTkLabel(
+            proc_frame,
+            text=self._t("settings.chunk_note"),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray30", "gray70"),
+            justify="left",
+            anchor="w"
+        )
+        lbl_chunk_note.grid(row=2, column=0, columnspan=2, padx=(0, 0), pady=(0, 6), sticky="w")
+
         # Meeting minute format
-        add_proc_row(2, "settings.template")
+        add_proc_row(3, "settings.template")
         ctk.CTkOptionMenu(
             proc_frame,
             values=[display_template_name(k, self.ui_locale) for k in VALID_TEMPLATES],
             variable=temp_template_var
-        ).grid(row=2, column=1, padx=(10, 0), pady=6, sticky="ew")
+        ).grid(row=3, column=1, padx=(10, 0), pady=6, sticky="ew")
 
         def do_save():
             if self._save_api_key(notify=False):
@@ -1192,7 +1274,7 @@ class STTMeetApp(ctk.CTk):
 
                 chunk = temp_chunk_var.get()
                 self.chunk_size_var.set(chunk)
-                save_pref("chunk_minutes", int(chunk.split()[0]))
+                save_pref("chunk_minutes", self._parse_chunk_minutes(chunk))
 
                 self._on_template_selected(temp_template_var.get())
 
@@ -1316,9 +1398,9 @@ class STTMeetApp(ctk.CTk):
         self.engine_var = ctk.StringVar(
             value=normalize_settings({"engine": get_pref("engine")})["engine"]
         )
-        self.chunk_size_var = ctk.StringVar(
-            value=f"{normalize_settings({'chunk_minutes': get_pref('chunk_minutes')})['chunk_minutes']} min"
-        )
+        pref_chunk = normalize_settings({'chunk_minutes': get_pref('chunk_minutes')})['chunk_minutes']
+        initial_chunk_val = self._t("chunk.no_chunk") if pref_chunk == 0 else f"{pref_chunk} min"
+        self.chunk_size_var = ctk.StringVar(value=initial_chunk_val)
 
         self.template_display_var = ctk.StringVar(
             value=display_template_name(self.template_var.get(), self.ui_locale)
@@ -1632,14 +1714,15 @@ class STTMeetApp(ctk.CTk):
         bottom_frame.grid_columnconfigure(1, weight=1)
 
         # Speaker mapping trigger
-        speaker_btn = ctk.CTkButton(
+        self.speaker_btn = ctk.CTkButton(
             bottom_frame,
             text=self._t("btn.map_speakers"),
             command=self._open_speaker_mapping_dialog,
+            state="disabled",
             width=160
         )
-        speaker_btn.grid(row=0, column=0, padx=16, pady=10, sticky="w")
-        self._i18n_label(speaker_btn, "btn.map_speakers")
+        self.speaker_btn.grid(row=0, column=0, padx=16, pady=10, sticky="w")
+        self._i18n_label(self.speaker_btn, "btn.map_speakers")
 
         # Export Buttons
         export_docx_btn = ctk.CTkButton(
@@ -1785,8 +1868,24 @@ class STTMeetApp(ctk.CTk):
                 break
 
     def _chunk_display_values(self):
-        """Chunk options rendered as '<minutes> min' for every option menu."""
-        return [f"{mins} min" for mins in VALID_CHUNK_MINUTES]
+        """Chunk options rendered as localized 'No Chunking (Single File)' or '<minutes> min'."""
+        values = []
+        for mins in VALID_CHUNK_MINUTES:
+            if mins == 0:
+                values.append(self._t("chunk.no_chunk"))
+            else:
+                values.append(f"{mins} min")
+        return values
+
+    def _parse_chunk_minutes(self, display_val: str) -> int:
+        """Parse chunk minutes integer from display text."""
+        raw = str(display_val).strip()
+        if raw == self._t("chunk.no_chunk") or "No Chunk" in raw or "Tiada" in raw or raw.startswith("0"):
+            return 0
+        try:
+            return int(raw.split()[0])
+        except (ValueError, IndexError):
+            return DEFAULT_CHUNK_MINUTES
 
     def _refresh_template_dropdown(self):
         """Refresh template dropdown labels according to current UI locale."""
@@ -1822,7 +1921,7 @@ class STTMeetApp(ctk.CTk):
         for tb in [self.txt_transcript, self.txt_minutes, self.txt_recap, self.txt_actions]:
             tb.delete("1.0", "end")
 
-        chunk_mins = int(self.chunk_size_var.get().split()[0])
+        chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
         language = self.lang_var.get()
         do_preprocess = self.preprocess_var.get()
 
@@ -2033,7 +2132,8 @@ class STTMeetApp(ctk.CTk):
                             self._t("status.step_chunk", chunk=chunk_display, msg=msg)
                         ),
                         model_override=model_override,
-                        cancel_event=self.cancel_event
+                        cancel_event=self.cancel_event,
+                        diarize=(chunk_minutes <= 0)
                     )
 
                     adjusted_text = adjust_chunk_timestamps(
@@ -2168,12 +2268,14 @@ class STTMeetApp(ctk.CTk):
                 lines = [l for l in preceding_text.splitlines() if l.strip()]
                 tail_context = "\n".join(lines[-4:]) if lines else ""
 
+                chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
                 raw_text = transcribe_audio_chunk(
                     client=client,
                     chunk_file_path=chunk_info["file_path"],
                     previous_tail_transcript=tail_context,
                     model_override=getattr(self, "active_model_override", None),
-                    cancel_event=self.cancel_event
+                    cancel_event=self.cancel_event,
+                    diarize=(chunk_mins <= 0)
                 )
 
                 adjusted_text = adjust_chunk_timestamps(raw_text, offset_seconds=chunk_info["offset_seconds"])
@@ -2271,6 +2373,13 @@ class STTMeetApp(ctk.CTk):
         self.gen_minutes_btn.configure(state="normal")
         self.gen_recap_btn.configure(state="normal")
         self.gen_actions_btn.configure(state="normal")
+
+        # Speaker identification is only enabled if No Chunking was selected
+        chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
+        if chunk_mins <= 0 and self.detected_speakers:
+            self.speaker_btn.configure(state="normal")
+        else:
+            self.speaker_btn.configure(state="disabled")
 
         # Save meeting session so it restores across app restarts
         if self.active_file_hash:
@@ -2585,10 +2694,7 @@ class STTMeetApp(ctk.CTk):
         # unsafe. During a run the snapshot taken on the UI thread is used instead.
         if self.is_processing and self._session_settings_snapshot:
             return dict(self._session_settings_snapshot)
-        try:
-            chunk_mins = int(str(self.chunk_size_var.get()).split()[0])
-        except (ValueError, IndexError):
-            chunk_mins = DEFAULT_CHUNK_MINUTES
+        chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
         return {
             "engine": self.engine_var.get(),
             "language": self.lang_var.get(),
@@ -2716,6 +2822,11 @@ class STTMeetApp(ctk.CTk):
                 self.gen_minutes_btn.configure(state="normal")
                 self.gen_recap_btn.configure(state="normal")
                 self.gen_actions_btn.configure(state="normal")
+                saved_chunk_mins = data.get("settings", {}).get("chunk_minutes", DEFAULT_CHUNK_MINUTES)
+                if saved_chunk_mins <= 0 and self.detected_speakers:
+                    self.speaker_btn.configure(state="normal")
+                else:
+                    self.speaker_btn.configure(state="disabled")
 
             if self.generated_minutes:
                 sections = parse_minutes_sections(self.generated_minutes)
@@ -2751,7 +2862,8 @@ class STTMeetApp(ctk.CTk):
         # set() does not fire the option menu command callback, so this will not
         # reset the chunk dropdown values or emit a misleading status message.
         self.engine_var.set(clean["engine"])
-        self.chunk_size_var.set(f"{clean['chunk_minutes']} min")
+        chunk_val = self._t("chunk.no_chunk") if clean["chunk_minutes"] == 0 else f"{clean['chunk_minutes']} min"
+        self.chunk_size_var.set(chunk_val)
         self.preprocess_var.set(clean["preprocess"])
         if "template" in clean and clean["template"] in VALID_TEMPLATES:
             self.template_var.set(clean["template"])
@@ -2839,7 +2951,8 @@ class STTMeetApp(ctk.CTk):
         # Close floating monitor dialog if open
         if self.monitor_dialog and self.monitor_dialog.winfo_exists():
             self.monitor_dialog.destroy()
-            self.monitor_dialog = None
+        self.monitor_dialog = None
+        self._docs_window = None
 
         # Cleanly purge all cache files across .sttmeet_cache and .sttmeet_cache/chunks
         purged_count = 0
@@ -2961,6 +3074,11 @@ class STTMeetApp(ctk.CTk):
     # Speaker Mapping Dialog
     # -------------------------------------------------------------
     def _open_speaker_mapping_dialog(self):
+        chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
+        if chunk_mins > 0:
+            messagebox.showinfo(self._t("msg.speaker_mapping"), self._t("msg.speaker_mapping_no_chunk"))
+            return
+
         if not self.raw_transcript:
             messagebox.showinfo(self._t("msg.speaker_mapping"), self._t("msg.no_speakers_yet"))
             return
