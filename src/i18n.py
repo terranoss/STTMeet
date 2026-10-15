@@ -509,6 +509,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "ms": "Tiada kandungan transkrip atau minit untuk dieksport.",
     },
     "msg.export_done": {"en": "Document(s) saved successfully!", "ms": "Dokumen berjaya disimpan!"},
+    "msg.minutes_already_generated": {
+        "en": "Meeting minutes for '{template}' have already been generated.\n\nRe-generating will call the Gemini API and overwrite the existing minutes for this template.\n\nDo you want to proceed and regenerate?",
+        "ms": "Minit mesyuarat untuk '{template}' telah pun dijana sebelum ini.\n\nMenjana semula akan memanggil API Gemini dan menulis ganti minit sedia ada untuk templat ini.\n\nAdakah anda pasti mahu teruskan dan jana semula?",
+    },
 
     # --- Exported document chrome ------------------------------------
     # These were previously hardcoded bilingual ("Tarikh / Date") regardless

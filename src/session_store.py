@@ -63,6 +63,7 @@ def build_session_payload(
     generated_actions: str = "",
     detected_speakers: Optional[List[str]] = None,
     speaker_mapping: Optional[Dict[str, str]] = None,
+    cached_minutes_by_template: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assemble a versioned session payload. Chunk text is NOT stored here."""
     return {
@@ -78,6 +79,7 @@ def build_session_payload(
         "generated_recap": generated_recap or "",
         "generated_actions": generated_actions or "",
         "detected_speakers": list(detected_speakers or []),
+        "cached_minutes_by_template": dict(cached_minutes_by_template or {}),
         "updated_at": datetime.now().isoformat(),
     }
 

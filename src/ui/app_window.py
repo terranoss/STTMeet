@@ -381,6 +381,7 @@ class STTMeetApp(ctk.CTk):
         self.generated_minutes: str = ""
         self.generated_recap: str = ""
         self.generated_actions: str = ""
+        self.cached_minutes_by_template: Dict[str, str] = {}
         self.detected_speakers: List[str] = []
         self.speaker_entries: Dict[str, ctk.CTkEntry] = {}
         self.speaker_mapping: Dict[str, str] = {}
@@ -1764,6 +1765,23 @@ class STTMeetApp(ctk.CTk):
                 self.template_var.set(k)
                 save_pref("template", k)
                 log.info("Meeting minute template changed to: %s", k)
+
+                # If this template was already generated and cached, load it instantly into view
+                cached_text = self.cached_minutes_by_template.get(k)
+                if cached_text:
+                    self.generated_minutes = cached_text
+                    sections = parse_minutes_sections(cached_text)
+                    self._populate_minutes_tabs(sections)
+                    self._hide_minutes_error_banner()
+                else:
+                    # Switch to empty view for this template so user can click Generate
+                    self.generated_minutes = ""
+                    self.txt_minutes.delete("1.0", "end")
+
+                # If transcript is available and pipeline is not busy, enable Generate Minutes button
+                has_transcript = bool((self.processed_transcript or self.raw_transcript).strip())
+                if has_transcript and not self.is_processing:
+                    self.gen_minutes_btn.configure(state="normal")
                 break
 
     def _chunk_display_values(self):
@@ -2318,6 +2336,7 @@ class STTMeetApp(ctk.CTk):
             )
 
             sections = parse_minutes_sections(self.generated_minutes)
+            self.cached_minutes_by_template[template] = self.generated_minutes
             self.after(0, lambda secs=sections: self._populate_minutes_tabs(secs))
             self.after(0, self._hide_minutes_error_banner)
             self._update_step_badge("step4", "done")
@@ -2364,6 +2383,17 @@ class STTMeetApp(ctk.CTk):
         if self.is_processing:
             messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
             return
+
+        current_template = self.template_var.get()
+        # If this template was already generated, warn the user before overwriting
+        if current_template in self.cached_minutes_by_template or (self.generated_minutes and self.generated_minutes.strip()):
+            template_label = display_template_name(current_template, self.ui_locale)
+            confirm = messagebox.askyesno(
+                self._t("msg.notice"),
+                self._t("msg.minutes_already_generated", template=template_label)
+            )
+            if not confirm:
+                return
 
         self.is_processing = True
         self.cancel_event.clear()
@@ -2599,7 +2629,8 @@ class STTMeetApp(ctk.CTk):
             generated_recap=self.generated_recap,
             generated_actions=self.generated_actions,
             detected_speakers=self.detected_speakers,
-            speaker_mapping=self.speaker_mapping
+            speaker_mapping=self.speaker_mapping,
+            cached_minutes_by_template=self.cached_minutes_by_template
         )
 
         session_file = session_path(CACHE_DIR, audio_hash)
@@ -2666,6 +2697,12 @@ class STTMeetApp(ctk.CTk):
             self.generated_minutes = data["generated_minutes"]
             self.generated_recap = data.get("generated_recap", "") or ""
             self.generated_actions = data.get("generated_actions", "") or ""
+            self.cached_minutes_by_template = dict(data.get("cached_minutes_by_template", {}) or {})
+            # If a legacy session has generated_minutes but empty cached_minutes_by_template, backfill it
+            saved_template = data.get("settings", {}).get("template", "action_minutes")
+            if self.generated_minutes and saved_template not in self.cached_minutes_by_template:
+                self.cached_minutes_by_template[saved_template] = self.generated_minutes
+
             self.detected_speakers = data["detected_speakers"]
             self.speaker_mapping = data["speaker_mapping"]
             self.active_file_hash = audio_hash
@@ -2778,6 +2815,7 @@ class STTMeetApp(ctk.CTk):
         self.generated_minutes = ""
         self.generated_recap = ""
         self.generated_actions = ""
+        self.cached_minutes_by_template = {}
         self.detected_speakers = []
         self.speaker_mapping = {}
         self.active_chunks_meta = []
@@ -2881,6 +2919,9 @@ class STTMeetApp(ctk.CTk):
         self.is_processing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+        self.gen_minutes_btn.configure(state="normal")
+        self.gen_recap_btn.configure(state="normal")
+        self.gen_actions_btn.configure(state="normal")
         messagebox.showinfo(
             self._t("msg.completed"),
             self._t("msg.completed_body")
