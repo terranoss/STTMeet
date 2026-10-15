@@ -63,6 +63,7 @@ from ..audio_processor import (
     split_audio_into_chunks,
     compute_file_hash
 )
+from ..cancellation import CancelledError
 from ..gemini_transcriber import (
     get_gemini_client,
     transcribe_audio_chunk
@@ -119,13 +120,16 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
     Floating dialog panel displaying live status for each audio chunk.
     Enables users to monitor pending/working/done/error states, cancel execution,
     reprocess failed chunks individually, and extract all combined transcripts.
+
+    While the pipeline is transcribing, closing is blocked (see set_close_locked) so
+    the live view cannot be dismissed mid-run. This deliberately avoids grab_set: the
+    main window and its other modals stay usable while the monitor is locked.
     """
-    def __init__(self, master, chunks_meta: List[Dict], on_cancel_callback, on_reprocess_callback, on_extract_callback,
-                 t: Optional[Callable[..., str]] = None):
+    def __init__(self, master, chunks_meta: List[Dict], on_reprocess_callback, on_extract_callback,
+                 on_cancel_callback=None, t: Optional[Callable[..., str]] = None):
         super().__init__(master)
         self.master_app = master
         self.chunks_meta = chunks_meta
-        self.on_cancel_callback = on_cancel_callback
         self.on_reprocess_callback = on_reprocess_callback
         self.on_extract_callback = on_extract_callback
 
@@ -135,10 +139,13 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         self._i18n: List[Tuple[Any, str]] = []
         self._chunk_detail: Dict[int, str] = {}  # chunk index -> last error detail
 
+        self._close_key = "monitor.hide"
+
         self.title(self._t("monitor.title"))
         self.geometry("640x520")
         self.minsize(550, 400)
         self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
 
         self.row_widgets: Dict[int, Dict] = {}
         self._build_ui()
@@ -147,6 +154,14 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         self._i18n.append((widget, key))
         widget.configure(text=self._t(key, **fmt))
         return widget
+
+    def set_close_locked(self, locked: bool):
+        """No-op retained for backwards compatibility. Window can always be hidden."""
+        pass
+
+    def _on_close_requested(self):
+        """Close path for X button and Hide button — always hides the floating panel."""
+        self.withdraw()
 
     def retranslate(self):
         """Re-apply every string after the app's language changes."""
@@ -247,18 +262,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         # Bottom Action Bar
         bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
         bottom_frame.grid(row=2, column=0, padx=14, pady=(6, 12), sticky="ew")
-        bottom_frame.grid_columnconfigure(1, weight=1)
-
-        self.btn_cancel = ctk.CTkButton(
-            bottom_frame,
-            text=self._t("monitor.cancel"),
-            fg_color="#C62828",
-            hover_color="#B71C1C",
-            width=100,
-            command=self.on_cancel_callback
-        )
-        self.btn_cancel.grid(row=0, column=0, padx=(0, 6), pady=6, sticky="w")
-        self._i18n.append((self.btn_cancel, "monitor.cancel"))
+        bottom_frame.grid_columnconfigure(0, weight=1)
 
         self.btn_extract = ctk.CTkButton(
             bottom_frame,
@@ -270,17 +274,17 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
             state="disabled",
             command=self.on_extract_callback
         )
-        self.btn_extract.grid(row=0, column=2, padx=6, pady=6, sticky="e")
+        self.btn_extract.grid(row=0, column=1, padx=6, pady=6, sticky="e")
         self._i18n.append((self.btn_extract, "monitor.extract"))
 
         self.btn_close = ctk.CTkButton(
             bottom_frame,
-            text=self._t("monitor.hide"),
+            text=self._t(self._close_key),
             width=100,
-            command=self.withdraw
+            command=self._on_close_requested
         )
-        self.btn_close.grid(row=0, column=3, padx=(6, 0), pady=6, sticky="e")
-        self._i18n.append((self.btn_close, "monitor.hide"))
+        self.btn_close.grid(row=0, column=2, padx=(6, 0), pady=6, sticky="e")
+        self._i18n.append((self.btn_close, lambda _t: _t(self._close_key)))
 
     def update_chunk_state(self, chunk_index: int, state: str, detail: str = ""):
         """
@@ -321,7 +325,6 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         if completed_count == total_count:
             status_text += self._t("monitor.summary_all_done")
             self.btn_extract.configure(state="normal")
-            self.btn_cancel.configure(state="disabled")
         elif has_errors:
             status_text += self._t("monitor.summary_errors")
             self.btn_extract.configure(state="disabled")
@@ -359,6 +362,9 @@ class STTMeetApp(ctk.CTk):
         self.worker_thread: Optional[threading.Thread] = None
         self.cancel_event = threading.Event()
         self.is_processing = False
+        # True only while the step-3 chunk loop can still observe cancel_event.
+        # Cancel is meaningless during e.g. minutes-only generation.
+        self._transcribing = False
 
         # API Key lives here for the whole session; the entry widget only exists
         # inside the Settings modal. Seeded from .env so a restart restores it.
@@ -1711,6 +1717,7 @@ class STTMeetApp(ctk.CTk):
             return
 
         self.is_processing = True
+        self._transcribing = True
         self.cancel_event.clear()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
@@ -1744,10 +1751,19 @@ class STTMeetApp(ctk.CTk):
         )
         self.worker_thread.start()
 
-    def _cancel_processing(self):
-        if messagebox.askyesno(self._t("msg.cancel_title"), self._t("msg.cancel_confirm")):
-            self.cancel_event.set()
-            self._set_status(self._t("status.cancelling"))
+    def _cancel_processing(self, parent=None):
+        """Immediately raise the cooperative cancel flag to stop all processing."""
+        if not self.is_processing and not self._transcribing:
+            messagebox.showinfo(
+                self._t("msg.cancel_title"),
+                self._t("msg.cancel_nothing"),
+                parent=parent or self
+            )
+            return
+
+        self.cancel_event.set()
+        self._set_status(self._t("status.cancelling"))
+        self.cancel_btn.configure(state="disabled")
 
     def _open_or_focus_chunk_monitor(self):
         """Bring chunk monitor dialog to front or recreate it if closed."""
@@ -1770,6 +1786,9 @@ class STTMeetApp(ctk.CTk):
             on_extract_callback=self._extract_transcript_from_monitor,
             t=self._t,
         )
+        # Closing is blocked only while a transcription run is in flight. Because
+        # the dialog is rebuilt here, this line also clears any stale lock.
+        self.monitor_dialog.set_close_locked(self._transcribing)
         self.monitor_btn.configure(state="normal")
         # Sync existing status into monitor
         completed_count = 0
@@ -1821,7 +1840,8 @@ class STTMeetApp(ctk.CTk):
                 self._update_step_badge("step1", "done", self._t("step.skipped"))
 
             if self.cancel_event.is_set():
-                self._on_pipeline_cancelled()
+                # Runs on the worker thread; the handler touches Tk widgets.
+                self.after(0, self._on_pipeline_cancelled)
                 return
 
             # Step 2: Slicing into Chunks
@@ -1881,7 +1901,7 @@ class STTMeetApp(ctk.CTk):
 
             for i, chunk_info in enumerate(chunks):
                 if self.cancel_event.is_set():
-                    self._on_pipeline_cancelled()
+                    self.after(0, self._on_pipeline_cancelled)
                     return
 
                 idx = chunk_info["chunk_index"]
@@ -1919,7 +1939,8 @@ class STTMeetApp(ctk.CTk):
                         progress_callback=lambda msg: self._set_status(
                             self._t("status.step_chunk", chunk=chunk_display, msg=msg)
                         ),
-                        model_override=model_override
+                        model_override=model_override,
+                        cancel_event=self.cancel_event
                     )
 
                     adjusted_text = adjust_chunk_timestamps(
@@ -1953,6 +1974,13 @@ class STTMeetApp(ctk.CTk):
                     self._update_chunk_monitor_item(idx, "done")
                     self._refresh_live_transcript_view()
 
+                except CancelledError:
+                    # A cancel is not a chunk failure: leave the chunk pending so
+                    # the next run resumes it, and unwind the whole pipeline.
+                    self._update_chunk_monitor_item(idx, "cancelled")
+                    self.after(0, self._on_pipeline_cancelled)
+                    return
+
                 except Exception as chunk_err:
                     err_msg = str(chunk_err)
                     log.error("Failed chunk %s: %s", chunk_display, err_msg)
@@ -1970,8 +1998,10 @@ class STTMeetApp(ctk.CTk):
                 ))
 
             self.is_processing = False
+            self._transcribing = False
             self.after(0, lambda: self.start_btn.configure(state="normal"))
             self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
+            self.after(0, self._unlock_monitor)
 
             if completed_count == total_chunks:
                 self._update_step_badge("step3", "done", f"({total_chunks}/{total_chunks})")
@@ -2025,6 +2055,9 @@ class STTMeetApp(ctk.CTk):
             messagebox.showerror(self._t("msg.error"), self._t("msg.key_required"))
             return
 
+        self.cancel_event.clear()
+        self.is_processing = True
+        self.cancel_btn.configure(state="normal")
         self._update_chunk_monitor_item(chunk_index, "working")
         self._set_status(self._t("status.reprocessing_chunk", index=chunk_index + 1))
 
@@ -2046,7 +2079,8 @@ class STTMeetApp(ctk.CTk):
                     client=client,
                     chunk_file_path=chunk_info["file_path"],
                     previous_tail_transcript=tail_context,
-                    model_override=getattr(self, "active_model_override", None)
+                    model_override=getattr(self, "active_model_override", None),
+                    cancel_event=self.cancel_event
                 )
 
                 adjusted_text = adjust_chunk_timestamps(raw_text, offset_seconds=chunk_info["offset_seconds"])
@@ -2089,6 +2123,16 @@ class STTMeetApp(ctk.CTk):
                 if self.active_file_hash:
                     self._save_full_session(self.active_file_hash)
 
+            except CancelledError:
+                log.info("Reprocess of chunk %d cancelled by user.", chunk_index)
+                self.active_chunk_status[chunk_index] = {
+                    "status": "cancelled",
+                    "text": "",
+                    "error": "Cancelled by user"
+                }
+                self._update_chunk_monitor_item(chunk_index, "cancelled")
+                self._set_status(self._t("status.cancelled"))
+
             except Exception as e:
                 err_str = str(e)
                 log.error("Reprocess of chunk %d failed: %s", chunk_index, err_str)
@@ -2101,8 +2145,9 @@ class STTMeetApp(ctk.CTk):
                 self._set_status(
                     self._t("status.reprocess_failed", index=chunk_index + 1, error=err_str[:40])
                 )
-
-        t = threading.Thread(target=worker, daemon=True)
+            finally:
+                self.is_processing = False
+                self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
         t.start()
 
     def _extract_transcript_from_monitor(self):
@@ -2138,6 +2183,7 @@ class STTMeetApp(ctk.CTk):
 
         # Minimize / close monitor
         if self.monitor_dialog and self.monitor_dialog.winfo_exists():
+            self.monitor_dialog.set_close_locked(False)
             self.monitor_dialog.withdraw()
 
         self._set_progress(1.0, self._t("status.extracted", count=len(ordered_parts)))
@@ -2190,7 +2236,8 @@ class STTMeetApp(ctk.CTk):
                 progress_callback=lambda msg: self._set_status(
                     f"{self._t('status.step_prefix', n=4)} {msg}"
                 ),
-                model_override=self._get_selected_model_override()
+                model_override=self._get_selected_model_override(),
+                cancel_event=self.cancel_event
             )
 
             sections = parse_minutes_sections(self.generated_minutes)
@@ -2200,6 +2247,16 @@ class STTMeetApp(ctk.CTk):
             self._save_full_session(file_hash)
             self._set_progress(1.0, self._t("status.all_complete"))
             self.after(0, self._on_pipeline_finished)
+
+        except CancelledError:
+            # Cancellation is not a synthesis failure: leave the transcript and
+            # badges untouched so the user can retry cleanly.
+            log.info("Minutes synthesis cancelled by user.")
+            self.is_processing = False
+            self._transcribing = False
+            self._update_step_badge("step4", "pending")
+            self._set_status(self._t("status.cancelled"))
+            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
 
         except Exception as err:
             err_msg = str(err)
@@ -2232,6 +2289,7 @@ class STTMeetApp(ctk.CTk):
             return
 
         self.is_processing = True
+        self.cancel_event.clear()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="disabled")
         self.gen_minutes_btn.configure(state="disabled")
@@ -2587,18 +2645,30 @@ class STTMeetApp(ctk.CTk):
             self._t("msg.completed_body")
         )
 
+    def _unlock_monitor(self):
+        """Allow the chunk monitor to be closed again. Main thread only."""
+        dialog = self.monitor_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.set_close_locked(False)
+
     def _on_pipeline_cancelled(self):
         self.is_processing = False
+        self._transcribing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+        # Cancellation can land before this run's monitor exists, in which case
+        # the previous run's monitor is the one still holding the lock.
+        self._unlock_monitor()
         self._set_status(self._t("status.cancelled"))
         if self.active_file_hash:
             self._save_full_session(self.active_file_hash)
 
     def _on_pipeline_error(self, error_message: str):
         self.is_processing = False
+        self._transcribing = False
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+        self._unlock_monitor()
         self._set_status(self._t("status.error", error=error_message))
         messagebox.showerror(
             self._t("msg.transcription_error"),

@@ -8,11 +8,11 @@ Generates Meeting Minutes based on specialized templates from docs/meeting_minut
 
 Supports Bahasa Melayu, English, and Bilingual modes.
 """
-import time
 from typing import Dict, Any, Callable, Optional, List
 from google import genai
 from google.genai import types
 
+from .cancellation import CancelledError, cancellable_sleep, raise_if_cancelled
 from .config import MODEL_NAME, FALLBACK_MODELS, MINUTES_MODEL_NAME, MINUTES_FALLBACK_MODELS, MAX_OUTPUT_TOKENS
 from .logger import get_logger
 
@@ -635,11 +635,14 @@ def generate_meeting_minutes(
     template: str = "action_minutes",
     progress_callback: Optional[Callable[[str], None]] = None,
     max_retries: int = 3,
-    model_override: Optional[str] = None
+    model_override: Optional[str] = None,
+    cancel_event=None
 ) -> str:
     """
     Synthesize meeting transcript into structured meeting minutes using the specified template.
     Includes automatic retry with exponential backoff for temporary 503 spikes.
+
+    Pass a threading.Event as cancel_event to abandon the run; raises CancelledError.
     """
     log.info(
         "Generating meeting minutes in language '%s', template '%s' (transcript length: %d chars)",
@@ -655,10 +658,12 @@ def generate_meeting_minutes(
     models_to_try = [preferred] + [m for m in MINUTES_FALLBACK_MODELS if m != preferred]
 
     for model_candidate in models_to_try:
+        raise_if_cancelled(cancel_event)
         log.info("Attempting minutes generation with model: %s", model_candidate)
 
         for attempt in range(1, max_retries + 1):
             try:
+                raise_if_cancelled(cancel_event)
                 log.info("Calling Gemini model '%s' for minutes synthesis (Attempt %d/%d)...", model_candidate, attempt, max_retries)
                 if progress_callback:
                     progress_callback(f"Generating minutes with {model_candidate} (Attempt {attempt}/{max_retries})...")
@@ -671,9 +676,16 @@ def generate_meeting_minutes(
                         temperature=0.2
                     )
                 )
+                # The call cannot be interrupted; discard its result if a cancel
+                # was requested while it was in flight.
+                raise_if_cancelled(cancel_event)
                 result = response.text or ""
                 log.info("Meeting minutes generated successfully with '%s' (%d chars).", model_candidate, len(result))
                 return result
+
+            except CancelledError:
+                # Must precede the generic handler or the cancel would be retried.
+                raise
 
             except Exception as e:
                 err_str = str(e)
@@ -693,7 +705,8 @@ def generate_meeting_minutes(
                     wait_sec = attempt * 5
                     if progress_callback:
                         progress_callback(f"Server busy. Retrying in {wait_sec}s (Attempt {attempt + 1}/{max_retries})...")
-                    time.sleep(wait_sec)
+                    if not cancellable_sleep(cancel_event, wait_sec):
+                        raise CancelledError("Retry backoff cancelled by user.")
                 else:
                     log.error("All %d minutes synthesis attempts failed for '%s': %s", max_retries, model_candidate, err_str[:80])
                     break

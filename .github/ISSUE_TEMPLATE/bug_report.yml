@@ -14,7 +14,7 @@ body:
     attributes:
       label: What happened?
       description: What did you expect, and what happened instead?
-      placeholder: I clicked ▶ Transcribe Audio and...
+      placeholder: I clicked ▶ Start and...
     validations:
       required: true
 
