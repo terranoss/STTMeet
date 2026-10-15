@@ -348,12 +348,21 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "monitor.cancel": {"en": "⏹ Cancel", "ms": "⏹ Batal"},
     "monitor.extract": {"en": "📥 Extract Transcript", "ms": "📥 Ekstrak Transkrip"},
     "monitor.hide": {"en": "Hide Window", "ms": "Sembunyikan Tetingkap"},
+    "monitor.locked": {"en": "🔒 Closing Disabled", "ms": "🔒 Tutup Dilumpuhkan"},
+    "monitor.close_locked": {
+        "en": "This monitor stays open until transcription finishes. Use Cancel to stop the run first.",
+        "ms": "Pemantau ini kekal terbuka sehingga transkrip selesai. Gunakan Batal untuk menghentikan proses dahulu.",
+    },
     "monitor.state_pending": {"en": "Pending ⚪", "ms": "Menunggu ⚪"},
     "monitor.state_working": {"en": "Transcribing... 🔵", "ms": "Mentranskrip... 🔵"},
     "monitor.state_done": {"en": "Completed 🟢", "ms": "Selesai 🟢"},
     "monitor.state_error": {"en": "Error 🔴", "ms": "Ralat 🔴"},
     "monitor.state_error_detail": {"en": "Error: {detail}... 🔴", "ms": "Ralat: {detail}... 🔴"},
     "monitor.state_cancelled": {"en": "Cancelled ⚪", "ms": "Dibatalkan ⚪"},
+    "msg.cancel_nothing": {
+        "en": "Nothing to cancel — no transcription is currently running.",
+        "ms": "Tiada apa-apa untuk dibatalkan — tiada proses transkrip sedang berjalan.",
+    },
     "monitor.summary_base": {
         "en": "Total Chunks: {total} | Completed: {done}/{total}",
         "ms": "Jumlah Potongan: {total} | Selesai: {done}/{total}",
