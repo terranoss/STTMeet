@@ -12,9 +12,22 @@ from src.transcript_processor import (
     apply_speaker_mapping
 )
 from src.utils import format_duration, estimate_cost_and_tokens
+from src.i18n import (
+    ALL_MODES,
+    DEFAULT_LOCALE,
+    LOGIC_COUPLED_LITERALS,
+    MINUTES_LANG_BY_UI_LOCALE,
+    MINUTES_LANG_DISPLAY,
+    STRINGS,
+    display_minutes_lang,
+    mode_label,
+    normalize_locale,
+    translate,
+)
 from src.session_store import (
     DEFAULT_SETTINGS,
     SCHEMA_VERSION,
+    VALID_LANGUAGES,
     build_session_payload,
     load_session,
     normalize_settings,
@@ -154,6 +167,128 @@ def test_load_session_missing_and_corrupt():
         corrupt.write_text("{not valid json", encoding="utf-8")
         assert load_session(corrupt) is None
 
+# ---------------------------------------------------------------------------
+# Localization
+# ---------------------------------------------------------------------------
+
+def test_every_string_has_english_and_malay():
+    for key, entry in STRINGS.items():
+        assert "en" in entry and entry["en"], f"{key} missing 'en'"
+        assert "ms" in entry and entry["ms"], f"{key} missing 'ms'"
+
+def test_translate_each_mode():
+    assert translate("btn.transcribe", "en") == translate("btn.transcribe", "en")
+    en = translate("menu.settings", "en")
+    ms = translate("menu.settings", "ms")
+    both = translate("menu.settings", "both")
+    assert en == "Settings"
+    assert ms == "Tetapan"
+    assert both == "Settings / Tetapan"
+
+def test_translate_explicit_both_overrides_auto_join():
+    # Tab captions were Malay-first before localization; that order must survive.
+    assert translate("tab.summary", "both") == "Ringkasan / Summary"
+    # Entries without an explicit variant are auto-joined English / Bahasa.
+    assert "both" not in STRINGS["btn.transcribe"]
+    assert translate("btn.transcribe", "both").endswith("Transcribe Audio / Transkrip Audio")
+
+def test_translate_both_does_not_duplicate_leading_emoji():
+    for key, entry in STRINGS.items():
+        if "both" in entry:
+            continue
+        combined = translate(key, "both")
+        symbol = entry["en"].split(" ", 1)[0]
+        if symbol and not any(ch.isalnum() for ch in symbol):
+            assert combined.count(symbol) == 1, f"{key} repeats the {symbol} icon"
+
+def test_translate_missing_key_raises():
+    try:
+        translate("no.such.key", "en")
+    except KeyError:
+        return
+    raise AssertionError("expected KeyError for an unknown i18n key")
+
+def test_translate_falls_back_to_english_for_unknown_mode():
+    assert translate("menu.settings", "klingon") == translate("menu.settings", "en")
+
+def test_translate_formats_placeholders():
+    assert translate("status.batch_finished", "en", done=3, total=9) == (
+        "Batch finished: 3/9 chunks completed. "
+        "Please click '\u21bb Reprocess' on failed chunks."
+    )
+    assert "3/9" in translate("status.batch_finished", "ms", done=3, total=9)
+
+def test_logic_coupled_literals_are_not_translated():
+    """Engine/language/chunk values are parsed or keyed; translating breaks them."""
+    for key, entry in STRINGS.items():
+        for variant in entry.values():
+            for literal in LOGIC_COUPLED_LITERALS:
+                assert literal not in variant, f"{key} leaks logic-coupled value {literal!r}"
+
+def test_normalize_locale():
+    for mode in ALL_MODES:
+        assert normalize_locale(mode) == mode
+    assert normalize_locale("klingon") == DEFAULT_LOCALE
+    assert normalize_locale(None) == DEFAULT_LOCALE
+    assert normalize_locale(7) == DEFAULT_LOCALE
+
+def test_locale_cascades_to_a_valid_minutes_language():
+    for locale, expected in MINUTES_LANG_BY_UI_LOCALE.items():
+        assert expected in VALID_LANGUAGES, f"{locale} maps to an invalid minutes language"
+    assert MINUTES_LANG_BY_UI_LOCALE["en"] == "English"
+    assert MINUTES_LANG_BY_UI_LOCALE["ms"] == "Bahasa Melayu"
+    assert MINUTES_LANG_BY_UI_LOCALE["both"] == "Bilingual"
+
+def test_minutes_lang_display_map_matches_valid_languages():
+    assert set(MINUTES_LANG_DISPLAY) == set(VALID_LANGUAGES)
+    for canonical, entry in MINUTES_LANG_DISPLAY.items():
+        assert entry["en"] and entry["ms"]
+
+def test_display_minutes_lang_is_display_only():
+    # Shows a localized name while the canonical value is untouched.
+    assert display_minutes_lang("Bilingual", "ms") == "Dwibahasa"
+    assert display_minutes_lang("Bilingual", "en") == "Bilingual"
+    # An unmapped value is returned verbatim rather than raising.
+    assert display_minutes_lang("Welsh", "ms") == "Welsh"
+
+def test_mode_labels_cover_every_mode():
+    for mode in ALL_MODES:
+        assert mode_label(mode, "en")
+        assert mode_label(mode, "ms")
+
+# ---------------------------------------------------------------------------
+# Preferences
+# ---------------------------------------------------------------------------
+
+def test_prefs_roundtrip_and_tolerance():
+    import src.prefs as prefs_module
+    from src.prefs import get_pref, load_prefs, save_pref
+
+    original_dir = prefs_module.PREFS_PATH.parent
+    original_path = prefs_module.PREFS_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        prefs_module.PREFS_PATH = Path(tmp) / "prefs.json"
+        try:
+            assert load_prefs() == {}
+            assert get_pref("ui_locale", DEFAULT_LOCALE) == DEFAULT_LOCALE
+
+            assert save_pref("ui_locale", "ms") is True
+            assert get_pref("ui_locale") == "ms"
+
+            # A second key must not clobber the first.
+            assert save_pref("other", 1) is True
+            assert get_pref("ui_locale") == "ms"
+            assert get_pref("other") == 1
+
+            # Corrupt and non-object files degrade to {} instead of raising.
+            prefs_module.PREFS_PATH.write_text("{not json", encoding="utf-8")
+            assert load_prefs() == {}
+            prefs_module.PREFS_PATH.write_text("[1, 2, 3]", encoding="utf-8")
+            assert load_prefs() == {}
+        finally:
+            prefs_module.PREFS_PATH = original_path
+    assert original_dir is not None
+
 if __name__ == "__main__":
     test_time_conversions()
     test_adjust_chunk_timestamps()
@@ -165,4 +300,18 @@ if __name__ == "__main__":
     test_session_loads_v1_without_settings()
     test_normalize_settings_rejects_stale_values()
     test_load_session_missing_and_corrupt()
+    test_every_string_has_english_and_malay()
+    test_translate_each_mode()
+    test_translate_explicit_both_overrides_auto_join()
+    test_translate_both_does_not_duplicate_leading_emoji()
+    test_translate_missing_key_raises()
+    test_translate_falls_back_to_english_for_unknown_mode()
+    test_translate_formats_placeholders()
+    test_logic_coupled_literals_are_not_translated()
+    test_normalize_locale()
+    test_locale_cascades_to_a_valid_minutes_language()
+    test_minutes_lang_display_map_matches_valid_languages()
+    test_display_minutes_lang_is_display_only()
+    test_mode_labels_cover_every_mode()
+    test_prefs_roundtrip_and_tolerance()
     print("All unit tests passed successfully!")
