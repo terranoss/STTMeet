@@ -1,0 +1,75 @@
+name: Bug report
+description: Something in STTMeet doesn't work as documented
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Meeting recordings and transcripts are often
+        confidential — **please do not attach raw audio or unredacted transcripts.**
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+      placeholder: I clicked ▶ Start and...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: 3.12.4
+    validations:
+      required: true
+
+  - type: input
+    id: ffmpeg
+    attributes:
+      label: FFmpeg version
+      description: Output of `ffmpeg -version`
+      placeholder: ffmpeg version 7.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Which engine were you using?
+      options:
+        - "⚡ Gemini Cloud (Auto-Failover)"
+        - "☁️ Gemini 3 Flash"
+        - "☁️ Gemini 3.8 Flash"
+        - "☁️ Gemini 3.5 Flash"
+        - "☁️ Gemini 3.5 Flash Lite"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: From `sttmeet.log`. Please redact any meeting content, names, or API keys first.
+      render: shell

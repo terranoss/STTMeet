@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a capability or improvement for STTMeet
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the meeting-transcription problem you hit, not just the feature you want.
+      placeholder: When a 4-hour recording hits a quota limit...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: I would expect the app to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
