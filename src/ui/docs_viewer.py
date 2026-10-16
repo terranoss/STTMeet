@@ -228,7 +228,7 @@ class DocsWindow(ctk.CTkToplevel):
                 anchor="w",
                 width=SIDEBAR_WIDTH - 32,
                 height=34,
-                corner_radius=8,
+                corner_radius=0,
                 fg_color="transparent",
                 text_color=TRANSPARENT_TEXT,
                 hover_color=TRANSPARENT_HOVER,

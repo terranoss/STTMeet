@@ -221,8 +221,54 @@ def test_every_string_has_english_and_malay():
         assert "ms" in entry and entry["ms"], f"{key} missing 'ms'"
 
 def test_translate_each_mode():
-    assert translate("menu.settings", "en") == "Settings"
-    assert translate("menu.settings", "ms") == "Tetapan"
+    assert translate("menubar.tools", "en") == "Tools"
+    assert translate("menubar.tools", "ms") == "Alat"
+    assert translate("menubar.settings", "en") == "Settings..."
+    assert translate("menubar.settings", "ms") == "Tetapan..."
+
+def test_windows_style_ui_strings_are_complete():
+    """Menu bar, toolbar and status bar must all be localized for every locale."""
+    keys = [k for k in STRINGS if k.startswith(("menubar.", "toolbar.", "statusbar."))]
+    assert keys, "no menu bar / toolbar / status bar strings found"
+    for key in keys:
+        for locale in ALL_MODES:
+            assert translate(key, locale).strip(), f"{key} empty in {locale}"
+
+def test_windows_style_chrome_replaced_the_slide_in_drawer():
+    """The hamburger drawer is gone; its obsolete i18n keys must not linger."""
+    removed = (
+        "menu.settings", "menu.save_session", "menu.docs", "menu.about",
+        "menu.open_log_folder", "menu.close_hint", "menu.language_label",
+        "menu.section_general", "menu.section_tools",
+    )
+    for key in removed:
+        assert not has_key(key), f"obsolete drawer key still defined: {key}"
+
+def test_toolbar_and_menubar_cover_the_expected_actions():
+    from src.ui.app_window import _TOOLBAR_ITEMS
+    assert len(_TOOLBAR_ITEMS) == 6
+    for key, icon, handler in _TOOLBAR_ITEMS:
+        assert icon and not icon.isascii() or icon in ("\u2139\uFE0F",), f"{key} has no glyph"
+        assert key.startswith("toolbar.")
+        assert handler.startswith("_"), f"{key} handler {handler} is not a method name"
+    labels = {k for k, _, _ in _TOOLBAR_ITEMS}
+    assert labels == {
+        "toolbar.open", "toolbar.start", "toolbar.cancel",
+        "toolbar.save", "toolbar.docs", "toolbar.about",
+    }
+
+def test_ui_uses_windows_flat_corner_radii():
+    """Every window chrome frame/button in the app must be square-cornered."""
+    import pathlib
+    import re
+    ui = pathlib.Path(__file__).resolve().parent / "src" / "ui"
+    pattern = re.compile(r"corner_radius\s*=\s*(\d+)")
+    offenders = []
+    for name in ("app_window.py", "docs_viewer.py", "markdown_view.py"):
+        for match in pattern.finditer((ui / name).read_text(encoding="utf-8")):
+            if match.group(1) != "0":
+                offenders.append(f"{name}: corner_radius={match.group(1)}")
+    assert not offenders, "rounded corners remain: " + ", ".join(offenders)
 
 def test_docs_are_bundled_and_discoverable():
     """The in-app Documentation reader reads docs/ from disk, not a web link."""
@@ -281,7 +327,7 @@ def test_template_description_parser_handles_missing_or_empty_input():
 
 def test_docs_menu_item_is_localized_in_every_mode():
     for locale in ALL_MODES:
-        assert translate("menu.docs", locale).strip()
+        assert translate("toolbar.docs", locale).strip()
         assert translate("docs.window.title", locale).strip()
         assert translate("docs.sidebar.title", locale).strip()
 
@@ -384,9 +430,9 @@ def test_translate_missing_key_raises():
     raise AssertionError("expected KeyError for an unknown i18n key")
 
 def test_translate_falls_back_to_english_for_unknown_mode():
-    assert translate("menu.settings", "klingon") == translate("menu.settings", "en")
+    assert translate("menubar.tools", "klingon") == translate("menubar.tools", "en")
     # A locale written by an older build is no longer valid and must not raise.
-    assert translate("menu.settings", "both") == translate("menu.settings", "en")
+    assert translate("menubar.tools", "both") == translate("menubar.tools", "en")
 
 def test_translate_formats_placeholders():
     assert translate("status.batch_finished", "en", done=3, total=9) == (
@@ -595,6 +641,10 @@ if __name__ == "__main__":
     test_load_session_missing_and_corrupt()
     test_every_string_has_english_and_malay()
     test_translate_each_mode()
+    test_windows_style_ui_strings_are_complete()
+    test_windows_style_chrome_replaced_the_slide_in_drawer()
+    test_toolbar_and_menubar_cover_the_expected_actions()
+    test_ui_uses_windows_flat_corner_radii()
     test_docs_are_bundled_and_discoverable()
     test_docs_menu_item_is_localized_in_every_mode()
     test_every_curated_doc_has_a_localized_title()

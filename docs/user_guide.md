@@ -17,9 +17,10 @@ template so you can pick the right one for your meeting.
 | FFmpeg | Required for audio preprocessing. Verify with `ffmpeg -version`. |
 | Supported audio | `.mp3`, `.m4a`, `.wav`, `.aac`, `.ogg`, `.flac`, `.mp4` |
 
-Open the **☰** menu → **⚙️ Settings**, paste your Gemini API Key and click
-**Save**. A green **API Key configured** badge appears in the drawer, so you can
-always confirm the app is ready before starting a long transcription.
+Open the **Tools** menu → **Settings...** (or the ⚙️ toolbar icon), paste
+your Gemini API Key and click **Save**. A green **API Key configured** badge
+appears in the status bar, so you can always confirm the app is ready before
+starting a long transcription.
 
 ---
 
@@ -102,9 +103,9 @@ remembered between sessions.
 | **Three-Column** | One row per item: discussion, action, responsibility | Dense agendas where every line must have an owner |
 | **Board / Governance** | Formal board minute numbering with resolutions | Company boards, committees, governance bodies |
 
-Open **📚 Documentation** in the **☰** menu and select **Meeting Minute Formats**
-for the full description of each one — what it records, and the kind of meeting
-it suits.
+Open the **Tools** menu → **Documentation** (or the 📚 toolbar icon) and
+select **Meeting Minute Formats** for the full description of each one —
+what it records, and the kind of meeting it suits.
 
 ### 4.1 Action Minutes *(default)*
 Sections: meeting objective, review of prior action items, agenda items with
@@ -167,7 +168,8 @@ Inside the body, two conventions matter most:
 
 ## 6. Interface Language
 
-The **☰** menu switches the interface between **English** and **Bahasa Melayu**,
+The **EN/MS** chip in the toolbar switches the interface between **English**
+and **Bahasa Melayu**,
 and the minutes output language follows the interface language automatically.
 The **🌐 Output** chip always shows the language currently used for generation.
 

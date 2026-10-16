@@ -112,24 +112,35 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "ffmpeg.installed": {"en": "FFmpeg: ✅ Installed", "ms": "FFmpeg: ✅ Dipasang"},
     "ffmpeg.missing": {"en": "FFmpeg: ❌ Not Found in PATH", "ms": "FFmpeg: ❌ Tidak Dijumpai dalam PATH"},
 
-    # --- Drawer menu --------------------------------------------------
-    "menu.section_general": {"en": "GENERAL", "ms": "UTAMA"},
-    "menu.section_tools": {"en": "TOOLS & ABOUT", "ms": "ALAT & TENTANG"},
-    "menu.language_label": {"en": "🌐  Language / Bahasa", "ms": "🌐  Bahasa / Language"},
-    "menu.settings": {"en": "Settings", "ms": "Tetapan"},
-    "menu.save_session": {"en": "Save Session", "ms": "Simpan Sesi"},
-    "menu.open_log_folder": {"en": "Open Log Folder", "ms": "Buka Folder Log"},
-    "menu.docs": {"en": "Documentation", "ms": "Dokumentasi"},
-    "menu.about": {"en": "About", "ms": "Tentang"},
-    "menu.close_hint": {
-        "en": "Press Esc or click outside to close",
-        "ms": "Tekan Esc atau klik di luar untuk tutup",
-    },
-    "menu.key_configured": {
+    # --- Menu bar ------------------------------------------------------
+    "menubar.file": {"en": "File", "ms": "Fail"},
+    "menubar.edit": {"en": "Edit", "ms": "Sunting"},
+    "menubar.tools": {"en": "Tools", "ms": "Alat"},
+    "menubar.help": {"en": "Help", "ms": "Bantuan"},
+    "menubar.open_audio": {"en": "Open Audio...", "ms": "Buka Audio..."},
+    "menubar.save_session": {"en": "Save Session", "ms": "Simpan Sesi"},
+    "menubar.reset": {"en": "Reset Workspace", "ms": "Set Semula Ruang Kerja"},
+    "menubar.exit": {"en": "Exit", "ms": "Keluar"},
+    "menubar.map_speakers": {"en": "Map Speaker Names...", "ms": "Petakan Nama Penceramah..."},
+    "menubar.settings": {"en": "Settings...", "ms": "Tetapan..."},
+    "menubar.open_log": {"en": "Open Log Folder", "ms": "Buka Folder Log"},
+    "menubar.docs": {"en": "Documentation", "ms": "Dokumentasi"},
+    "menubar.about": {"en": "About STTMeet", "ms": "Tentang STTMeet"},
+
+    # --- Toolbar -------------------------------------------------------
+    "toolbar.open": {"en": "Open", "ms": "Buka"},
+    "toolbar.start": {"en": "Start", "ms": "Mula"},
+    "toolbar.cancel": {"en": "Cancel", "ms": "Batal"},
+    "toolbar.save": {"en": "Save", "ms": "Simpan"},
+    "toolbar.docs": {"en": "Docs", "ms": "Dokumen"},
+    "toolbar.about": {"en": "About", "ms": "Tentang"},
+
+    # --- Status bar ----------------------------------------------------
+    "statusbar.api_key_configured": {
         "en": "✅  API Key configured",
         "ms": "✅  Kunci API dikonfigurasi",
     },
-    "menu.key_missing": {
+    "statusbar.api_key_missing": {
         "en": "⚠️  No API Key — open Settings",
         "ms": "⚠️  Tiada Kunci API — buka Tetapan",
     },

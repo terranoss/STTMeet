@@ -111,7 +111,19 @@ ctk.set_default_color_theme("blue")
 # fg_color="transparent", regardless of appearance mode, which makes the glyph
 # invisible on the light-theme surface. Text and hover colours for such buttons
 # are therefore always set explicitly as (light, dark) tuples; see theme.py.
-from .theme import ON_ACCENT_TEXT, TRANSPARENT_HOVER, TRANSPARENT_TEXT
+from .theme import (
+    ACCENT_FG,
+    ACCENT_HOVER,
+    ACCENT_TEXT,
+    MUTED_TEXT,
+    ON_ACCENT_TEXT,
+    STATUS_BAR_BG,
+    STATUS_BAR_BORDER,
+    TOOLBAR_BG,
+    TOOLBAR_BORDER,
+    TRANSPARENT_HOVER,
+    TRANSPARENT_TEXT,
+)
 
 # The dashboard opens maximized. CustomTkinter runs a DPI scaling pass shortly
 # after startup that re-applies self.geometry() and undoes state("zoomed"), so
@@ -189,7 +201,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         self.grid_rowconfigure(1, weight=1)
 
         # Header Info Card
-        header_frame = ctk.CTkFrame(self, corner_radius=8)
+        header_frame = ctk.CTkFrame(self, corner_radius=0)
         header_frame.grid(row=0, column=0, padx=14, pady=(12, 6), sticky="ew")
         header_frame.grid_columnconfigure(0, weight=1)
 
@@ -205,7 +217,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         self.progress_bar.set(0.0)
 
         # Scrollable Chunk List
-        self.scroll_frame = ctk.CTkScrollableFrame(self, corner_radius=8)
+        self.scroll_frame = ctk.CTkScrollableFrame(self, corner_radius=0)
         self.scroll_frame.grid(row=1, column=0, padx=14, pady=6, sticky="nsew")
         self.scroll_frame.grid_columnconfigure(1, weight=1)
 
@@ -215,7 +227,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
             end_sec = chunk.get("end_ms", 0) / 1000.0
             time_str = f"{format_duration(start_sec)} - {format_duration(end_sec)}"
 
-            card = ctk.CTkFrame(self.scroll_frame, corner_radius=6, fg_color=("#F5F5F5", "#242424"))
+            card = ctk.CTkFrame(self.scroll_frame, corner_radius=0, fg_color=("#F5F5F5", "#242424"))
             card.pack(fill="x", pady=4, padx=4)
             card.grid_columnconfigure(1, weight=1)
 
@@ -237,7 +249,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color="gray",
                 fg_color=("#E0E0E0", "#2B2B2B"),
-                corner_radius=6,
+                corner_radius=0,
                 padx=10,
                 pady=3
             )
@@ -339,6 +351,17 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
         self.summary_label.configure(text=status_text)
 
 
+# Traditional icon toolbar: (i18n key, glyph, handler name resolved on the app).
+_TOOLBAR_ITEMS = (
+    ("toolbar.open", "\U0001F4C2", "_browse_audio_file"),
+    ("toolbar.start", "\u25B6", "_start_processing_pipeline"),
+    ("toolbar.cancel", "\u23F9", "_cancel_processing"),
+    ("toolbar.save", "\U0001F4BE", "_save_session_manually"),
+    ("toolbar.docs", "\U0001F4DA", "_open_docs_window"),
+    ("toolbar.about", "\u2139\uFE0F", "_open_about_dialog"),
+)
+
+
 class STTMeetApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -401,18 +424,15 @@ class STTMeetApp(ctk.CTk):
         self._step_states = {"step1": "pending", "step2": "pending", "step3": "pending", "step4": "pending"}
         self._progress_value: float = 0.0
 
-        # Slide-in menu (created lazily on first open)
-        self._menu_open: bool = False
-        self.menu_overlay = None
-        self.menu_frame = None
+        # Status bar indicators
         self.menu_key_badge = None
-        self._menu_slide_job: Optional[str] = None
+        self._docs_window = None
 
         self._build_ui()
         self._refresh_output_lang_chip()
+        self._refresh_menu_key_badge()
         self._check_initial_environment()
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
-        self.bind("<Escape>", self._on_escape_key)
         self._start_maximized()
 
     def _start_maximized(self):
@@ -448,10 +468,13 @@ class STTMeetApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
 
-        # 1. Top Section: Header & Settings
-        self._build_header_and_settings()
+        # 0. Menu bar (native tk.Menu)
+        self._build_menu_bar()
 
-        # 2. File Selection & Audio Details Card
+        # 1. Toolbar (icon buttons + language chip)
+        self._build_toolbar()
+
+        # 2. File Selection & Audio Details
         self._build_file_section()
 
         # 3. Action Controls & Progress
@@ -460,8 +483,11 @@ class STTMeetApp(ctk.CTk):
         # 4. Center Section: Tabbed Content Viewer
         self._build_tabs_section()
 
-        # 5. Bottom Section: Speaker Mapping & Export Bar
+        # 5. Bottom Section: Export Bar
         self._build_bottom_bar()
+
+        # 6. Status Bar
+        self._build_status_bar()
 
     # -------------------------------------------------------------
     # Localization
@@ -514,12 +540,11 @@ class STTMeetApp(ctk.CTk):
         chip_var.set(self._t("control.output_lang", value=display))
 
     def _open_menu_for_language(self):
-        """Open the drawer so the language toggle is reachable from the chip."""
-        self._open_menu()
-        try:
-            self.menu_frame.lift()
-        except Exception:
-            pass
+        """Cycle to the next language when the output-language chip is clicked."""
+        modes = list(ALL_MODES)
+        current = modes.index(self.ui_locale) if self.ui_locale in modes else 0
+        next_mode = modes[(current + 1) % len(modes)]
+        self._set_ui_locale(next_mode)
 
     def _retranslate_ui(self):
         """Re-apply every registered string plus the widgets with custom logic."""
@@ -544,9 +569,12 @@ class STTMeetApp(ctk.CTk):
         self._refresh_locale_toggle()
         self._refresh_template_dropdown()
         try:
+            self._retranslate_menu_bar()
             self._refresh_docs_window()
+            self._refresh_ffmpeg_badge()
+            self._refresh_menu_key_badge()
         except Exception:
-            log.warning("Could not retranslate documentation window", exc_info=True)
+            log.warning("Could not retranslate menu bar", exc_info=True)
         if self.monitor_dialog is not None and self.monitor_dialog.winfo_exists():
             try:
                 self.monitor_dialog.retranslate()
@@ -622,344 +650,105 @@ class STTMeetApp(ctk.CTk):
                 found.append(text)
         return found
 
-    def _build_header_and_settings(self):
-        top_frame = ctk.CTkFrame(self, corner_radius=10)
-        top_frame.grid(row=0, column=0, padx=16, pady=(12, 6), sticky="ew")
-        top_frame.grid_columnconfigure(2, weight=1)
-
-        # Hamburger toggle — opens the slide-in menu
-        self.menu_btn = ctk.CTkButton(
-            top_frame,
-            text="☰",
-            width=42,
-            font=ctk.CTkFont(size=20),
-            fg_color="transparent",
-            text_color=TRANSPARENT_TEXT,
-            hover_color=TRANSPARENT_HOVER,
-            command=self._toggle_menu
+    def _build_toolbar(self):
+        """Traditional icon toolbar. Labels surface on hover via the status bar."""
+        toolbar = ctk.CTkFrame(
+            self, corner_radius=0, fg_color=TOOLBAR_BG,
+            border_width=1, border_color=TOOLBAR_BORDER
         )
-        self.menu_btn.grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        toolbar.grid_columnconfigure(len(_TOOLBAR_ITEMS), weight=1)
 
-        title_label = ctk.CTkLabel(
-            top_frame,
-            text=self._t("header.title"),
-            font=ctk.CTkFont(size=20, weight="bold")
-        )
-        title_label.grid(row=0, column=1, padx=(4, 10), pady=10, sticky="w")
+        self._status_hint_previous: Optional[str] = None
+        self.tb_buttons: Dict[str, ctk.CTkButton] = {}
 
-        # Status Badges
-        self.ffmpeg_badge = ctk.CTkLabel(
-            top_frame,
-            text=self._t("ffmpeg.checking"),
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        self.ffmpeg_badge.grid(row=0, column=3, padx=(10, 16), pady=10, sticky="e")
-
-    # -------------------------------------------------------------
-    # Slide-in Menu
-    # -------------------------------------------------------------
-    MENU_WIDTH = 300
-    _MENU_SLIDE_STEPS = 6
-
-    def _toggle_menu(self):
-        if self._menu_open:
-            self._close_menu()
-        else:
-            self._open_menu()
-
-    def _on_escape_key(self, event=None):
-        if self._menu_open:
-            self._close_menu()
-            return "break"
-        return None
-
-    def _open_menu(self):
-        if self._menu_open:
-            return
-        self._menu_open = True
-        self._cancel_menu_slide()
-
-        if self.menu_overlay is None or not self.menu_overlay.winfo_exists():
-            # A stipple-filled Tk Canvas is used as the dim layer: CustomTkinter's
-            # colour parser rejects 8-digit #RRGGBBAA alpha values, so the 50%
-            # dither pattern is the portable way to darken the content behind.
-            self.menu_overlay = tk.Canvas(
-                self,
-                highlightthickness=0,
-                bd=0
-            )
-            self.menu_overlay.create_rectangle(
-                0, 0, 10000, 10000,
-                fill="#000000",
-                stipple="gray50",
-                outline=""
-            )
-            self.menu_overlay.bind("<Button-1>", lambda _e: self._close_menu())
-            self.menu_overlay.bind("<Escape>", self._on_escape_key)
-        self.menu_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        # tkraise() on a Canvas is a tag operation, so raise the widget explicitly.
-        self.tk.call("raise", self.menu_overlay._w)
-
-        if self.menu_frame is None or not self.menu_frame.winfo_exists():
-            self._build_menu_panel()
-        self._refresh_menu_key_badge()
-        self.menu_frame.place_configure(y=0, relheight=1)
-        self.menu_frame.tkraise()
-
-        # Slide in from the left edge
-        self._animate_menu(target_x=0)
-
-    def _close_menu(self, animate: bool = True):
-        if not self._menu_open:
-            return
-        self._menu_open = False
-        self._cancel_menu_slide()
-        if not animate:
-            if self.menu_frame is not None and self.menu_frame.winfo_exists():
-                self.menu_frame.place_configure(x=-self._menu_width())
-            self._teardown_menu_overlay()
-        else:
-            self._animate_menu(target_x=-self._menu_width(), then=self._teardown_menu_overlay)
-
-    def _teardown_menu_overlay(self):
-        """Remove the dimming overlay once the drawer is fully off-screen."""
-        if self._menu_open:
-            return
-        if self.menu_overlay is not None and self.menu_overlay.winfo_exists():
-            self.menu_overlay.place_forget()
-
-    def _menu_width(self) -> int:
-        """Actual on-screen width of the drawer, falling back to MENU_WIDTH."""
-        if self.menu_frame is not None and self.menu_frame.winfo_exists():
-            width = self.menu_frame.winfo_width()
-            if width > 1:
-                return width
-        return self.MENU_WIDTH
-
-    def _cancel_menu_slide(self):
-        if self._menu_slide_job is not None:
-            try:
-                self.after_cancel(self._menu_slide_job)
-            except Exception:
-                pass
-            self._menu_slide_job = None
-
-    def _animate_menu(self, target_x: int, then=None):
-        """Step the drawer horizontally toward target_x to fake a slide."""
-        self._cancel_menu_slide()
-        if self.menu_frame is None or not self.menu_frame.winfo_exists():
-            if then:
-                then()
-            return
-
-        try:
-            current_x = int(self.menu_frame.winfo_x())
-        except Exception:
-            current_x = -self.MENU_WIDTH
-
-        diff = target_x - current_x
-        if abs(diff) <= 25:
-            new_x = target_x
-        else:
-            raw_step = int(diff / 2.5)
-            if diff > 0:
-                step = max(raw_step, 60)
-            else:
-                step = min(raw_step, -60)
-            new_x = current_x + step
-
-        if (target_x > current_x and new_x >= target_x) or (target_x < current_x and new_x <= target_x):
-            new_x = target_x
-
-        self.menu_frame.place_configure(x=new_x)
-
-        if new_x == target_x:
-            self._menu_slide_job = None
-            if then:
-                self.after(0, then)
-        else:
-            self._menu_slide_job = self.after(16, self._animate_menu, target_x, then)
-
-    def _build_menu_panel(self):
-        self.menu_frame = ctk.CTkFrame(
-            self,
-            width=self.MENU_WIDTH,
-            corner_radius=0,
-            border_width=1,
-            border_color=("gray80", "gray25")
-        )
-        self.menu_frame.grid_columnconfigure(0, weight=1)
-
-        # Row 0: Top Header with App Title, version and Close '✕' button
-        header_row = ctk.CTkFrame(self.menu_frame, fg_color="transparent")
-        header_row.grid(row=0, column=0, padx=16, pady=(18, 6), sticky="ew")
-        header_row.grid_columnconfigure(0, weight=1)
-
-        title_box = ctk.CTkFrame(header_row, fg_color="transparent")
-        title_box.grid(row=0, column=0, sticky="w")
-
-        menu_title = ctk.CTkLabel(
-            title_box,
-            text=self._t("header.title"),
-            font=ctk.CTkFont(size=18, weight="bold")
-        )
-        menu_title.pack(anchor="w")
-        self._i18n_widgets.append((menu_title, "header.title"))
-
-        menu_version = ctk.CTkLabel(
-            title_box,
-            text=get_display_version(),
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        menu_version.pack(anchor="w")
-
-        close_btn = ctk.CTkButton(
-            header_row,
-            text="✕",
-            width=28,
-            height=28,
-            corner_radius=14,
-            fg_color="transparent",
-            text_color=TRANSPARENT_TEXT,
-            hover_color=TRANSPARENT_HOVER,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=self._close_menu
-        )
-        close_btn.grid(row=0, column=1, sticky="e")
-
-        # Row 1: Status Card
-        status_card = ctk.CTkFrame(
-            self.menu_frame,
-            corner_radius=8,
-            fg_color=("#F3F4F6", "#27272A"),
-            border_width=1,
-            border_color=("#E5E7EB", "#3F3F46")
-        )
-        status_card.grid(row=1, column=0, padx=14, pady=(6, 12), sticky="ew")
-        status_card.grid_columnconfigure(0, weight=1)
-
-        self.menu_key_badge = ctk.CTkLabel(
-            status_card,
-            text="",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            anchor="w",
-            padx=10,
-            pady=8
-        )
-        self.menu_key_badge.grid(row=0, column=0, sticky="ew")
-
-        # Row 2 & 3: Language Toggle (Pill container)
-        lang_label = ctk.CTkLabel(
-            self.menu_frame,
-            text=self._t("menu.language_label"),
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("gray40", "gray60"),
-            anchor="w"
-        )
-        lang_label.grid(row=2, column=0, padx=18, pady=(2, 4), sticky="w")
-        self._i18n_widgets.append((lang_label, "menu.language_label"))
-
-        locale_container = ctk.CTkFrame(
-            self.menu_frame,
-            corner_radius=8,
-            fg_color=("#E5E7EB", "#27272A"),
-            border_width=1,
-            border_color=("#D1D5DB", "#3F3F46")
-        )
-        locale_container.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="ew")
-        for i in range(len(ALL_MODES)):
-            locale_container.grid_columnconfigure(i, weight=1)
-
-        self._locale_buttons = {}
-        for i, mode in enumerate(ALL_MODES):
+        for idx, (key, icon, handler) in enumerate(_TOOLBAR_ITEMS):
             btn = ctk.CTkButton(
-                locale_container,
-                text=mode_label(mode, self.ui_locale),
-                height=30,
-                corner_radius=6,
-                font=ctk.CTkFont(size=11),
+                toolbar,
+                text=icon,
+                width=38,
+                height=32,
+                corner_radius=0,
                 fg_color="transparent",
                 text_color=TRANSPARENT_TEXT,
                 hover_color=TRANSPARENT_HOVER,
+                font=ctk.CTkFont(size=15),
+                command=getattr(self, handler)
+            )
+            btn.grid(row=0, column=idx, padx=1, pady=2, sticky="w")
+            btn.bind("<Enter>", lambda _e, k=key: self._show_toolbar_hint(k))
+            btn.bind("<Leave>", lambda _e: self._clear_toolbar_hint())
+            self.tb_buttons[key] = btn
+
+        # Toolbar twins of the main control buttons must grey out with them.
+        # Wired in _build_controls_section, where those buttons now exist.
+
+        locale_frame = ctk.CTkFrame(toolbar, fg_color="transparent", corner_radius=0)
+        locale_frame.grid(row=0, column=len(_TOOLBAR_ITEMS) + 1, padx=(10, 4), pady=2, sticky="e")
+        for i, mode in enumerate(ALL_MODES):
+            btn = ctk.CTkButton(
+                locale_frame,
+                text=mode_label(mode, self.ui_locale),
+                width=44,
+                height=26,
+                corner_radius=0,
+                font=ctk.CTkFont(size=10),
+                fg_color=ACCENT_FG if mode == self.ui_locale else "transparent",
+                text_color=ACCENT_TEXT if mode == self.ui_locale else TRANSPARENT_TEXT,
+                hover_color=ACCENT_HOVER if mode == self.ui_locale else TRANSPARENT_HOVER,
                 command=lambda m=mode: self._set_ui_locale(m)
             )
-            btn.grid(row=0, column=i, padx=2, pady=2, sticky="ew")
+            btn.grid(row=0, column=i, padx=1, pady=1)
             self._locale_buttons[mode] = btn
         self._refresh_locale_toggle()
 
-        # Row 4: Section 1 Header - General
-        sec_general = ctk.CTkLabel(
-            self.menu_frame,
-            text=self._t("menu.section_general"),
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=("gray50", "gray55"),
-            anchor="w"
-        )
-        sec_general.grid(row=4, column=0, padx=18, pady=(4, 2), sticky="w")
-        self._i18n_widgets.append((sec_general, "menu.section_general"))
+    def _show_toolbar_hint(self, key: str):
+        """Show a toolbar button's localized name in the status bar on hover."""
+        if self._status_hint_previous is None:
+            self._status_hint_previous = self.status_label.cget("text")
+        self._set_status(self._t(key))
 
-        # Row 5 & 6: General menu items
-        self._add_menu_item("menu.settings", self._menu_action_settings, row=5, icon="⚙️")
-        self._add_menu_item("menu.save_session", self._menu_action_save_session, row=6, icon="💾")
+    def _clear_toolbar_hint(self):
+        """Restore whatever the status bar showed before the hover."""
+        if self._status_hint_previous is not None:
+            previous, self._status_hint_previous = self._status_hint_previous, None
+            self._set_status(previous)
 
-        # Row 7: Subtle divider line
-        ctk.CTkFrame(self.menu_frame, height=1, fg_color=("gray85", "gray25")).grid(
-            row=7, column=0, padx=18, pady=(8, 8), sticky="ew"
-        )
+    def _mirror_button_state(self, source_key: str, target_key: str):
+        """Keep a toolbar twin enabled/disabled in step with its main button.
 
-        # Row 8: Section 2 Header - Tools & Info
-        sec_tools = ctk.CTkLabel(
-            self.menu_frame,
-            text=self._t("menu.section_tools"),
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=("gray50", "gray55"),
-            anchor="w"
-        )
-        sec_tools.grid(row=8, column=0, padx=18, pady=(4, 2), sticky="w")
-        self._i18n_widgets.append((sec_tools, "menu.section_tools"))
+        The pipeline toggles state on the control-section buttons from many
+        places; mirroring keeps the toolbar honest without touching them.
+        """
+        source = getattr(self, source_key, None)
+        target = self.tb_buttons.get(target_key)
+        if source is None or target is None:
+            return
+        original = source.configure
 
-        # Row 9, 10 & 11: Tools menu items
-        self._add_menu_item("menu.open_log_folder", self._menu_action_open_log_folder, row=9, icon="📁")
-        self._add_menu_item("menu.docs", self._menu_action_open_docs, row=10, icon="📚")
-        self._add_menu_item("menu.about", self._menu_action_about, row=11, icon="ℹ️")
+        def configure(*args, **kwargs):
+            result = original(*args, **kwargs)
+            state = kwargs.get("state")
+            if state is not None:
+                try:
+                    target.configure(state=state)
+                except Exception:
+                    log.warning("Could not mirror toolbar button state", exc_info=True)
+            return result
 
-        # Row 12: Spacer row configured with weight=1 to absorb extra height
-        self.menu_frame.grid_rowconfigure(12, weight=1)
+        source.configure = configure
 
-        # Row 13: Footer / Close hint
-        hint = ctk.CTkLabel(
-            self.menu_frame,
-            text=self._t("menu.close_hint"),
-            font=ctk.CTkFont(size=10),
-            text_color="gray",
-            wraplength=self.MENU_WIDTH - 40,
-            justify="center",
-            anchor="center"
-        )
-        hint.grid(row=13, column=0, padx=18, pady=(10, 16), sticky="ew")
-        self._i18n_widgets.append((hint, "menu.close_hint"))
+        # Adopt the current state; the mirror only propagates later changes.
+        try:
+            target.configure(state=source.cget("state"))
+        except Exception:
+            log.warning("Could not sync initial toolbar button state", exc_info=True)
 
-    def _add_menu_item(self, key: str, command, row: int, icon: str = ""):
-        """Add a drawer row with smooth card hover styling and optional icon."""
-        def fmt(text: str) -> str:
-            return f"{icon}  {text}" if icon else text
-
-        btn = ctk.CTkButton(
-            self.menu_frame,
-            text=fmt(self._t(key)),
-            anchor="w",
-            height=38,
-            corner_radius=8,
-            fg_color="transparent",
-            text_color=TRANSPARENT_TEXT,
-            hover_color=TRANSPARENT_HOVER,
-            font=ctk.CTkFont(size=13),
-            command=command
-        )
-        btn.grid(row=row, column=0, padx=14, pady=2, sticky="ew")
-        self._i18n_widgets.append((btn, key, fmt))
+    def _wire_toolbar_state(self):
+        """Called once the control-section buttons exist."""
+        self._mirror_button_state("start_btn", "toolbar.start")
+        self._mirror_button_state("cancel_btn", "toolbar.cancel")
+        self._mirror_button_state("save_session_btn", "toolbar.save")
 
     def _refresh_locale_toggle(self):
         """Highlight the active language button and re-label all of them."""
@@ -969,41 +758,91 @@ class STTMeetApp(ctk.CTk):
             active = (mode == self.ui_locale)
             btn.configure(
                 text=mode_label(mode, self.ui_locale),
-                fg_color=("#1976D2", "#1565C0") if active else "transparent",
+                fg_color=("#0078D4", "#005A9E") if active else "transparent",
                 text_color=ON_ACCENT_TEXT if active else TRANSPARENT_TEXT,
-                hover_color=("#1565C0", "#0D47A1") if active else TRANSPARENT_HOVER,
-                font=ctk.CTkFont(size=11, weight="bold" if active else "normal"),
+                hover_color=("#005A9E", "#004578") if active else TRANSPARENT_HOVER,
+                font=ctk.CTkFont(size=10, weight="bold" if active else "normal"),
             )
+
+    def _build_menu_bar(self):
+        self.menubar = tk.Menu(self, tearoff=0)
+
+        file_menu = tk.Menu(self.menubar, tearoff=0)
+        file_menu.add_command(label=self._t("menubar.open_audio"), command=self._browse_audio_file)
+        file_menu.add_command(label=self._t("menubar.save_session"), command=self._save_session_manually)
+        file_menu.add_command(label=self._t("menubar.reset"), command=self._reset_workspace)
+        file_menu.add_separator()
+        file_menu.add_command(label=self._t("menubar.exit"), command=self._on_app_close)
+        self.menubar.add_cascade(label=self._t("menubar.file"), menu=file_menu)
+
+        edit_menu = tk.Menu(self.menubar, tearoff=0)
+        edit_menu.add_command(label=self._t("menubar.map_speakers"), command=self._open_speaker_mapping_dialog)
+        self.menubar.add_cascade(label=self._t("menubar.edit"), menu=edit_menu)
+
+        tools_menu = tk.Menu(self.menubar, tearoff=0)
+        tools_menu.add_command(label=self._t("menubar.settings"), command=self._open_settings_dialog)
+        tools_menu.add_command(label=self._t("menubar.open_log"), command=self._menu_action_open_log_folder)
+        tools_menu.add_command(label=self._t("menubar.docs"), command=self._open_docs_window)
+        self.menubar.add_cascade(label=self._t("menubar.tools"), menu=tools_menu)
+
+        help_menu = tk.Menu(self.menubar, tearoff=0)
+        help_menu.add_command(label=self._t("menubar.about"), command=self._open_about_dialog)
+        self.menubar.add_cascade(label=self._t("menubar.help"), menu=help_menu)
+
+        self.config(menu=self.menubar)
+
+    def _retranslate_menu_bar(self):
+        """Native tk.Menu labels are not widgets, so rebuild the bar on a switch."""
+        self._build_menu_bar()
+
+    def _build_status_bar(self):
+        status_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=STATUS_BAR_BG, border_width=1, border_color=STATUS_BAR_BORDER)
+        status_frame.grid(row=5, column=0, sticky="ew")
+        status_frame.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            status_frame,
+            text=self._t("status.ready"),
+            font=ctk.CTkFont(size=10),
+            anchor="w",
+            text_color=MUTED_TEXT
+        )
+        self.status_label.grid(row=0, column=0, padx=8, sticky="w")
+
+        self.ffmpeg_badge = ctk.CTkLabel(
+            status_frame,
+            text=self._t("ffmpeg.checking"),
+            font=ctk.CTkFont(size=10),
+            text_color=MUTED_TEXT
+        )
+        self.ffmpeg_badge.grid(row=0, column=1, padx=8, sticky="e")
+
+        self.api_key_badge = ctk.CTkLabel(
+            status_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color=MUTED_TEXT
+        )
+        self.api_key_badge.grid(row=0, column=2, padx=8, sticky="e")
 
     def _refresh_menu_key_badge(self):
-        if self.menu_key_badge is None or not self.menu_key_badge.winfo_exists():
+        if self.api_key_badge is None or not self.api_key_badge.winfo_exists():
             return
         if self.api_key_var.get().strip():
-            self.menu_key_badge.configure(
-                text=self._t("menu.key_configured"),
-                text_color=("#15803D", "#4ADE80"),
-                fg_color="transparent"
+            self.api_key_badge.configure(
+                text=self._t("statusbar.api_key_configured"),
+                text_color=("#15803D", "#4ADE80")
             )
         else:
-            self.menu_key_badge.configure(
-                text=self._t("menu.key_missing"),
-                text_color=("#DC2626", "#F87171"),
-                fg_color="transparent"
+            self.api_key_badge.configure(
+                text=self._t("statusbar.api_key_missing"),
+                text_color=("#DC2626", "#F87171")
             )
 
     # -------------------------------------------------------------
-    # Menu Actions
+    # Actions reachable from the menu bar and toolbar
     # -------------------------------------------------------------
-    def _menu_action_settings(self):
-        self._close_menu(animate=False)
-        self._open_settings_dialog()
-
-    def _menu_action_save_session(self):
-        self._close_menu(animate=False)
-        self._save_session_manually()
-
     def _menu_action_open_log_folder(self):
-        self._close_menu(animate=False)
         folder = LOG_FILE.parent
         try:
             os.startfile(str(folder))
@@ -1011,10 +850,6 @@ class STTMeetApp(ctk.CTk):
         except Exception as e:
             log.warning("Could not open log folder: %s", e)
             messagebox.showinfo(self._t("msg.log_folder"), self._t("msg.log_folder_body", folder=folder))
-
-    def _menu_action_open_docs(self):
-        self._close_menu(animate=False)
-        self._open_docs_window()
 
     def _open_docs_window(self):
         """Open (or focus) the in-app documentation reader."""
@@ -1040,10 +875,6 @@ class STTMeetApp(ctk.CTk):
         window = getattr(self, "_docs_window", None)
         if window is not None and window.winfo_exists():
             window.refresh_locale(self.ui_locale)
-
-    def _menu_action_about(self):
-        self._close_menu(animate=False)
-        self._open_about_dialog()
 
     def _open_api_key_page(self):
         """Open Google AI Studio so the user can create a Gemini API key."""
@@ -1357,7 +1188,7 @@ class STTMeetApp(ctk.CTk):
         )
 
     def _build_file_section(self):
-        file_frame = ctk.CTkFrame(self, corner_radius=10)
+        file_frame = ctk.CTkFrame(self, corner_radius=0)
         file_frame.grid(row=1, column=0, padx=16, pady=6, sticky="ew")
         file_frame.grid_columnconfigure(1, weight=1)
 
@@ -1389,7 +1220,7 @@ class STTMeetApp(ctk.CTk):
         self.audio_stats_label.grid(row=1, column=0, columnspan=2, padx=16, pady=(0, 10), sticky="w")
 
     def _build_controls_section(self):
-        ctrl_frame = ctk.CTkFrame(self, corner_radius=10)
+        ctrl_frame = ctk.CTkFrame(self, corner_radius=0)
         ctrl_frame.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         ctrl_frame.grid_columnconfigure(2, weight=1)
 
@@ -1430,7 +1261,7 @@ class STTMeetApp(ctk.CTk):
             textvariable=self._output_lang_var,
             width=170,
             height=30,
-            corner_radius=6,
+            corner_radius=0,
             fg_color=("#E8EAF6", "#2A2A3D"),
             hover_color=("#C5CAE9", "#3A3A52"),
             font=ctk.CTkFont(size=11),
@@ -1512,7 +1343,7 @@ class STTMeetApp(ctk.CTk):
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color="gray",
                 fg_color=("#E0E0E0", "#2B2B2B"),
-                corner_radius=6,
+                corner_radius=0,
                 padx=10,
                 pady=3
             )
@@ -1537,8 +1368,11 @@ class STTMeetApp(ctk.CTk):
         )
         self.status_label.grid(row=3, column=0, columnspan=14, padx=16, pady=(0, 10), sticky="w")
 
+        # The toolbar was built before these buttons existed; link their states.
+        self._wire_toolbar_state()
+
     def _build_tabs_section(self):
-        self.tabview = ctk.CTkTabview(self, corner_radius=10)
+        self.tabview = ctk.CTkTabview(self, corner_radius=0)
         self.tabview.grid(row=3, column=0, padx=16, pady=6, sticky="nsew")
 
         # Tabs are added under locale-independent names so switching language
@@ -1556,7 +1390,7 @@ class STTMeetApp(ctk.CTk):
         self.tab_minutes.grid_columnconfigure(0, weight=1)
         self.tab_minutes.grid_rowconfigure(2, weight=1)
 
-        self.minutes_banner_frame = ctk.CTkFrame(self.tab_minutes, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
+        self.minutes_banner_frame = ctk.CTkFrame(self.tab_minutes, fg_color=("#FFEBEE", "#421C1C"), corner_radius=0)
         self.minutes_banner_label = ctk.CTkLabel(
             self.minutes_banner_frame,
             text=self._t("minutes.banner_idle"),
@@ -1619,7 +1453,7 @@ class STTMeetApp(ctk.CTk):
         self.tab_recap.grid_columnconfigure(0, weight=1)
         self.tab_recap.grid_rowconfigure(2, weight=1)
 
-        self.recap_banner_frame = ctk.CTkFrame(self.tab_recap, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
+        self.recap_banner_frame = ctk.CTkFrame(self.tab_recap, fg_color=("#FFEBEE", "#421C1C"), corner_radius=0)
         self.recap_banner_label = ctk.CTkLabel(
             self.recap_banner_frame,
             text="",
@@ -1662,7 +1496,7 @@ class STTMeetApp(ctk.CTk):
         self.tab_actions.grid_columnconfigure(0, weight=1)
         self.tab_actions.grid_rowconfigure(2, weight=1)
 
-        self.actions_banner_frame = ctk.CTkFrame(self.tab_actions, fg_color=("#FFEBEE", "#421C1C"), corner_radius=6)
+        self.actions_banner_frame = ctk.CTkFrame(self.tab_actions, fg_color=("#FFEBEE", "#421C1C"), corner_radius=0)
         self.actions_banner_label = ctk.CTkLabel(
             self.actions_banner_frame,
             text="",
@@ -1709,7 +1543,7 @@ class STTMeetApp(ctk.CTk):
         return tb
 
     def _build_bottom_bar(self):
-        bottom_frame = ctk.CTkFrame(self, corner_radius=10)
+        bottom_frame = ctk.CTkFrame(self, corner_radius=0)
         bottom_frame.grid(row=4, column=0, padx=16, pady=(6, 12), sticky="ew")
         bottom_frame.grid_columnconfigure(1, weight=1)
 
@@ -1758,14 +1592,26 @@ class STTMeetApp(ctk.CTk):
     # Helpers & Validation
     # -------------------------------------------------------------
     def _check_initial_environment(self):
-        is_ok, msg = check_ffmpeg()
-        if is_ok:
-            self.ffmpeg_badge.configure(text=self._t("ffmpeg.installed"), text_color="#2E7D32")
-        else:
-            self.ffmpeg_badge.configure(text=self._t("ffmpeg.missing"), text_color="#C62828")
+        is_ok, _msg = check_ffmpeg()
+        self._ffmpeg_ok: Optional[bool] = is_ok
+        self._refresh_ffmpeg_badge()
+        if not is_ok:
             messagebox.showwarning(
                 self._t("msg.ffmpeg_warning"),
                 self._t("msg.ffmpeg_missing_body")
+            )
+
+    def _refresh_ffmpeg_badge(self):
+        """Render the FFmpeg status indicator for the active language."""
+        if getattr(self, "_ffmpeg_ok", None) is None:
+            return
+        if self._ffmpeg_ok:
+            self.ffmpeg_badge.configure(
+                text=self._t("ffmpeg.installed"), text_color="#2E7D32"
+            )
+        else:
+            self.ffmpeg_badge.configure(
+                text=self._t("ffmpeg.missing"), text_color="#C62828"
             )
 
     def _save_api_key(self, notify: bool = True) -> bool:
@@ -3263,3 +3109,4 @@ class STTMeetApp(ctk.CTk):
 def run_app():
     app = STTMeetApp()
     app.mainloop()
+
