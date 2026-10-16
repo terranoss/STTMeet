@@ -707,6 +707,11 @@ class STTMeetApp(ctk.CTk):
             self._locale_buttons[mode] = btn
         self._refresh_locale_toggle()
 
+        # Initially disable toolbar.save until an audio file is loaded or session restored
+        tb_save = self.tb_buttons.get("toolbar.save")
+        if tb_save is not None:
+            tb_save.configure(state="disabled")
+
     def _show_toolbar_hint(self, key: str):
         """Show a toolbar button's localized name in the status bar on hover."""
         if self._status_hint_previous is None:
@@ -753,7 +758,6 @@ class STTMeetApp(ctk.CTk):
         """Called once the control-section buttons exist."""
         self._mirror_button_state("start_btn", "toolbar.start")
         self._mirror_button_state("cancel_btn", "toolbar.cancel")
-        self._mirror_button_state("save_session_btn", "toolbar.save")
 
     def _refresh_locale_toggle(self):
         """Highlight the active language button and re-label all of them."""
@@ -986,17 +990,9 @@ class STTMeetApp(ctk.CTk):
             anchor="w"
         ).grid(row=2, column=0, columnspan=2, pady=(1, 0), sticky="w")
 
-        ctk.CTkLabel(
-            body,
-            text=self._t("settings.saved_to", path=str(ENV_PATH)),
-            font=ctk.CTkFont(size=10),
-            text_color="gray",
-            anchor="w"
-        ).grid(row=3, column=0, pady=(6, 0), sticky="w")
-
         # Divider between API Key and Audio Preprocessing
         ctk.CTkFrame(body, height=1, fg_color=("gray85", "gray25")).grid(
-            row=4, column=0, pady=(16, 12), sticky="ew"
+            row=3, column=0, pady=(16, 12), sticky="ew"
         )
 
         # Audio Preprocessing Section
@@ -1245,7 +1241,7 @@ class STTMeetApp(ctk.CTk):
         # Pre-process state: persisted across restarts via prefs.json, edited in Settings modal
         self.preprocess_var = ctk.BooleanVar(value=bool(get_pref("preprocess", True)))
 
-        # Action Buttons
+        # Action Buttons (Workflow Triggers)
         self.start_btn = ctk.CTkButton(
             ctrl_frame,
             text=self._t("btn.transcribe"),
@@ -1255,25 +1251,8 @@ class STTMeetApp(ctk.CTk):
             command=self._start_processing_pipeline,
             width=150
         )
-        self.start_btn.grid(row=0, column=6, padx=4, pady=10, sticky="e")
+        self.start_btn.grid(row=0, column=3, padx=4, pady=10, sticky="e")
         self._i18n_label(self.start_btn, "btn.transcribe")
-
-        # Read-only output-language chip. lang_var is derived from the UI locale,
-        # so this shows the result rather than offering a second control.
-        self._output_lang_var = ctk.StringVar()
-        self.output_lang_chip = ctk.CTkButton(
-            ctrl_frame,
-            textvariable=self._output_lang_var,
-            width=170,
-            height=30,
-            corner_radius=0,
-            fg_color=("#E8EAF6", "#2A2A3D"),
-            hover_color=("#C5CAE9", "#3A3A52"),
-            font=ctk.CTkFont(size=11),
-            text_color=("#3949AB", "#9FA8DA"),
-            command=self._open_menu_for_language,
-        )
-        self.output_lang_chip.grid(row=0, column=7, padx=4, pady=10, sticky="e")
 
         self.cancel_btn = ctk.CTkButton(
             ctrl_frame,
@@ -1282,9 +1261,9 @@ class STTMeetApp(ctk.CTk):
             hover_color="#B71C1C",
             command=self._cancel_processing,
             state="disabled",
-            width=75
+            width=85
         )
-        self.cancel_btn.grid(row=0, column=8, padx=4, pady=10, sticky="e")
+        self.cancel_btn.grid(row=0, column=4, padx=4, pady=10, sticky="e")
         self._i18n_label(self.cancel_btn, "btn.cancel")
 
         self.monitor_btn = ctk.CTkButton(
@@ -1297,7 +1276,7 @@ class STTMeetApp(ctk.CTk):
             state="disabled",
             width=130
         )
-        self.monitor_btn.grid(row=0, column=9, padx=4, pady=10, sticky="e")
+        self.monitor_btn.grid(row=0, column=5, padx=4, pady=10, sticky="e")
         self._i18n_label(self.monitor_btn, "btn.monitor")
 
         self.reset_btn = ctk.CTkButton(
@@ -1309,21 +1288,8 @@ class STTMeetApp(ctk.CTk):
             command=self._reset_workspace,
             width=85
         )
-        self.reset_btn.grid(row=0, column=10, padx=4, pady=10, sticky="e")
+        self.reset_btn.grid(row=0, column=6, padx=(4, 16), pady=10, sticky="e")
         self._i18n_label(self.reset_btn, "btn.reset")
-
-        self.save_session_btn = ctk.CTkButton(
-            ctrl_frame,
-            text=self._t("btn.save_session"),
-            fg_color=("#00897B", "#00695C"),
-            hover_color=("#00796B", "#004D40"),
-            font=ctk.CTkFont(weight="bold"),
-            command=self._save_session_manually,
-            state="disabled",
-            width=130
-        )
-        self.save_session_btn.grid(row=0, column=11, padx=(4, 16), pady=10, sticky="e")
-        self._i18n_label(self.save_session_btn, "btn.save_session")
 
         # Visual Stepper Bar
         self.stepper_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
@@ -2622,10 +2588,11 @@ class STTMeetApp(ctk.CTk):
         return False
 
     def _set_save_session_enabled(self, enabled: bool):
-        """Toggle the Save Session button; safe to call from the worker thread."""
+        """Toggle the Save Session toolbar button; safe to call from the worker thread."""
         def apply():
-            if hasattr(self, "save_session_btn"):
-                self.save_session_btn.configure(state="normal" if enabled else "disabled")
+            tb_save = getattr(self, "tb_buttons", {}).get("toolbar.save")
+            if tb_save is not None and tb_save.winfo_exists():
+                tb_save.configure(state="normal" if enabled else "disabled")
         try:
             self.after(0, apply)
         except Exception:
@@ -2819,7 +2786,7 @@ class STTMeetApp(ctk.CTk):
         self.gen_actions_btn.configure(state="disabled")
         self.monitor_btn.configure(state="disabled")
         self.active_file_hash = ""
-        self._set_save_session_enabled(True)
+        self._set_save_session_enabled(False)
 
         # Close floating monitor dialog if open
         if self.monitor_dialog and self.monitor_dialog.winfo_exists():
