@@ -1,0 +1,45 @@
+# Normalize line endings: check out LF everywhere, commit LF everywhere.
+* text=auto eol=lf
+
+# Source files
+*.py       text diff=python
+*.md       text
+*.txt      text
+*.yml      text
+*.yaml     text
+*.json     text
+*.toml     text
+*.cfg      text
+*.ini      text
+
+# Keep these as-is (Windows-generated)
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=crlf
+
+# Binary — never diff or normalize
+*.mp3      binary
+*.m4a      binary
+*.wav      binary
+*.flac     binary
+*.aac      binary
+*.ogg      binary
+*.opus     binary
+*.wma      binary
+*.mp4      binary
+*.mkv      binary
+*.mov      binary
+*.ico      binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.pdf      binary
+*.docx     binary
+*.zip      binary
+*.whl      binary
+*.exe      binary
+*.dll      binary
+
+# Lockfiles must not be rewritten
+*.lock     -text
