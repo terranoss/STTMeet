@@ -134,6 +134,38 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "toolbar.save": {"en": "Save", "ms": "Simpan"},
     "toolbar.docs": {"en": "Docs", "ms": "Dokumen"},
     "toolbar.about": {"en": "About", "ms": "Tentang"},
+    "toolbar.tip_open": {
+        "en": "Open Audio File — Select meeting audio (.mp3, .m4a, .wav, .aac, .flac)",
+        "ms": "Buka Fail Audio — Pilih fail audio mesyuarat (.mp3, .m4a, .wav, .aac, .flac)",
+    },
+    "toolbar.tip_start": {
+        "en": "Start Transcription — Begin transcribing audio and generating minutes",
+        "ms": "Mula Transkrip — Mulakan transkrip audio dan menjana minit mesyuarat",
+    },
+    "toolbar.tip_cancel": {
+        "en": "Cancel — Stop ongoing transcription or processing",
+        "ms": "Batal — Hentikan proses transkrip atau pemprosesan semasa",
+    },
+    "toolbar.tip_save": {
+        "en": "Save Session — Save workspace, transcript, and minutes to file",
+        "ms": "Simpan Sesi — Simpan ruang kerja, transkrip, dan minit ke fail",
+    },
+    "toolbar.tip_docs": {
+        "en": "Documentation — View user guides and minute format templates",
+        "ms": "Dokumentasi — Lihat panduan pengguna dan templat format minit",
+    },
+    "toolbar.tip_about": {
+        "en": "About STTMeet — View version, models, and system status",
+        "ms": "Tentang STTMeet — Lihat versi, model, dan status sistem",
+    },
+    "toolbar.tip_locale_en": {
+        "en": "Switch language to EN",
+        "ms": "Tukar bahasa kepada EN",
+    },
+    "toolbar.tip_locale_ms": {
+        "en": "Switch language to MS",
+        "ms": "Tukar bahasa kepada MS",
+    },
 
     # --- Status bar ----------------------------------------------------
     "statusbar.api_key_configured": {

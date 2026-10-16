@@ -628,6 +628,23 @@ def test_weak_model_diarization_policy():
     assert has_key("msg.speaker_mapping_weak_model")
     assert has_key("settings.chunk_note")
 
+def test_tooltip_text_provider():
+    from src.ui.tooltip import Tooltip
+
+    class DummyWidget:
+        def bind(self, *args, **kwargs): pass
+        def winfo_exists(self): return True
+
+    dummy = DummyWidget()
+    t1 = Tooltip(dummy, "Static info")
+    assert t1._get_text() == "Static info"
+
+    current_val = "Hello"
+    t2 = Tooltip(dummy, lambda: current_val)
+    assert t2._get_text() == "Hello"
+    current_val = "Updated"
+    assert t2._get_text() == "Updated"
+
 if __name__ == "__main__":
     test_time_conversions()
     test_adjust_chunk_timestamps()
@@ -680,5 +697,6 @@ if __name__ == "__main__":
     test_recap_prompts()
     test_action_items_prompts()
     test_weak_model_diarization_policy()
+    test_tooltip_text_provider()
     print("All unit tests passed successfully!")
 

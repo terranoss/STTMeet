@@ -84,6 +84,7 @@ from ..minutes_generator import (
 from ..recap_generator import generate_meeting_recap
 from .markdown_view import MarkdownViewer
 from .docs_viewer import DocsWindow
+from .tooltip import Tooltip
 from ..exporter import (
     DocxUnavailableError,
     export_to_docx,
@@ -678,6 +679,8 @@ class STTMeetApp(ctk.CTk):
             btn.grid(row=0, column=idx, padx=1, pady=2, sticky="w")
             btn.bind("<Enter>", lambda _e, k=key: self._show_toolbar_hint(k))
             btn.bind("<Leave>", lambda _e: self._clear_toolbar_hint())
+            tip_key = key.replace("toolbar.", "toolbar.tip_")
+            Tooltip(btn, lambda tk=tip_key: self._t(tk))
             self.tb_buttons[key] = btn
 
         # Toolbar twins of the main control buttons must grey out with them.
@@ -699,6 +702,8 @@ class STTMeetApp(ctk.CTk):
                 command=lambda m=mode: self._set_ui_locale(m)
             )
             btn.grid(row=0, column=i, padx=1, pady=1)
+            tip_mode_key = f"toolbar.tip_locale_{mode}"
+            Tooltip(btn, lambda tmk=tip_mode_key: self._t(tmk))
             self._locale_buttons[mode] = btn
         self._refresh_locale_toggle()
 
