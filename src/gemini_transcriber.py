@@ -3,6 +3,12 @@ STTMeet Gemini Transcriber
 Uploads chunked audio to Google Files API via google-genai SDK, polls until ACTIVE,
 prompts Gemini with Malay-English Code-Switching guidelines,
 and ensures cloud file deletion cleanup.
+
+Retry, backoff, Quota failure detection and failover are owned by the shared
+policy in gemini_failover. What stays here is transcription's own concern: the
+Diarization policy per model, the transcription prompt, and the uploaded
+audio's lifecycle -- which brackets one model's whole retry sweep, is reused
+across that model's retries, and is deleted whatever the sweep ended in.
 """
 from typing import Optional, Callable, List
 from google import genai
@@ -10,9 +16,24 @@ from google.genai import types
 
 from .cancellation import CANCEL_POLL_SLICE_SECONDS, CancelledError, cancellable_sleep, raise_if_cancelled
 from .config import MODEL_NAME, FALLBACK_MODELS, MAX_OUTPUT_TOKENS, TEMPERATURE
+from .gemini_failover import EmptyResponseError, FailoverCall, generate_with_failover
 from .logger import get_logger
 
 log = get_logger(__name__)
+
+# Divergence from the text-generation call sites is deliberate and
+# user-visible, so it is spelled out here rather than inherited silently.
+# Transcription backs off by attempt * 4 seconds on a transient fault, and by
+# attempt * 3 seconds on an empty transcription, which is a third thing
+# entirely: the provider answered, with nothing.
+TRANSCRIPTION_BACKOFF_STEP_SECONDS = 4
+TRANSCRIPTION_EMPTY_RETRY_STEP_SECONDS = 3
+TRANSCRIPTION_QUOTA_FAILURE_MESSAGE = (
+    "All available Gemini models ({models}) exceeded daily free quotas or failed.\n"
+    "Please try again later once your Gemini quota resets, or use a different API key."
+)
+TRANSCRIPTION_ATTEMPT_PROGRESS = "Calling Gemini {model} (Attempt {attempt}/{max_retries})..."
+TRANSCRIPTION_RETRY_PROGRESS = "Server notice. Retrying in {seconds}s..."
 
 MALAY_ROJAK_TRANSCRIPTION_PROMPT = """You are an elite speech-to-text transcriber specializing in Malaysian business, government, and technical meetings.
 The meeting is conducted primarily in Bahasa Melayu with frequent English code-switching ("Bahasa Rojak").
@@ -102,6 +123,84 @@ def upload_and_wait_file(
         progress_callback("Audio processing ready in cloud.")
     return uploaded_file
 
+def transcription_prompt_for_model(
+    model_candidate: str,
+    previous_tail_transcript: Optional[str] = None,
+    diarize: bool = True
+) -> str:
+    """
+    The prompt this chunk is sent to one particular model of the Failover chain.
+
+    Diarization is asked for only of models strong enough to do it, so a weak
+    model in the chain is sent a clean-transcription prompt with no speaker
+    continuity to keep up.
+    """
+    # Disable diarization for weak models (e.g. Gemini 3.5 Flash Lite)
+    effective_diarize = diarize and ("lite" not in model_candidate.lower())
+
+    if effective_diarize:
+        speaker_rule = "Speaker Diarization: Label speakers consistently based on acoustic voice characteristics as 'Speaker 1', 'Speaker 2', etc."
+        output_format = "[MM:SS] Speaker X: <Spoken content>\n[MM:SS] Speaker Y: <Spoken content>\n..."
+    else:
+        speaker_rule = "Clean Transcription: Do NOT guess or label speaker numbers. Transcribe speech naturally with time markers only."
+        output_format = "[MM:SS] <Spoken content>\n[MM:SS] <Spoken content>\n..."
+
+    # Build speaker continuity guidance if previous chunk context is available
+    if effective_diarize and previous_tail_transcript and previous_tail_transcript.strip():
+        continuity_note = f"""
+SPEAKER CONTINUITY GUIDANCE:
+The immediately preceding segment ended with the following conversation:
+---
+{previous_tail_transcript.strip()}
+---
+Maintain the same Speaker numbers (Speaker 1, Speaker 2, etc.) for the corresponding voices.
+"""
+    else:
+        continuity_note = ""
+
+    return MALAY_ROJAK_TRANSCRIPTION_PROMPT.format(
+        speaker_rule=speaker_rule,
+        output_format=output_format,
+        speaker_continuity_context=continuity_note
+    )
+
+
+def extract_transcription(
+    response,
+    model_candidate: str,
+    attempt: int,
+    max_retries: int
+) -> str:
+    """
+    Read this chunk's transcript out of a provider response.
+
+    Robust extraction: check response.text first, then candidate content parts.
+    A response with nothing usable in it is not a chunk, so it is signalled as
+    an empty response and the shared policy retries it on its own backoff.
+    """
+    text_output = ""
+    if response.text and response.text.strip():
+        text_output = response.text.strip()
+    elif response.candidates:
+        extracted_parts = []
+        for cand in response.candidates:
+            if cand.content and cand.content.parts:
+                for part in cand.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        extracted_parts.append(part.text)
+        text_output = "\n".join(extracted_parts).strip()
+
+    if not text_output:
+        log.warning(
+            "Model '%s' returned empty text on attempt %d/%d (finish_reason: %s).",
+            model_candidate, attempt, max_retries,
+            getattr(response.candidates[0], "finish_reason", "UNKNOWN") if response.candidates else "NO_CANDIDATES"
+        )
+        raise EmptyResponseError("The provider returned an empty transcription.")
+
+    return text_output
+
+
 def transcribe_audio_chunk(
     client: genai.Client,
     chunk_file_path: str,
@@ -110,155 +209,70 @@ def transcribe_audio_chunk(
     max_retries: int = 3,
     model_override: Optional[str] = None,
     cancel_event=None,
-    diarize: bool = True
+    diarize: bool = True,
+    backoff_step: float = TRANSCRIPTION_BACKOFF_STEP_SECONDS,
+    empty_retry_step: float = TRANSCRIPTION_EMPTY_RETRY_STEP_SECONDS
 ) -> str:
     """
     Transcribes a single audio chunk using the configured Gemini model.
-    Includes exponential backoff retry and automatically deletes the uploaded file when complete.
-    Detects model deprecation/unavailability errors and raises a clear message.
+
+    Retry, backoff, Quota failure detection and failover are owned by the
+    shared policy in gemini_failover; the Diarization policy, the prompt, and
+    the uploaded audio's lifecycle stay here. The uploaded audio brackets one
+    model's whole retry sweep, so a retry reuses it rather than uploading
+    again, and it is deleted whatever the sweep ended in -- an answer, a
+    failure, or a cancellation.
 
     Pass a threading.Event as cancel_event to make the run abandonable: the
     function raises CancelledError at the first safe checkpoint after the event
     is set, and never returns a partial transcription.
     """
-    uploaded_file = None
-
     # Build candidate models list: preferred model first, followed by remaining fallback models
     preferred = model_override or MODEL_NAME
     models_to_try = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
 
     log.info("Starting transcription of chunk: %s (models available: %s)", chunk_file_path, models_to_try)
 
-    for model_candidate in models_to_try:
-        raise_if_cancelled(cancel_event)
+    def upload_this_chunk(model_candidate: str) -> types.File:
+        """
+        Put this chunk where the provider can hear it.
+
+        This runs before the policy takes ownership of the result, so it is
+        also where an upload that never becomes usable -- cancelled mid-poll, or
+        refused by the Files API -- has to release itself.
+        """
         log.info("Attempting transcription with model: %s", model_candidate)
-
-        # Disable diarization for weak models (e.g. Gemini 3.5 Flash Lite)
-        effective_diarize = diarize and ("lite" not in model_candidate.lower())
-
-        if effective_diarize:
-            speaker_rule = "Speaker Diarization: Label speakers consistently based on acoustic voice characteristics as 'Speaker 1', 'Speaker 2', etc."
-            output_format = "[MM:SS] Speaker X: <Spoken content>\n[MM:SS] Speaker Y: <Spoken content>\n..."
-        else:
-            speaker_rule = "Clean Transcription: Do NOT guess or label speaker numbers. Transcribe speech naturally with time markers only."
-            output_format = "[MM:SS] <Spoken content>\n[MM:SS] <Spoken content>\n..."
-
-        # Build speaker continuity guidance if previous chunk context is available
-        if effective_diarize and previous_tail_transcript and previous_tail_transcript.strip():
-            continuity_note = f"""
-SPEAKER CONTINUITY GUIDANCE:
-The immediately preceding segment ended with the following conversation:
----
-{previous_tail_transcript.strip()}
----
-Maintain the same Speaker numbers (Speaker 1, Speaker 2, etc.) for the corresponding voices.
-"""
-        else:
-            continuity_note = ""
-
-        formatted_prompt = MALAY_ROJAK_TRANSCRIPTION_PROMPT.format(
-            speaker_rule=speaker_rule,
-            output_format=output_format,
-            speaker_continuity_context=continuity_note
+        return upload_and_wait_file(
+            client, chunk_file_path, progress_callback, cancel_event=cancel_event
         )
-        uploaded_file = None
 
-        try:
-            uploaded_file = upload_and_wait_file(
-                client, chunk_file_path, progress_callback, cancel_event=cancel_event
-            )
+    def delete_this_chunk(uploaded_file) -> None:
+        """Automatic Cloud Storage Cleanup, whatever the sweep ended in."""
+        _delete_cloud_file(client, uploaded_file)
 
-            for attempt in range(1, max_retries + 1):
-                try:
-                    raise_if_cancelled(cancel_event)
-                    if progress_callback:
-                        progress_callback(f"Calling Gemini {model_candidate} (Attempt {attempt}/{max_retries})...")
-
-                    response = client.models.generate_content(
-                        model=model_candidate,
-                        contents=[
-                            uploaded_file,
-                            formatted_prompt
-                        ],
-                        config=types.GenerateContentConfig(
-                            max_output_tokens=MAX_OUTPUT_TOKENS,
-                            temperature=TEMPERATURE
-                        )
-                    )
-
-                    # The call above cannot be interrupted; honour a cancel that
-                    # was raised while it was in flight rather than banking the
-                    # partial work.
-                    raise_if_cancelled(cancel_event)
-
-                    # Robust text extraction: check response.text first, then candidate content parts
-                    text_output = ""
-                    if response.text and response.text.strip():
-                        text_output = response.text.strip()
-                    elif response.candidates:
-                        extracted_parts = []
-                        for cand in response.candidates:
-                            if cand.content and cand.content.parts:
-                                for part in cand.content.parts:
-                                    if hasattr(part, "text") and part.text:
-                                        extracted_parts.append(part.text)
-                        text_output = "\n".join(extracted_parts).strip()
-
-                    if not text_output:
-                        log.warning(
-                            "Model '%s' returned empty text on attempt %d/%d (finish_reason: %s).",
-                            model_candidate, attempt, max_retries,
-                            getattr(response.candidates[0], "finish_reason", "UNKNOWN") if response.candidates else "NO_CANDIDATES"
-                        )
-                        if attempt < max_retries:
-                            wait_sec = attempt * 3
-                            if not cancellable_sleep(cancel_event, wait_sec):
-                                raise CancelledError("Retry backoff cancelled by user.")
-                            continue
-                        else:
-                            raise RuntimeError(f"Model {model_candidate} returned empty transcription.")
-
-                    log.info("Chunk transcribed successfully with '%s' (%d chars).", model_candidate, len(text_output))
-                    return text_output
-
-                except CancelledError:
-                    # Must precede the generic handler: CancelledError is a
-                    # RuntimeError and would otherwise be treated as a
-                    # transient API failure and retried.
-                    raise
-
-                except Exception as api_err:
-                    err_str = str(api_err)
-
-                    # Check for 429 quota exhaustion specifically
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota exceeded" in err_str.lower():
-                        log.warning(
-                            "Quota exhausted for model '%s'. Triggering automatic failover to next model.",
-                            model_candidate
-                        )
-                        if progress_callback:
-                            progress_callback(f"Quota reached for {model_candidate}. Auto-switching model...")
-                        # Break inner retry loop to try the next model candidate immediately!
-                        break
-
-                    # Temporary 503 or transient network errors -> retry with backoff
-                    if attempt < max_retries:
-                        wait_sec = attempt * 4
-                        log.warning("Attempt %d/%d on '%s' failed: %s. Retrying in %ds...", attempt, max_retries, model_candidate, err_str[:80], wait_sec)
-                        if progress_callback:
-                            progress_callback(f"Server notice. Retrying in {wait_sec}s...")
-                        if not cancellable_sleep(cancel_event, wait_sec):
-                            raise CancelledError("Retry backoff cancelled by user.")
-                    else:
-                        log.error("All %d attempts failed for model '%s': %s", max_retries, model_candidate, err_str[:80])
-                        # If this model exhausted all retries, fall over to next candidate
-                        break
-
-        finally:
-            # Automatic Cloud Storage Cleanup
-            _delete_cloud_file(client, uploaded_file)
-
-    raise RuntimeError(
-        f"All available Gemini models ({', '.join(models_to_try)}) exceeded daily free quotas or failed.\n"
-        "Please try again later once your Gemini quota resets, or use a different API key."
-    )
+    return generate_with_failover(client, FailoverCall(
+        description="chunk transcription",
+        label="transcription",
+        models=models_to_try,
+        contents_for_model=lambda model, uploaded_file: [
+            # The audio the policy just put there for this model, so every retry
+            # of this model sends the same upload rather than paying again.
+            uploaded_file,
+            transcription_prompt_for_model(model, previous_tail_transcript, diarize),
+        ],
+        max_retries=max_retries,
+        backoff_step=backoff_step,
+        temperature=TEMPERATURE,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        final_error=TRANSCRIPTION_QUOTA_FAILURE_MESSAGE.format(models=", ".join(models_to_try)),
+        progress_callback=progress_callback,
+        attempt_progress=TRANSCRIPTION_ATTEMPT_PROGRESS,
+        retry_progress=TRANSCRIPTION_RETRY_PROGRESS,
+        extract=lambda response, model, attempt: extract_transcription(
+            response, model, attempt, max_retries
+        ),
+        empty_backoff_step=empty_retry_step,
+        cancel_event=cancel_event,
+        prepare=upload_this_chunk,
+        cleanup=delete_this_chunk,
+    ))
