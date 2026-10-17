@@ -123,6 +123,7 @@ def upload_and_wait_file(
         progress_callback("Audio processing ready in cloud.")
     return uploaded_file
 
+
 def transcription_prompt_for_model(
     model_candidate: str,
     previous_tail_transcript: Optional[str] = None,
@@ -131,7 +132,7 @@ def transcription_prompt_for_model(
     """
     The prompt this chunk is sent to one particular model of the Failover chain.
 
-    Diarization is asked for only of models strong enough to do it, so a weak
+    Diarization is asked for only of models strong enough to give it, so a weak
     model in the chain is sent a clean-transcription prompt with no speaker
     continuity to keep up.
     """
