@@ -1,4 +1,5 @@
 # Unit tests for STTMeet logic modules
+import ast
 import json
 import tempfile
 from datetime import datetime
@@ -428,6 +429,42 @@ def test_translate_missing_key_raises():
     except KeyError:
         return
     raise AssertionError("expected KeyError for an unknown i18n key")
+
+def test_every_literal_translation_key_resolves():
+    # translate() raises on a missing key rather than falling back, which is
+    # only a guarantee if callers stay inside it. Walk every literal key passed
+    # to _t()/translate() across src/ and assert each one resolves in every
+    # locale. Parsed rather than grepped so the check survives either quote
+    # style and f-strings, and so failures name a line.
+    #
+    # Only literal arguments are checked. Twenty-odd call sites build their key
+    # at runtime (toolbar tips via str.replace, docs titles via f-string slug),
+    # and those are covered by the has_key assertions elsewhere in this file.
+    checked = 0
+    for path in sorted(Path("src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name not in ("t", "_t", "translate") or not node.args:
+                continue
+            first = node.args[0]
+            if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+                continue
+            checked += 1
+            for locale in ALL_MODES:
+                try:
+                    translate(first.value, locale)
+                except KeyError:
+                    raise AssertionError(
+                        f"{path}:{node.lineno} translates unresolvable key "
+                        f"{first.value!r} (locale {locale!r})"
+                    )
+    # Guard the test itself: if the walk ever stops finding call sites, it is
+    # no longer checking anything and would pass vacuously.
+    assert checked > 200, f"only {checked} literal translation calls found; walk is broken"
 
 def test_translate_falls_back_to_english_for_unknown_mode():
     assert translate("menubar.tools", "klingon") == translate("menubar.tools", "en")

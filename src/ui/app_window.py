@@ -1171,7 +1171,7 @@ class STTMeetApp(ctk.CTk):
 
     def _open_audio_setup_wizard_manual(self):
         if not self.selected_audio_file or not os.path.exists(self.selected_audio_file):
-            messagebox.showinfo(self._t("msg.info"), self._t("file.no_selection"), parent=self)
+            messagebox.showinfo(self._t("msg.notice"), self._t("file.no_selection"), parent=self)
             return
         self._open_audio_setup_wizard(self.selected_audio_file)
 
