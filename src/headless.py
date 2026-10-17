@@ -152,6 +152,7 @@ def run_headless(
     outcome = HeadlessOutcome(exit_code=EXIT_OK, result=result)
     if not result.transcript.strip():
         print("No transcript was produced; nothing written.", file=sys.stderr)
+        outcome.exit_code = EXIT_NO_TRANSCRIPT
         return outcome
 
     outcome.transcript_path = _write_document(
