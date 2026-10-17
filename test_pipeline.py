@@ -1187,6 +1187,7 @@ if __name__ == "__main__":
     test_docs_sidebar_widgets_use_explicit_theme_colors()
     test_translate_has_no_combined_mode()
     test_translate_missing_key_raises()
+    test_every_literal_translation_key_resolves()
     test_translate_falls_back_to_english_for_unknown_mode()
     test_translate_formats_placeholders()
     test_logic_coupled_literals_are_not_translated()
