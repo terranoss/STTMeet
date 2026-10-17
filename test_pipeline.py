@@ -2,11 +2,12 @@
 import ast
 import json
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.config import API_KEY_URL, DOCS_DIR, MINUTES_FALLBACK_MODELS
+from src.config import API_KEY_URL, DOCS_DIR, FALLBACK_MODELS, MINUTES_FALLBACK_MODELS
 
 from src.transcript_processor import (
     parse_time_to_seconds,
@@ -81,6 +82,48 @@ from src.gemini_failover import (
     generate_with_failover,
     is_quota_failure,
 )
+from src.gemini_transcriber import (
+    transcribe_audio_chunk,
+    upload_and_wait_file,
+)
+from src.cancellation import CancelledError
+
+
+class FakeFilesApi:
+    """
+    Stand-in for the provider's Files API, where transcription's audio is uploaded.
+
+    Records what was uploaded and deleted so a test can see whether provider
+    storage leaked, and can hand back a file that is still PROCESSING so the
+    upload's poll-and-wait path runs.
+    """
+
+    def __init__(self, processing_polls=0, on_upload=None):
+        self._processing_polls = processing_polls
+        self._on_upload = on_upload
+        self.uploads = []
+        self.deleted = []
+        self._next_name = 0
+
+    def upload(self, file):
+        self._next_name += 1
+        name = "files/fake-%d" % self._next_name
+        self.uploads.append({"file": file, "name": name})
+        if self._on_upload:
+            self._on_upload()
+        return self._file(name, self._processing_polls > 0)
+
+    def get(self, name):
+        self._processing_polls -= 1
+        return self._file(name, self._processing_polls > 0)
+
+    def delete(self, name):
+        self.deleted.append(name)
+
+    @staticmethod
+    def _file(name, processing):
+        state = "PROCESSING" if processing else "ACTIVE"
+        return SimpleNamespace(name=name, state=SimpleNamespace(name=state))
 
 
 class FakeGeminiProvider:
@@ -89,13 +132,16 @@ class FakeGeminiProvider:
 
     Costs no quota and makes no network call. Each model in the script gets a
     list of outcomes consumed one per call: a string comes back as the
-    response text, an exception is raised for the caller to deal with.
+    response text, an exception is raised for the caller to deal with, and a
+    response object is handed back as-is for a script that needs to shape the
+    response itself (an empty transcription, say).
     """
 
-    def __init__(self, script):
+    def __init__(self, script, files=None):
         self._script = {model: list(outcomes) for model, outcomes in script.items()}
         self.calls = []
         self.models = SimpleNamespace(generate_content=self._generate_content)
+        self.files = files if files is not None else FakeFilesApi()
 
     def _generate_content(self, model, contents, config):
         self.calls.append({"model": model, "contents": contents, "config": config})
@@ -105,7 +151,9 @@ class FakeGeminiProvider:
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        return SimpleNamespace(text=outcome)
+        if isinstance(outcome, str):
+            return SimpleNamespace(text=outcome, candidates=None)
+        return outcome
 
     def attempts_on(self, model):
         """How many times the Failover chain reached for this model."""
@@ -115,6 +163,34 @@ class FakeGeminiProvider:
 def quota_failure_error():
     """The provider's own wording for a Quota failure."""
     return RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded for this project")
+
+
+def empty_transcription_response(finish_reason="MAX_TOKENS"):
+    """A response the provider answered with nothing usable in it."""
+    return SimpleNamespace(
+        text="",
+        candidates=[SimpleNamespace(content=None, finish_reason=finish_reason)],
+    )
+
+
+def recording_waits(module):
+    """
+    Context manager that records the backoff a policy asks for instead of
+    spending it, since backoff is a boundary of that policy.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _recording():
+        waits = []
+        original = module.cancellable_sleep
+        module.cancellable_sleep = lambda cancel_event, seconds, *args: waits.append(seconds) or True
+        try:
+            yield waits
+        finally:
+            module.cancellable_sleep = original
+
+    return _recording()
 
 def test_time_conversions():
     assert parse_time_to_seconds("01:30") == 90
@@ -950,6 +1026,201 @@ def test_resource_is_released_even_when_a_models_sweep_fails():
     assert released == ["upload"]
 
 
+def transcription_failover_chain(lead_model):
+    """The Failover chain the transcription path walks when the Engine pins a model."""
+    return [lead_model] + [m for m in FALLBACK_MODELS if m != lead_model]
+
+
+def test_transcribed_chunk_is_uploaded_once_and_the_upload_is_deleted():
+    """One upload brackets that model's whole retry sweep, and is deleted after."""
+    provider = FakeGeminiProvider({"model-a": ["[00:01] Speaker 1: Setuju."]})
+
+    transcript = transcribe_audio_chunk(provider, "chunk_0.wav", model_override="model-a")
+
+    assert transcript == "[00:01] Speaker 1: Setuju."
+    assert provider.attempts_on("model-a") == 1
+    assert [upload["file"] for upload in provider.files.uploads] == ["chunk_0.wav"]
+    assert provider.files.deleted == ["files/fake-1"]
+
+
+def test_transcription_reuses_one_upload_across_a_models_retries():
+    """A retry reaches for the same upload rather than paying for it again."""
+    from src import gemini_failover
+
+    provider = FakeGeminiProvider({
+        "model-a": [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            "[00:01] Speaker 1: Setuju.",
+        ],
+    })
+    with recording_waits(gemini_failover) as waits:
+        transcript = transcribe_audio_chunk(
+            provider, "chunk_0.wav", max_retries=3, model_override="model-a"
+        )
+
+    assert transcript == "[00:01] Speaker 1: Setuju."
+    assert provider.attempts_on("model-a") == 3
+    # Three generations, but the chunk was uploaded to the provider only once.
+    assert len(provider.files.uploads) == 1
+    assert provider.files.deleted == ["files/fake-1"]
+    # Transcription backs off by attempt * 4 seconds, unlike the text paths'
+    # attempt * 5.
+    assert waits == [4, 8]
+
+
+def test_transcription_fails_over_to_a_later_model_after_a_transient_error():
+    """One flaky model does not lose the chunk, and each model pays for its own upload."""
+    from src import gemini_failover
+
+    next_model = FALLBACK_MODELS[0]
+    provider = FakeGeminiProvider({
+        "model-a": [RuntimeError("503 UNAVAILABLE")] * 2,
+        next_model: ["[00:02] Speaker 2: Baik."],
+    })
+    with recording_waits(gemini_failover):
+        transcript = transcribe_audio_chunk(
+            provider, "chunk_0.wav", max_retries=2, model_override="model-a"
+        )
+
+    assert transcript == "[00:02] Speaker 2: Baik."
+    assert provider.attempts_on("model-a") == 2
+    assert provider.attempts_on(next_model) == 1
+    # Each model uploads before its own retry sweep, so model-a's upload is
+    # gone before the next model's begins, and both are deleted.
+    assert [upload["name"] for upload in provider.files.uploads] == ["files/fake-1", "files/fake-2"]
+    assert provider.files.deleted == ["files/fake-1", "files/fake-2"]
+
+
+def test_transcription_deletes_the_uploaded_audio_when_the_run_is_cancelled():
+    from src import gemini_failover
+
+    cancel_event = threading.Event()
+    provider = FakeGeminiProvider({"model-a": [RuntimeError("503 UNAVAILABLE")]})
+    original_sleep = gemini_failover.cancellable_sleep
+
+    # The user cancels while the retry backoff is running.
+    def cancel_during_backoff(event, seconds, *args):
+        cancel_event.set()
+        return True
+
+    gemini_failover.cancellable_sleep = cancel_during_backoff
+    try:
+        transcribe_audio_chunk(
+            provider, "chunk_0.wav", model_override="model-a", cancel_event=cancel_event
+        )
+    except CancelledError:
+        pass
+    else:
+        raise AssertionError("a cancelled transcription must raise CancelledError")
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert provider.files.uploads != []
+    assert provider.files.deleted == ["files/fake-1"]
+
+
+def test_cancellation_during_an_upload_leaves_no_file_in_provider_storage():
+    """An abandoned upload is released even though it never reaches a caller."""
+    cancel_event = threading.Event()
+    # The provider cancels the run the moment it accepts the upload, and the
+    # file is still processing when it is asked for again.
+    provider = FakeGeminiProvider(
+        {"model-a": ["[00:01] Speaker 1: Setuju."]},
+        files=FakeFilesApi(processing_polls=3, on_upload=cancel_event.set),
+    )
+
+    try:
+        transcribe_audio_chunk(
+            provider, "chunk_0.wav", model_override="model-a", cancel_event=cancel_event
+        )
+    except CancelledError:
+        pass
+    else:
+        raise AssertionError("a cancelled transcription must raise CancelledError")
+
+    assert [upload["file"] for upload in provider.files.uploads] == ["chunk_0.wav"]
+    assert provider.files.deleted == ["files/fake-1"]
+    # Nothing was ever transcribed, so nothing reached the provider's models.
+    assert provider.attempts_on("model-a") == 0
+
+
+def test_transcription_diarization_still_turns_off_for_weak_models():
+    """Diarization policy for weak models is out of scope, so it is unchanged."""
+    tail = "[00:58] Speaker 1: Jadi kita sambung."
+
+    provider = FakeGeminiProvider({"model-a": ["[00:01] Speaker 1: Setuju."]})
+    transcribe_audio_chunk(
+        provider, "chunk_0.wav", previous_tail_transcript=tail, model_override="model-a"
+    )
+    prompt = provider.calls[0]["contents"][1]
+
+    assert "Speaker Diarization" in prompt
+    assert "[MM:SS] Speaker X: <Spoken content>" in prompt
+    # Tail context carries across the chunk seam.
+    assert tail in prompt
+
+    provider = FakeGeminiProvider({"gemini-3.5-flash-lite": ["[00:01] Setuju."]})
+    transcribe_audio_chunk(
+        provider,
+        "chunk_0.wav",
+        previous_tail_transcript=tail,
+        model_override="gemini-3.5-flash-lite",
+    )
+    weak_prompt = provider.calls[0]["contents"][1]
+
+    assert "Clean Transcription" in weak_prompt
+    assert "Speaker Diarization" not in weak_prompt
+    assert "SPEAKER CONTINUITY GUIDANCE" not in weak_prompt
+
+
+def test_transcription_reports_its_own_progress_wording():
+    """The transcription progress a user reads today is kept as it was."""
+    from src import gemini_failover
+
+    next_model = FALLBACK_MODELS[0]
+    provider = FakeGeminiProvider({
+        "model-a": [
+            RuntimeError("503 UNAVAILABLE"),
+            RuntimeError("503 UNAVAILABLE"),
+            RuntimeError("503 UNAVAILABLE"),
+        ],
+        next_model: ["[00:03] Speaker 1: Jumpa."],
+    })
+    messages = []
+    with recording_waits(gemini_failover):
+        transcribe_audio_chunk(
+            provider,
+            "chunk_0.wav",
+            progress_callback=messages.append,
+            max_retries=3,
+            model_override="model-a",
+        )
+
+    assert "Uploading chunk to Google Files API..." in messages
+    assert "Calling Gemini model-a (Attempt 1/3)..." in messages
+    assert "Server notice. Retrying in 4s..." in messages
+    assert "Calling Gemini %s (Attempt 1/3)..." % next_model in messages
+    # The text-generation wording must not leak into the transcription path.
+    assert not any(message.startswith("Server busy") for message in messages)
+
+
+def test_transcription_keeps_its_own_quota_failure_message():
+    chain = transcription_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        transcribe_audio_chunk(provider, "chunk_0.wav", model_override="model-a")
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please try again later once your Gemini quota resets, or use a different API key."
+            % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
 def minutes_failover_chain(lead_model):
     """The Failover chain the Minutes path walks when the Engine pins a model."""
     return [lead_model] + [m for m in MINUTES_FALLBACK_MODELS if m != lead_model]
@@ -1029,6 +1300,67 @@ def test_minutes_quota_failure_message_is_unchanged():
     else:
         raise AssertionError("a Quota failure on every model must raise RuntimeError")
 
+
+def test_transcription_retries_an_empty_transcription_on_its_own_backoff():
+    """An empty transcription is not a chunk: it retries, then moves down the chain."""
+    from src import gemini_failover
+
+    next_model = FALLBACK_MODELS[0]
+    provider = FakeGeminiProvider({
+        "model-a": [empty_transcription_response(), empty_transcription_response()],
+        next_model: ["[00:04] Speaker 1: Lagi."],
+    })
+    with recording_waits(gemini_failover) as waits:
+        transcript = transcribe_audio_chunk(
+            provider, "chunk_0.wav", max_retries=2, model_override="model-a"
+        )
+
+    assert transcript == "[00:04] Speaker 1: Lagi."
+    assert provider.attempts_on("model-a") == 2
+    # An empty transcription backs off by attempt * 3 seconds, which is not the
+    # step a transient error backs off by.
+    assert waits == [3]
+
+
+def test_a_chunk_that_only_ever_comes_back_empty_is_not_a_transcript():
+    """Silence is never banked as the chunk's transcript."""
+    from src import gemini_failover
+
+    chain = transcription_failover_chain("model-a")
+    provider = FakeGeminiProvider({
+        model: [empty_transcription_response()] for model in chain
+    })
+    with recording_waits(gemini_failover):
+        try:
+            transcribe_audio_chunk(provider, "chunk_0.wav", max_retries=1, model_override="model-a")
+        except RuntimeError as error:
+            assert str(error).startswith("All available Gemini models (")
+        else:
+            raise AssertionError("an empty transcription must not pass for a transcript")
+
+
+def test_transcription_path_delegates_its_failure_policy_to_the_shared_module():
+    """The Quota failure predicate is written once, and transcription uses that one."""
+    source = (Path(__file__).parent / "src" / "gemini_transcriber.py").read_text(encoding="utf-8")
+
+    assert "RESOURCE_EXHAUSTED" not in source
+    assert "quota exceeded" not in source
+    assert "generate_with_failover" in source
+    assert "is_quota_failure" not in source
+
+
+def test_upload_lifecycle_is_an_input_to_the_policy_not_part_of_it():
+    """The policy brackets whatever a caller prepares; it never learns what it is."""
+    source = (Path(__file__).parent / "src" / "gemini_failover.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported = {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    assert "gemini_transcriber" not in imported
+
+    # The policy only ever reaches for the caller's resource through its
+    # prepare/cleanup callbacks: it names no provider file API of its own.
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert "files" not in attributes
 
 def test_minutes_and_action_items_delegate_their_failure_policy_to_the_shared_module():
     """The Quota failure predicate is written once, and both paths use that one."""
@@ -1215,6 +1547,18 @@ if __name__ == "__main__":
     test_exhausted_failover_chain_raises_the_calls_final_error()
     test_resource_lifecycle_brackets_one_models_whole_retry_sweep()
     test_resource_is_released_even_when_a_models_sweep_fails()
+    test_transcribed_chunk_is_uploaded_once_and_the_upload_is_deleted()
+    test_transcription_reuses_one_upload_across_a_models_retries()
+    test_transcription_fails_over_to_a_later_model_after_a_transient_error()
+    test_transcription_deletes_the_uploaded_audio_when_the_run_is_cancelled()
+    test_cancellation_during_an_upload_leaves_no_file_in_provider_storage()
+    test_transcription_diarization_still_turns_off_for_weak_models()
+    test_transcription_reports_its_own_progress_wording()
+    test_transcription_keeps_its_own_quota_failure_message()
+    test_transcription_retries_an_empty_transcription_on_its_own_backoff()
+    test_a_chunk_that_only_ever_comes_back_empty_is_not_a_transcript()
+    test_transcription_path_delegates_its_failure_policy_to_the_shared_module()
+    test_upload_lifecycle_is_an_input_to_the_policy_not_part_of_it()
     test_failover_policy_module_owns_the_policy_and_nothing_else()
     test_failover_description_carries_no_provider_types()
     test_recap_path_keeps_its_backoff_step_and_temperature()
