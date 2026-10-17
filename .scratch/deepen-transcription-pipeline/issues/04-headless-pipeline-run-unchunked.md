@@ -6,16 +6,16 @@ This is deliberately the narrowest version that is still real. It proves the **P
 
 **Blocked by:** 03 — Move transcription onto the shared failover policy
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The **Pipeline run** is callable without constructing any window or importing the desktop UI package
-- [ ] The **Pipeline run** takes its settings as a plain data object, not from interface variables
-- [ ] Progress and per-**Chunk** status are reported through one channel, distinguished by phase
-- [ ] Reports carry a translation key and formatting arguments, not finished sentences
-- [ ] No message the headless path emits requires a translation table to produce
-- [ ] A headless flag on the existing entry point transcribes an **Audio file** and writes **Transcript** and **Minutes** to disk
-- [ ] The headless run honours the **Engine** choice and **Processing language**
-- [ ] The headless run's settings default to what the desktop app persists
-- [ ] A test drives a whole **Pipeline run** through the seam with a recording observer and a fake transcription client, asserting only what the observer saw
-- [ ] Importing the **Pipeline run** pulls in no UI toolkit
-- [ ] The existing suite still passes
+- [x] The **Pipeline run** is callable without constructing any window or importing the desktop UI package
+- [x] The **Pipeline run** takes its settings as a plain data object, not from interface variables
+- [x] Progress and per-**Chunk** status are reported through one channel, distinguished by phase
+- [x] Reports carry a translation key and formatting arguments, not finished sentences
+- [x] No message the headless path emits requires a translation table to produce
+- [x] A headless flag on the existing entry point transcribes an **Audio file** and writes **Transcript** and **Minutes** to disk
+- [x] The headless run honours the **Engine** choice and **Processing language**
+- [x] The headless run's settings default to what the desktop app persists
+- [x] A test drives a whole **Pipeline run** through the seam with a recording observer and a fake transcription client, asserting only what the observer saw
+- [x] Importing the **Pipeline run** pulls in no UI toolkit
+- [x] The existing suite still passes

@@ -279,9 +279,14 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "ms": "[Langkah 1/4] Memproses audio (MP3 mono 16kHz)...",
     },
     "status.step1_done": {"en": "[Step 1/4] Audio preprocessing skipped.", "ms": "[Langkah 1/4] Praproses audio dilangkau."},
+    "status.step1_detail": {"en": "[Step 1/4] {detail}", "ms": "[Langkah 1/4] {detail}"},
     "status.step2_start": {
         "en": "[Step 2/4] Preparing audio chunks (checking cache)...",
         "ms": "[Langkah 2/4] Menyediakan potongan audio (semak cache)...",
+    },
+    "status.step2_off": {
+        "en": "[Step 2/4] Chunking is off; the whole recording is transcribed as one Chunk.",
+        "ms": "[Langkah 2/4] Pemotongan dinyahkan; keseluruhan rakaman ditranskrip sebagai satu Potongan.",
     },
     "status.step3_cached": {"en": "[Step 3/4] Loaded {chunks} from cache.", "ms": "[Langkah 3/4] Memuatkan {chunks} daripada cache."},
     "status.step3_transcribing": {
@@ -291,6 +296,24 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "status.all_chunks_done": {
         "en": "All chunks completed! Click 'Extract Transcript' in the Monitor window.",
         "ms": "Semua potongan selesai! Klik 'Ekstrak Transkrip' dalam tetingkap Pemantau.",
+    },
+    # Reported by a headless Pipeline run, where there is no window to click in.
+    "status.step3_chunk": {
+        "en": "[Step 3/4] Transcribing Chunk {index} of {total}...",
+        "ms": "[Langkah 3/4] Mentranskrip Potongan {index} daripada {total}...",
+    },
+    "status.step3_engine": {
+        "en": "[Step 3/4] Engine: {engine}.",
+        "ms": "[Langkah 3/4] Enjin: {engine}.",
+    },
+    "status.step3_engine_auto": {
+        "en": "[Step 3/4] Engine: auto-failover.",
+        "ms": "[Langkah 3/4] Enjin: failover automatik.",
+    },
+    "status.step3_detail": {"en": "[Step 3/4] {detail}", "ms": "[Langkah 3/4] {detail}"},
+    "status.transcript_ready": {
+        "en": "Transcript ready ({chars} characters).",
+        "ms": "Transkrip sedia ({chars} aksara).",
     },
     "status.batch_finished": {
         "en": "Batch finished: {done}/{total} chunks completed. Please click '↻ Reprocess' on failed chunks.",
@@ -314,6 +337,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "Ready. Transcription and meeting minutes completed successfully!",
         "ms": "Sedia. Transkrip dan minit mesyuarat berjaya disiapkan!",
     },
+    "status.step4_detail": {"en": "[Step 4/4] {detail}", "ms": "[Langkah 4/4] {detail}"},
     "status.minutes_failed": {
         "en": "Transcript completed. Minutes generation failed (click Retry).",
         "ms": "Transkrip selesai. Penjanaan minit gagal (klik Cuba Semula).",
