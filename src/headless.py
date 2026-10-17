@@ -12,7 +12,10 @@ here in English, best effort: a key with no wording behind it still prints, beca
 Pipeline run reports translation keys and this path must not need a translation table to
 run.
 """
+import signal
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -33,6 +36,9 @@ EXIT_NO_TRANSCRIPT = 1
 
 EXIT_NO_MINUTES = 2
 """A Transcript was written; Minutes synthesis failed."""
+
+EXIT_CANCELLED = 130
+"""The run was cancelled with Ctrl+C. The Checkpoint survives; nothing was written."""
 
 TRANSCRIPT_SUFFIX = "_transcript.md"
 MINUTES_SUFFIX = "_minutes.md"
@@ -98,6 +104,41 @@ class HeadlessOutcome:
     minutes_path: Optional[Path] = None
 
 
+@contextmanager
+def interrupt_cancels(cancel_event):
+    """
+    Wire Ctrl+C to a run's cancel event for the duration of the run.
+
+    A terminal user stops a run with Ctrl+C, and the Pipeline run knows how to stop --
+    but only through the cancel event it is handed. Translating one into the other is
+    this adapter's job, not the pipeline's: the pipeline stays free of signal handling,
+    which is also what keeps it usable from a thread or a test.
+
+    The previous handler is put back afterwards, so nothing leaks into the rest of the
+    process, and a second Ctrl+C reaches the default handler and stops the terminal
+    reader waiting rather than appearing to hang.
+    """
+    previous = None
+
+    def on_interrupt(signum, frame):
+        cancel_event.set()
+        # A second Ctrl+C is a reader who has asked twice. Let the default handler end it.
+        signal.signal(signal.SIGINT, previous if previous is not None else signal.SIG_DFL)
+
+    try:
+        previous = signal.signal(signal.SIGINT, on_interrupt)
+    except ValueError:
+        # Not the main thread: signals cannot be installed here, and a caller running a
+        # Pipeline run on a worker owns cancellation itself.
+        yield cancel_event
+        return
+
+    try:
+        yield cancel_event
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def _write_document(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -111,6 +152,8 @@ def run_headless(
     engine: Optional[str] = None,
     template: Optional[str] = None,
     preprocess: Optional[bool] = None,
+    chunk_minutes: Optional[int] = None,
+    cache_dir: Optional[str] = None,
     client: Any = None,
     observer: Any = None,
     cancel_event=None,
@@ -123,8 +166,13 @@ def run_headless(
     the desktop app persists. The API key comes from the environment or .env, since
     there is no interface to read it from. The outcome carries the exit code and where
     the documents landed.
+
+    An interrupted run leaves its Checkpoint where cache_dir says, so restarting the same
+    command resumes rather than re-paying for the Chunks already transcribed.
     """
     settings = PipelineSettings(audio_path=str(audio_path), api_key=get_api_key())
+    if cache_dir is not None:
+        settings.cache_dir = str(cache_dir)
     if language is not None:
         settings.language = language
     if engine is not None:
@@ -133,12 +181,24 @@ def run_headless(
         settings.template = template
     if preprocess is not None:
         settings.preprocess = preprocess
+    if chunk_minutes is not None:
+        settings.chunk_minutes = chunk_minutes
 
     console = ConsoleObserver(stream) if observer is None else observer
+    # A cancel_event the caller did not supply is this adapter's to create, and Ctrl+C
+    # is wired to it: a terminal reader stopping a run means cancelling it, which leaves
+    # the Checkpoint resumable rather than killing the process mid-Chunk.
+    cancel_event = cancel_event if cancel_event is not None else threading.Event()
     try:
-        result = run_pipeline(settings, console, cancel_event=cancel_event, client=client)
+        with interrupt_cancels(cancel_event):
+            result = run_pipeline(settings, console, cancel_event=cancel_event, client=client)
     except CancelledError:
-        raise
+        print(
+            "Cancelled. Chunks transcribed so far are in the Checkpoint; "
+            "run the same command again to resume.",
+            file=sys.stderr,
+        )
+        return HeadlessOutcome(exit_code=EXIT_CANCELLED, result=PipelineResult())
     except Exception as err:
         # A terminal reader gets a reason and an exit code, not a traceback.
         log.error("Headless Pipeline run failed: %s", err)

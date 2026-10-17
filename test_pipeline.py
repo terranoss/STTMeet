@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,7 +99,9 @@ from src.gemini_transcriber import (
     transcribe_audio_chunk,
     upload_and_wait_file,
 )
+from src.audio_processor import compute_file_hash
 from src.cancellation import CancelledError
+from src.checkpoint_store import checkpoint_path
 from src.pipeline import (
     ENGINE_MODEL_OVERRIDES,
     Phase,
@@ -1571,7 +1574,7 @@ def test_a_whole_pipeline_run_reports_what_it_is_doing_and_yields_transcript_and
 
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
-        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
         observer = RecordingObserver()
 
         result = run_pipeline(
@@ -1601,7 +1604,7 @@ def test_a_minutes_failure_never_costs_the_transcript():
 
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
-        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
         observer = RecordingObserver()
         # Every model of the Minutes chain refuses for the day.
         script = {model: [quota_failure_error()] for model in MINUTES_FALLBACK_MODELS}
@@ -1631,6 +1634,7 @@ def test_the_run_honours_the_engine_and_the_processing_language():
         settings = PipelineSettings(
             audio_path=str(audio), api_key="key", preprocess=False,
             engine=pinned, language="English",
+            cache_dir=tmp,
         )
         observer = RecordingObserver()
 
@@ -1655,7 +1659,7 @@ def test_every_report_a_run_makes_renders_from_its_key_and_args():
     """
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
-        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
         observer = RecordingObserver()
 
         run_pipeline(settings, observer,
@@ -1689,7 +1693,7 @@ def test_a_cancelled_run_transcribes_nothing():
     """A Pipeline run handed a set cancel event reports nothing and calls nothing."""
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
-        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
         observer = RecordingObserver()
         provider = pipeline_run_provider("[00:01] Speaker 1: Setuju.", "# Minit")
         already_cancelled = threading.Event()
@@ -1726,7 +1730,7 @@ def test_preprocessing_decides_which_audio_is_transcribed_and_reports_its_own_pr
         original = pipeline_module.preprocess_audio
         pipeline_module.preprocess_audio = fake_preprocess
         try:
-            settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=True)
+            settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=True, cache_dir=tmp)
             observer = RecordingObserver()
             provider = pipeline_run_provider(transcript, "# Minit")
             run_pipeline(settings, observer, client=provider)
@@ -1816,7 +1820,7 @@ def test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk():
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
         outcome = run_headless(
-            str(audio), output_dir=tmp, preprocess=False,
+            str(audio), output_dir=tmp, preprocess=False, cache_dir=tmp,
             client=pipeline_run_provider(transcript, minutes),
         )
         written = sorted(p.name for p in Path(tmp).glob("*.md"))
@@ -1836,7 +1840,7 @@ def test_a_headless_run_keeps_the_transcript_when_minutes_fail():
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
         outcome = run_headless(
-            str(audio), output_dir=tmp, preprocess=False,
+            str(audio), output_dir=tmp, preprocess=False, cache_dir=tmp,
             client=FakeGeminiProvider(script),
         )
         written = sorted(p.name for p in Path(tmp).glob("*.md"))
@@ -1910,6 +1914,519 @@ def test_the_engine_and_its_model_name_name_the_same_choice_both_ways():
     assert model_for_engine("") is None
 
 
+def a_chunking_plan(directory, count, chunk_minutes=25):
+    """
+    The Chunks Chunking would produce for a long Audio file: one slice file each, with
+    the timestamps and offset the run needs to stitch them back together.
+
+    Built rather than derived, because finding silence boundaries needs a real decoder.
+    What is under test is what a Pipeline run does with a Chunk plan, not where the
+    boundaries happened to fall.
+    """
+    plan = []
+    for index in range(count):
+        slice_path = Path(directory) / ("chunk_%03d.mp3" % index)
+        slice_path.write_bytes(b"16kHz mono slice %d" % index)
+        plan.append({
+            "chunk_index": index,
+            "file_path": str(slice_path),
+            "start_ms": index * chunk_minutes * 60 * 1000,
+            "end_ms": (index + 1) * chunk_minutes * 60 * 1000,
+            "duration_ms": chunk_minutes * 60 * 1000,
+            "offset_seconds": float(index * chunk_minutes * 60),
+        })
+    return plan
+
+
+@contextmanager
+def chunking_that_splits_into(plan):
+    """Stand in for Chunking with a plan, so a run can be driven without a decoder."""
+    from src import pipeline as pipeline_module
+
+    def split(audio_path, **kwargs):
+        split.calls += 1
+        split.audio_paths.append(audio_path)
+        return list(plan)
+
+    split.calls = 0
+    split.audio_paths = []
+    original = pipeline_module.split_audio_into_chunks
+    pipeline_module.split_audio_into_chunks = split
+    try:
+        yield split
+    finally:
+        pipeline_module.split_audio_into_chunks = original
+
+
+@contextmanager
+def chunking_that_must_not_run():
+    """Fail loudly if a run splits an Audio file it was told not to split."""
+    from src import pipeline as pipeline_module
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("Chunking is off; the recording must not be sliced.")
+
+    original = pipeline_module.split_audio_into_chunks
+    pipeline_module.split_audio_into_chunks = refuse
+    try:
+        yield
+    finally:
+        pipeline_module.split_audio_into_chunks = original
+
+
+def chunked_pipeline_provider(chunk_transcripts, minutes_text, lead=None):
+    """
+    A fake Gemini client serving one transcription per Chunk, then one Minutes synthesis.
+
+    A pinned Engine makes both calls land on the same model, which then answers them in
+    the order the run makes them: every Chunk in turn, then the Minutes.
+    """
+    lead = lead or MODEL_NAME
+    script = {lead: list(chunk_transcripts)}
+    if MINUTES_MODEL_NAME == lead:
+        script[lead].append(minutes_text)
+    else:
+        script[MINUTES_MODEL_NAME] = [minutes_text]
+    return FakeGeminiProvider(script)
+
+
+def test_chunking_splits_a_long_audio_file_and_every_chunk_is_transcribed():
+    """Chunking on: the Audio file becomes many Chunks, and each is sent to the service."""
+    # Each Chunk's timestamps are local to that Chunk, as the service returns them.
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    minutes = "# Minit\n\n## Keputusan\nTutup mesyuarat."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        provider = chunked_pipeline_provider(chunk_texts, minutes)
+        observer = RecordingObserver()
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+
+        with chunking_that_splits_into(plan) as chunking:
+            result = run_pipeline(settings, observer, client=provider)
+
+    assert chunking.calls == 1
+    assert result.chunks == 3
+    assert result.completed_chunks == 3
+    # Each Chunk was uploaded as its own slice, in order, rather than the whole file.
+    assert [upload["file"] for upload in provider.files.uploads] == [
+        chunk["file_path"] for chunk in plan
+    ]
+    # The Transcript is every Chunk's text, in order.
+    # The Transcript is every Chunk's text, in order, each Chunk's clock shifted onto
+    # the meeting's: Chunk 2 starts 25 minutes in, Chunk 3 an hour in.
+    assert result.transcript == "\n\n".join([
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[25:03] Speaker 2: Agenda kedua.",
+        "[50:07] Speaker 1: Kita tutup mesyuarat.",
+    ])
+    assert [(r.index, r.key) for r in observer.reports if r.phase == Phase.CHUNK] == [
+        (0, "chunk.working"), (0, "chunk.done"),
+        (1, "chunk.working"), (1, "chunk.done"),
+        (2, "chunk.working"), (2, "chunk.done"),
+    ]
+    assert ("step2", "done") in observer.steps()
+
+
+def test_chunking_is_skipped_entirely_when_it_is_off():
+    """Chunking off: the recording is never sliced, and is the one Chunk end to end."""
+    transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Kita teruskan."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        provider = pipeline_run_provider(transcript, "# Minit")
+        observer = RecordingObserver()
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=0, cache_dir=tmp,
+        )
+
+        with chunking_that_must_not_run():
+            result = run_pipeline(settings, observer, client=provider)
+
+        uploaded = [upload["file"] for upload in provider.files.uploads]
+
+    assert result.chunks == 1
+    assert result.completed_chunks == 1
+    assert result.transcript == transcript
+    # The whole Audio file is what reaches the service, uncut.
+    assert uploaded == [str(audio)]
+    assert "status.step2_off" in observer.keys()
+    step2_done = [r for r in observer.reports
+                  if r.phase == Phase.STEP and r.key == "step2" and r.state == "done"][0]
+    assert step2_done.args == {"skipped": True, "chunk_count": 1}
+
+
+class CheckpointWatchingObserver(RecordingObserver):
+    """
+    An observer that reads the Checkpoint off disk at each Chunk report.
+
+    The run's promise is that the Checkpoint is written before it moves on to the next
+    Chunk, so the only honest way to see that is to look at the file when the run says
+    the Chunk is done rather than after the run has finished.
+    """
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.banked_at_chunk_done = []
+
+    def report(self, report):
+        super().report(report)
+        if report.phase == Phase.CHUNK and report.key == "chunk.done":
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            self.banked_at_chunk_done.append(sorted(payload["chunks"]))
+
+
+def test_a_checkpoint_records_each_chunk_as_soon_as_it_is_done():
+    """The Checkpoint is written after every Chunk, not once at the end of the run."""
+    chunk_texts = ["[00:05] Speaker 1: Satu.", "[00:05] Speaker 2: Dua."]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 2)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+        observer = CheckpointWatchingObserver(
+            checkpoint_path(tmp, compute_file_hash(str(audio)))
+        )
+
+        with chunking_that_splits_into(plan):
+            run_pipeline(settings, observer,
+                         client=chunked_pipeline_provider(chunk_texts, "# Minit"))
+
+        saved = json.loads(observer.path.read_text(encoding="utf-8"))
+
+    # Each Chunk was on disk by the time the run reported it done, so an interruption
+    # after Chunk 1 still has Chunk 0 banked.
+    assert observer.banked_at_chunk_done == [["0"], ["0", "1"]]
+    assert saved["chunk_minutes"] == 25
+    # What is banked is the Chunk's final text, on the meeting's clock.
+    assert saved["chunks"]["0"] == "[00:05] Speaker 1: Satu."
+    assert saved["chunks"]["1"] == "[25:05] Speaker 2: Dua."
+
+
+def test_an_interrupted_run_resumes_and_does_not_re_pay_for_chunks_already_done():
+    """
+    The acceptance case: a long meeting interrupted partway, restarted, picks up where it
+    stopped rather than transcribing from the beginning.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    minutes = "# Minit\n\n## Keputusan\nTutup mesyuarat."
+    # One model pinned, so the whole run -- every Chunk and the Minutes -- is answered by
+    # one scripted list, and reaching for any other model is a test failure.
+    lead = MODEL_NAME
+    pinned = "☁️ Gemini 3.8 Flash"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp, engine=pinned,
+        )
+
+        # First run: the first two Chunks transcribe, the third is refused by every model
+        # of the chain -- which is what an exhausted day looks like.
+        first_provider = FakeGeminiProvider(
+            dict(
+                {lead: chunk_texts[:2] + [quota_failure_error(), minutes]},
+                **{model: [quota_failure_error()] for model in FALLBACK_MODELS if model != lead},
+            )
+        )
+        first_observer = RecordingObserver()
+        with chunking_that_splits_into(plan):
+            first = run_pipeline(settings, first_observer, client=first_provider)
+
+        # Second run: a fresh client whose script covers only what is left to do -- the
+        # third Chunk and the Minutes. Anything more would be a re-paid Chunk, so nothing
+        # else is scripted: reaching for an unscripted call is itself the failure.
+        second_provider = FakeGeminiProvider({
+            lead: [chunk_texts[2], minutes],
+        })
+        second_observer = RecordingObserver()
+        with chunking_that_splits_into(plan):
+            second = run_pipeline(settings, second_observer, client=second_provider)
+
+        first_uploads = [upload["file"] for upload in first_provider.files.uploads]
+        second_uploads = [upload["file"] for upload in second_provider.files.uploads]
+
+    # The first run banked the two Chunks it managed and said the step was incomplete.
+    assert first.completed_chunks == 2
+    assert first.chunks == 3
+    assert ("step3", "error") in first_observer.steps()
+    assert (2, "chunk.error") in [
+        (r.index, r.key) for r in first_observer.reports if r.phase == Phase.CHUNK
+    ]
+
+    # The resumed run paid for only the Chunk that was missing, and got the whole
+    # meeting back -- assembled from three Chunks, the first two read from the Checkpoint.
+    assert second.chunks == 3
+    assert second.completed_chunks == 3
+    assert second_uploads == [plan[2]["file_path"]]
+    assert first_uploads[:2] == [plan[0]["file_path"], plan[1]["file_path"]]
+    # Every Chunk's text is in the Transcript exactly once, in the order it was spoken.
+    assert second.transcript.count("Agenda pertama.") == 1
+    assert second.transcript.count("Agenda kedua.") == 1
+    assert second.transcript.count("Kita tutup mesyuarat.") == 1
+    assert second.transcript.index("Agenda pertama.") < second.transcript.index("Agenda kedua.")
+    assert second.transcript.index("Agenda kedua.") < second.transcript.index("Kita tutup mesyuarat.")
+
+    # The resumed run said which Chunks came from the Checkpoint rather than the service.
+    chunk_reports = [(r.index, r.key) for r in second_observer.reports
+                     if r.phase == Phase.CHUNK]
+    assert chunk_reports == [
+        (0, "chunk.cached"), (1, "chunk.cached"),
+        (2, "chunk.working"), (2, "chunk.done"),
+    ]
+
+
+def test_tail_context_carries_the_previous_chunk_across_the_seam():
+    """
+    Each Chunk is sent the tail of the Chunk before it, so speaker names and phrasing
+    stay continuous where the Chunking boundary fell mid-sentence.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: En. Razak akan bentangkan laporan.\n"
+        "[00:09] Speaker 2: Pn. Faridah, sila prepare bahagian wandangian.",
+        "[00:07] Speaker 1: Terima kasih.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        provider = chunked_pipeline_provider(chunk_texts, "# Minit")
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+        with chunking_that_splits_into(plan):
+            result = run_pipeline(settings, RecordingObserver(), client=provider)
+
+        # What the service was actually sent, prompt for prompt.
+        prompts = [call["contents"][1] for call in provider.calls[:3]]
+        transcript = result.transcript
+
+    # The first Chunk has nothing before it, so it carries no Tail context.
+    assert "SPEAKER CONTINUITY GUIDANCE" not in prompts[0]
+    # The second was sent the first Chunk's closing line, and the third the second's --
+    # as they stand in the Transcript, on the meeting's clock rather than the Chunk's.
+    assert transcript.splitlines()[1] in prompts[1]
+    assert transcript.splitlines()[3] in prompts[2]
+    # So the third Chunk was not sent the first Chunk's tail as well.
+    assert transcript.splitlines()[1] not in prompts[2]
+
+
+def test_overlap_is_removed_from_the_seam_between_two_chunks():
+    """
+    Chunking cuts at silence but keeps five seconds of audio either side, so the opening
+    of a Chunk repeats the close of the one before. That Overlap is removed, not kept
+    twice in the Transcript.
+    """
+    repeated = "[00:03] Speaker 2: Baik Tuan, saya sambung."
+    chunk_texts = [
+        "[00:40] Speaker 1: Kita teruskan.\n" + repeated,
+        repeated + "\n[00:12] Speaker 1: Agenda seterusnya.",
+        "[00:05] Speaker 2: Baiknya.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+        with chunking_that_splits_into(plan):
+            result = run_pipeline(settings, RecordingObserver(),
+                                  client=chunked_pipeline_provider(chunk_texts, "# Minit"))
+
+    # The repeated line is in the Transcript once, and the Chunk after the seam keeps
+    # only what was new in it.
+    assert result.transcript.count("Baik Tuan, saya sambung.") == 1
+    assert "Agenda seterusnya." in result.transcript
+    assert "Baiknya." in result.transcript
+
+
+def test_a_cancelled_run_stops_between_chunks_and_leaves_the_rest_resumable():
+    """
+    A cancel mid-meeting ends the run promptly -- the Chunk after the cancel is never
+    sent -- and what was already transcribed stays in the Checkpoint as done, so the
+    remaining Chunks are resumed rather than failed.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    cancel_event = threading.Event()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+
+        # The user cancels once the second Chunk has been transcribed.
+        class CancellingObserver(RecordingObserver):
+            def report(self, report):
+                super().report(report)
+                if report.phase == Phase.CHUNK and report.key == "chunk.done" and report.index == 1:
+                    cancel_event.set()
+
+        observer = CancellingObserver()
+        provider = chunked_pipeline_provider(chunk_texts, "# Minit")
+        with chunking_that_splits_into(plan):
+            try:
+                run_pipeline(settings, observer, cancel_event=cancel_event, client=provider)
+                raise AssertionError("a cancelled run must not return a result")
+            except CancelledError:
+                pass
+
+        uploaded = [upload["file"] for upload in provider.files.uploads]
+        checkpoint = json.loads(
+            checkpoint_path(tmp, compute_file_hash(str(audio))).read_text(encoding="utf-8")
+        )
+
+    # It stopped between Chunks: the third was never sent, and no Minutes were asked for.
+    assert uploaded == [plan[0]["file_path"], plan[1]["file_path"]]
+    assert provider.attempts_on(MINUTES_MODEL_NAME) == 0
+
+    # The two finished Chunks are banked as done. The third is absent -- neither done
+    # nor errored -- which is what "resumable rather than failed" means on disk.
+    assert sorted(checkpoint["chunks"]) == ["0", "1"]
+    assert "error" not in json.dumps(checkpoint)
+
+
+def test_ctrl_c_cancels_a_headless_run_and_leaves_it_resumable():
+    """
+    Ctrl+C is how a terminal user stops a run. It must end the run the same way the
+    Cancel button ends it on the desktop -- through the cancel event, not by killing the
+    process -- so the Chunks already transcribed survive to be resumed.
+    """
+    import signal
+
+    from src.headless import EXIT_CANCELLED, run_headless
+
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+
+    class InterruptingObserver:
+        """Raises SIGINT at the terminal, as Ctrl+C would, once Chunk 1 is banked."""
+
+        def __init__(self):
+            self.transcript_path = None
+
+        def report(self, report):
+            if (report.phase == Phase.CHUNK and report.key == "chunk.done"
+                    and report.index == 1):
+                # raise_signal, not os.kill: on Windows os.kill(SIGINT) terminates the
+                # process outright, which is exactly the behaviour being ruled out here.
+                signal.raise_signal(signal.SIGINT)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        # Only the first two Chunks are scripted: if the interrupt did not take, the run
+        # would reach for a third call this provider has no answer for.
+        provider = chunked_pipeline_provider(chunk_texts[:2], "# Minit")
+        original_split = None
+        from src import pipeline as pipeline_module
+        original_split = pipeline_module.split_audio_into_chunks
+        pipeline_module.split_audio_into_chunks = lambda audio_path, **kw: list(plan)
+        try:
+            outcome = run_headless(
+                str(audio), output_dir=tmp, preprocess=False, chunk_minutes=25,
+                cache_dir=tmp, client=provider, observer=InterruptingObserver(),
+            )
+        finally:
+            pipeline_module.split_audio_into_chunks = original_split
+
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+        checkpoint = json.loads(
+            checkpoint_path(tmp, compute_file_hash(str(audio))).read_text(encoding="utf-8")
+        )
+
+    # Ctrl+C did not kill the process: it came back through the adapter's own door code.
+    assert outcome.exit_code == EXIT_CANCELLED
+    # Nothing half-finished was written, and the finished Chunks are still banked.
+    assert written == []
+    assert sorted(checkpoint["chunks"]) == ["0", "1"]
+
+
+def test_a_headless_run_that_failed_partway_is_resumed_by_running_it_again():
+    """
+    The whole acceptance case end to end, through the seam a terminal reader actually
+    uses: a long meeting fails partway, and running the same command again produces the
+    complete Transcript without re-paying for the Chunks already transcribed.
+    """
+    from src.headless import EXIT_OK, run_headless
+
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    minutes = "# Minit\n\n## Keputusan\nTutup mesyuarat."
+    lead = MODEL_NAME
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        with chunking_that_splits_into(plan):
+            # First attempt: the third Chunk is refused by the whole chain.
+            first = FakeGeminiProvider({
+                lead: chunk_texts[:2] + [quota_failure_error(), minutes],
+            })
+            failed = run_headless(
+                str(audio), output_dir=tmp, preprocess=False, chunk_minutes=25,
+                cache_dir=tmp, client=first,
+            )
+            after_first = sorted(p.name for p in Path(tmp).glob("*.md"))
+
+            # Second attempt, same command: a client with answers for the rest only.
+            second = FakeGeminiProvider({lead: [chunk_texts[2], minutes]})
+            resumed = run_headless(
+                str(audio), output_dir=tmp, preprocess=False, chunk_minutes=25,
+                cache_dir=tmp, client=second,
+            )
+            written = sorted(p.name for p in Path(tmp).glob("*.md"))
+            transcript = Path(resumed.transcript_path).read_text(encoding="utf-8")
+
+    # The failed run wrote nothing, even though it had two Chunks' worth of text.
+    assert failed.exit_code != EXIT_OK
+    assert failed.transcript_path is None
+    assert after_first == []
+
+    # The resumed run wrote both documents, and paid for only the Chunk that was missing.
+    assert resumed.exit_code == EXIT_OK
+    assert written == ["meeting_minutes.md", "meeting_transcript.md"]
+    assert [upload["file"] for upload in second.files.uploads] == [plan[2]["file_path"]]
+    # The Transcript is the whole meeting, in order, each line once.
+    for phrase in ("Agenda pertama.", "Agenda kedua.", "Kita tutup mesyuarat."):
+        assert transcript.count(phrase) == 1
+    assert transcript.index("Agenda pertama.") < transcript.index("Kita tutup mesyuarat.")
+
+
 def test_every_test_in_this_suite_is_registered_to_run():
     """
     main() calls tests from a hardcoded list, so a test that is defined but not
@@ -1944,7 +2461,7 @@ def test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why():
 
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
-        outcome = run_headless(str(audio), output_dir=tmp, preprocess=False, client=provider)
+        outcome = run_headless(str(audio), output_dir=tmp, preprocess=False, cache_dir=tmp, client=provider)
         written = sorted(p.name for p in Path(tmp).glob("*.md"))
 
     assert outcome.exit_code == EXIT_NO_TRANSCRIPT
@@ -2052,6 +2569,15 @@ if __name__ == "__main__":
     test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk()
     test_a_headless_run_keeps_the_transcript_when_minutes_fail()
     test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why()
+    test_chunking_splits_a_long_audio_file_and_every_chunk_is_transcribed()
+    test_chunking_is_skipped_entirely_when_it_is_off()
+    test_a_checkpoint_records_each_chunk_as_soon_as_it_is_done()
+    test_an_interrupted_run_resumes_and_does_not_re_pay_for_chunks_already_done()
+    test_tail_context_carries_the_previous_chunk_across_the_seam()
+    test_overlap_is_removed_from_the_seam_between_two_chunks()
+    test_a_cancelled_run_stops_between_chunks_and_leaves_the_rest_resumable()
+    test_ctrl_c_cancels_a_headless_run_and_leaves_it_resumable()
+    test_a_headless_run_that_failed_partway_is_resumed_by_running_it_again()
     test_a_console_report_prints_its_key_and_arguments_without_a_translation_table()
     test_the_headless_flag_on_the_entry_point_configures_the_run()
     test_the_engine_and_its_model_name_name_the_same_choice_both_ways()

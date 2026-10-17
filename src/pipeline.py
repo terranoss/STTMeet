@@ -22,19 +22,22 @@ Three properties of this module are the point of it, not decoration:
   ever seems to need the Chunk monitor or the transcript view, the answer is to report
   an event and let the adapter render it.
 
-Scope: this is the unchunked path. An Audio file with Chunking off is one Chunk from
-end to end. Chunking, resume from Checkpoint, Tail context and Overlap removal arrive
-with the next ticket, which fills in the loop this module is shaped to hold.
+Scope: this module owns the per-Chunk loop, the Checkpoint, Tail context and Overlap
+removal. It still does not save sessions -- what constitutes a saved session is the
+caller's concern -- and it still has no second entry point for reprocessing one Chunk.
 """
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional
 
-from .audio_processor import compute_file_hash, preprocess_audio
+from .audio_processor import compute_file_hash, preprocess_audio, split_audio_into_chunks
 from .cancellation import CancelledError, raise_if_cancelled
+from .checkpoint_store import load_checkpoint, save_checkpoint
+from .config import CACHE_DIR
 from .gemini_transcriber import get_gemini_client, transcribe_audio_chunk
 from .logger import get_logger
 from .minutes_generator import generate_meeting_minutes
 from .session_store import DEFAULT_SETTINGS
+from .transcript_processor import adjust_chunk_timestamps, deduplicate_overlap
 
 log = get_logger(__name__)
 
@@ -78,7 +81,13 @@ class Phase:
     """Status text that also moves the bar: carries a percentage from 0.0 to 1.0."""
 
     CHUNK = "chunk"
-    """One Chunk's row: key names the Chunk's state and index says which Chunk."""
+    """
+    One Chunk's row: key names the Chunk's state and index says which Chunk.
+
+    ``chunk.cached`` is a Chunk this run did not transcribe: it was already done in the
+    Checkpoint and is being read back in. It is distinct from ``chunk.done`` so a caller
+    can show a resumed run differently from a fresh one.
+    """
 
 
 @dataclass(frozen=True)
@@ -108,7 +117,7 @@ class PipelineSettings:
     The defaults are what the desktop app persists, read from session_store rather than
     copied, so the two entry points cannot drift apart. Two deliberate exceptions: the
     API key is empty, because a headless run reads it from the environment instead, and
-    Chunking is off because that is the only path this run supports yet.
+    Chunking is off, because a recording that fits in one request should not be sliced.
     """
 
     audio_path: str
@@ -126,6 +135,9 @@ class PipelineSettings:
     preprocess: bool = DEFAULT_SETTINGS["preprocess"]
     chunk_minutes: int = 0
     """0 means Chunking is off: the whole recording is one Chunk."""
+
+    cache_dir: str = str(CACHE_DIR)
+    """Where this run's Checkpoint is written, and where a resume looks for it."""
 
 
 @dataclass
@@ -221,32 +233,56 @@ def run_pipeline(
     raise_if_cancelled(cancel_event)
 
     # --- Step 2: Chunking --------------------------------------------------
-    # With Chunking off the whole recording is one Chunk, so this step does no work. The
-    # next ticket replaces it with a real split and a loop over what it returns.
     report(PipelineReport(phase=Phase.STEP, key=STEP_CHUNKING, state="working"))
-    report(PipelineReport(phase=Phase.STATUS, key="status.step2_off"))
-    report(PipelineReport(phase=Phase.STEP, key=STEP_CHUNKING, state="done",
-                          args={"skipped": True, "chunk_count": 1}))
+    if settings.chunk_minutes > 0:
+        report(PipelineReport(phase=Phase.PROGRESS, key="status.step2_start",
+                              percent=PREPROCESS_START))
+        chunk_plan = split_audio_into_chunks(
+            target_audio,
+            chunk_minutes=settings.chunk_minutes,
+            progress_callback=lambda message, percent: report(
+                PipelineReport(phase=Phase.STATUS, key="status.step2_detail",
+                               args={"detail": message})
+            ),
+        )
+        report(PipelineReport(phase=Phase.STEP, key=STEP_CHUNKING, state="done",
+                              args={"skipped": False, "chunk_count": len(chunk_plan)}))
+    else:
+        # Chunking off: the whole recording is the one Chunk, and nothing is sliced.
+        chunk_plan = [{
+            "chunk_index": 0,
+            "file_path": target_audio,
+            "offset_seconds": 0.0,
+        }]
+        report(PipelineReport(phase=Phase.STATUS, key="status.step2_off"))
+        report(PipelineReport(phase=Phase.STEP, key=STEP_CHUNKING, state="done",
+                              args={"skipped": True, "chunk_count": 1}))
+    result.chunks = len(chunk_plan)
     raise_if_cancelled(cancel_event)
 
     # --- Step 3: Transcribe -------------------------------------------------
     report(PipelineReport(phase=Phase.STEP, key=STEP_TRANSCRIBE, state="working"))
-    report(PipelineReport(phase=Phase.PROGRESS, key="status.step3_chunk",
-                          percent=TRANSCRIBE_START, args={"index": 1, "total": 1}))
     if model_override:
         report(PipelineReport(phase=Phase.STATUS, key="status.step3_engine",
                               args={"engine": model_override}))
     else:
         report(PipelineReport(phase=Phase.STATUS, key="status.step3_engine_auto"))
 
-    transcript = _transcribe_the_recording(
-        replace(settings, audio_path=target_audio), client, model_override, cancel_event, report
+    transcript, completed = _transcribe_every_chunk(
+        replace(settings, audio_path=target_audio),
+        chunk_plan,
+        client,
+        model_override,
+        cancel_event,
+        report,
+        file_hash=result.file_hash,
     )
     result.transcript = transcript
-    result.completed_chunks = 1
+    result.completed_chunks = completed
     report(PipelineReport(phase=Phase.PROGRESS, key="status.transcript_ready",
                           percent=TRANSCRIBE_DONE, args={"chars": len(transcript)}))
-    report(PipelineReport(phase=Phase.STEP, key=STEP_TRANSCRIBE, state="done"))
+    report(PipelineReport(phase=Phase.STEP, key=STEP_TRANSCRIBE,
+                          state="done" if completed == result.chunks else "error"))
 
     # --- Step 4: Minutes ------------------------------------------------------
     report(PipelineReport(phase=Phase.STEP, key=STEP_MINUTES, state="working"))
@@ -282,26 +318,97 @@ def run_pipeline(
     return result
 
 
-def _transcribe_the_recording(
+def _transcribe_every_chunk(
     settings: PipelineSettings,
+    chunk_plan,
+    client: Any,
+    model_override: Optional[str],
+    cancel_event,
+    report,
+    file_hash: str = "",
+) -> tuple:
+    """
+    Walk the Chunks in order, transcribe what is not already in the Checkpoint, and
+    assemble the Transcript from everything that came back.
+
+    Returns the Transcript and how many Chunks it was assembled from. A Chunk that fails
+    does not end the run -- the rest of a three-hour meeting is worth more than the Chunk
+    that would not transcribe -- but it does mean the Transcript is partial, which the
+    caller is told about through step3's badge.
+
+    Tail context is taken in exactly one place, at the end of the iteration, from whatever
+    text this Chunk ended up holding. A Chunk read back from the Checkpoint seeds it just
+    as a freshly transcribed one does, which is what lets a resumed run stitch across the
+    seam it did not transcribe.
+    """
+    total = len(chunk_plan)
+    done = load_checkpoint(settings.cache_dir, file_hash, settings.chunk_minutes)
+    transcript_parts = []
+    completed = 0
+    previous_text = ""
+    tail_context = ""
+
+    for position, chunk in enumerate(chunk_plan):
+        index = int(chunk["chunk_index"])
+        # Cancellation is checked between Chunks, so a cancel stops the run promptly
+        # rather than after the service has been paid for the rest of the meeting.
+        raise_if_cancelled(cancel_event)
+        percent = _transcribe_percent(position, total)
+        report(PipelineReport(phase=Phase.PROGRESS, key="status.step3_chunk",
+                              percent=percent, args={"index": position + 1, "total": total}))
+
+        cached = done.get(str(index), "")
+        if cached.strip():
+            chunk_text = cached
+            report(PipelineReport(phase=Phase.CHUNK, key="chunk.cached", index=index))
+        else:
+            chunk_text = _transcribe_one_chunk(
+                chunk, tail_context, previous_text, client, model_override, cancel_event, report
+            )
+            if not chunk_text:
+                continue
+            # Banked before it is announced done: a Chunk reported done must already be
+            # on disk, or "done" would be a promise the next run cannot keep.
+            done[str(index)] = chunk_text
+            save_checkpoint(settings.cache_dir, file_hash, settings.chunk_minutes, done)
+            report(PipelineReport(phase=Phase.CHUNK, key="chunk.done", index=index))
+
+        completed += 1
+        transcript_parts.append(chunk_text)
+        previous_text = chunk_text
+        tail_context = _tail_context(chunk_text)
+
+    return "\n\n".join(part for part in transcript_parts if part.strip()), completed
+
+
+def _transcribe_one_chunk(
+    chunk,
+    tail_context: str,
+    previous_text: str,
     client: Any,
     model_override: Optional[str],
     cancel_event,
     report,
 ) -> str:
     """
-    Transcribe the whole recording as the one Chunk a Chunking-off run has.
+    Transcribe one Chunk and return the text that goes into the Transcript for it.
 
-    Timestamp adjustment, Overlap removal and the per-Chunk Checkpoint write belong to
-    the loop the next ticket adds, where there is more than one Chunk for them to matter
-    between. They are deliberately not faked here.
+    The three things that happen at a Chunk seam happen here and nowhere else: Tail
+    context is taken in by the call, the Chunk's own timestamps are shifted onto the
+    meeting's clock, and Overlap with the preceding Chunk is removed. The transcription
+    itself goes through the shared Failover loop, which owns retry and failover.
+
+    Returns '' if the Chunk could not be transcribed; the caller decides whether that
+    ends the run. Raises CancelledError, because a cancel is not a Chunk failure and the
+    remaining Chunks must stay resumable.
     """
-    index = 0
+    index = int(chunk["chunk_index"])
     report(PipelineReport(phase=Phase.CHUNK, key="chunk.working", index=index))
     try:
-        text = transcribe_audio_chunk(
+        raw_text = transcribe_audio_chunk(
             client=client,
-            chunk_file_path=settings.audio_path,
+            chunk_file_path=chunk["file_path"],
+            previous_tail_transcript=tail_context,
             progress_callback=lambda message: report(
                 PipelineReport(phase=Phase.STATUS, key="status.step3_detail",
                                args={"detail": message})
@@ -313,8 +420,44 @@ def _transcribe_the_recording(
         report(PipelineReport(phase=Phase.CHUNK, key="chunk.cancelled", index=index))
         raise
     except Exception as err:
+        # One Chunk failing is not the meeting failing. Say which Chunk and carry on, so
+        # the Chunks after it still get transcribed and the Transcript is only short by
+        # this one.
+        log.warning("Chunk %d could not be transcribed: %s", index, err)
         report(PipelineReport(phase=Phase.CHUNK, key="chunk.error", index=index,
                               args={"error": str(err)}))
-        raise
-    report(PipelineReport(phase=Phase.CHUNK, key="chunk.done", index=index))
-    return text
+        return ""
+
+    adjusted = adjust_chunk_timestamps(
+        raw_text, offset_seconds=float(chunk.get("offset_seconds") or 0.0)
+    )
+    if previous_text:
+        return deduplicate_overlap(previous_text, adjusted)
+    return adjusted
+
+
+TAIL_CONTEXT_LINES = 4
+"""How many lines of the previous Chunk's transcript carry across the seam."""
+
+
+def _tail_context(chunk_text: str) -> str:
+    """
+    The Tail context: the last few lines of a Chunk's transcript.
+
+    These are what the next Chunk is sent alongside its audio, so speaker names and
+    phrasing stay continuous across the seam. Taken from the Chunk's final text -- after
+    timestamp adjustment and Overlap removal -- because that is the text the Transcript
+    will contain and therefore the text that actually precedes the seam.
+    """
+    lines = [line for line in chunk_text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines[-TAIL_CONTEXT_LINES:])
+
+
+def _transcribe_percent(position: int, total: int) -> float:
+    """Where the progress bar sits for the Chunk at this position in the run."""
+    if total <= 1:
+        return TRANSCRIBE_START
+    span = TRANSCRIBE_DONE - TRANSCRIBE_START
+    return TRANSCRIBE_START + span * (position / total)
