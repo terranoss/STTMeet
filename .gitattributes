@@ -43,3 +43,4 @@
 
 # Lockfiles must not be rewritten
 *.lock     -text
+graphify-out/graph.json merge=graphify

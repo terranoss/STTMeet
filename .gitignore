@@ -119,3 +119,6 @@ Desktop.ini
 # Exported meeting documents (may contain confidential content)
 *.docx
 *.doc
+
+skills-lock.json
+.opencode/
