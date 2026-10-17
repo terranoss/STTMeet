@@ -1,13 +1,25 @@
 # Unit tests for STTMeet logic modules
 import ast
+import dataclasses
 import json
+import subprocess
+import sys
 import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.config import API_KEY_URL, DOCS_DIR, FALLBACK_MODELS, MINUTES_FALLBACK_MODELS
+REPO_ROOT = Path(__file__).resolve().parent
+
+from src.config import (
+    API_KEY_URL,
+    DOCS_DIR,
+    FALLBACK_MODELS,
+    MINUTES_FALLBACK_MODELS,
+    MINUTES_MODEL_NAME,
+    MODEL_NAME,
+)
 
 from src.transcript_processor import (
     parse_time_to_seconds,
@@ -87,6 +99,42 @@ from src.gemini_transcriber import (
     upload_and_wait_file,
 )
 from src.cancellation import CancelledError
+from src.pipeline import (
+    ENGINE_MODEL_OVERRIDES,
+    Phase,
+    PipelineSettings,
+    engine_for_model,
+    model_for_engine,
+    run_pipeline,
+)
+
+
+class RecordingObserver:
+    """
+    An observer that keeps every report the Pipeline run makes.
+
+    The Pipeline run's whole contract with a caller is what it reports, so a
+    test that asserts on this list is asserting on the seam, not on internals.
+    """
+
+    def __init__(self):
+        self.reports = []
+
+    def report(self, report):
+        self.reports.append(report)
+
+    def keys(self, phase=None):
+        return [r.key for r in self.reports if phase is None or r.phase == phase]
+
+    def steps(self):
+        """(step, badge state) for every step-badge report, in order."""
+        return [(r.key, r.state) for r in self.reports if r.phase == Phase.STEP]
+
+    def phases(self):
+        return [r.phase for r in self.reports]
+
+    def percents(self):
+        return [r.percent for r in self.reports if r.percent is not None]
 
 
 class FakeFilesApi:
@@ -1486,6 +1534,424 @@ def test_audio_setup_wizard_integration():
     assert hasattr(STTMeetApp, "_open_audio_setup_wizard")
     assert hasattr(STTMeetApp, "_open_audio_setup_wizard_manual")
 
+def pipeline_run_provider(transcript_text, minutes_text, transcription_lead=None, minutes_lead=None):
+    """
+    A fake Gemini client serving one whole-Audio-file transcription and one Minutes
+    synthesis.
+
+    The two leads default to what each Failover chain leads with on its own; a pinned
+    Engine makes them the same model, which then answers both calls in order. Any other
+    model being reached for is a test failure, because nothing here should fail over.
+    """
+    transcription_lead = transcription_lead or MODEL_NAME
+    minutes_lead = minutes_lead or MINUTES_MODEL_NAME
+    script = {transcription_lead: [transcript_text]}
+    if minutes_lead == transcription_lead:
+        script[minutes_lead].append(minutes_text)
+    else:
+        script[minutes_lead] = [minutes_text]
+    return FakeGeminiProvider(script)
+
+
+def a_recording_audio_file(directory):
+    """A stand-in Audio file on disk: enough bytes to be hashed."""
+    path = Path(directory) / "meeting.mp3"
+    path.write_bytes(b"not really an mp3, but it is a file with a hash")
+    return path
+
+
+def test_a_whole_pipeline_run_reports_what_it_is_doing_and_yields_transcript_and_minutes():
+    """
+    A Pipeline run is reachable without a window: an Audio file with Chunking
+    off goes in, a Transcript and Minutes come out, and the only thing the run
+    says to its caller is reports.
+    """
+    transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Setuju, kita teruskan."
+    minutes = "# Minit\n\n## Keputusan\nSetuju."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        observer = RecordingObserver()
+
+        result = run_pipeline(
+            settings, observer, client=pipeline_run_provider(transcript, minutes)
+        )
+
+    assert result.transcript == transcript
+    assert result.minutes == minutes
+
+    # Per-Chunk status arrives on one channel, distinguished by phase. With
+    # Chunking off the whole recording is the one Chunk, at index 0.
+    assert observer.keys(Phase.CHUNK) == ["chunk.working", "chunk.done"]
+    assert [r.index for r in observer.reports if r.phase == Phase.CHUNK] == [0, 0]
+
+    # All four steps are badged through the same channel.
+    assert observer.steps() == [
+        ("step1", "working"), ("step1", "done"),
+        ("step2", "working"), ("step2", "done"),
+        ("step3", "working"), ("step3", "done"),
+        ("step4", "working"), ("step4", "done"),
+    ]
+
+
+def test_a_minutes_failure_never_costs_the_transcript():
+    """The Transcript is worth more than the Minutes, and says so without raising."""
+    transcript = "[00:01] Speaker 1: Setuju."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        observer = RecordingObserver()
+        # Every model of the Minutes chain refuses for the day.
+        script = {model: [quota_failure_error()] for model in MINUTES_FALLBACK_MODELS}
+        script[MODEL_NAME] = [transcript]
+        provider = FakeGeminiProvider(script)
+
+        result = run_pipeline(settings, observer, client=provider)
+
+    assert result.transcript == transcript
+    assert result.minutes == ""
+    assert result.minutes_error
+    assert "status.minutes_failed" in observer.keys()
+    assert observer.steps()[-1] == ("step4", "error")
+    # The Chunk still finished, and the Transcript was assembled from it.
+    assert observer.keys(Phase.CHUNK) == ["chunk.working", "chunk.done"]
+
+
+def test_the_run_honours_the_engine_and_the_processing_language():
+    """The Engine leads both Failover chains; the Processing language reaches the prompt."""
+    transcript = "[00:01] Speaker 1: Setuju."
+    minutes = "# Action Minutes of Meeting"
+    pinned = "☁️ Gemini 3.8 Flash"
+    provider = pipeline_run_provider(transcript, minutes, "gemini-3.8-flash", "gemini-3.8-flash")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            engine=pinned, language="English",
+        )
+        observer = RecordingObserver()
+
+        result = run_pipeline(settings, observer, client=provider)
+
+    assert result.engine == "gemini-3.8-flash"
+    # Both calls went to the model the Engine pinned, and to no other model.
+    assert [call["model"] for call in provider.calls] == ["gemini-3.8-flash"] * 2
+    # The run said which Engine it is using, rather than the caller having to know.
+    engine_report = [r for r in observer.reports if r.key == "status.step3_engine"][0]
+    assert engine_report.args["engine"] == "gemini-3.8-flash"
+    # The Minutes were asked for in the Processing language.
+    minutes_prompt = provider.calls[1]["contents"][0]
+    assert "in English" in minutes_prompt
+    assert "Bahasa Melayu" not in minutes_prompt
+
+
+def test_every_report_a_run_makes_renders_from_its_key_and_args():
+    """
+    Reports carry a translation key and formatting arguments, never a finished
+    sentence: every one of them renders from the English table using only its own args.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        observer = RecordingObserver()
+
+        run_pipeline(settings, observer,
+                     client=pipeline_run_provider("[00:01] Speaker 1: Setuju.", "# Minit"))
+
+    reported = [r for r in observer.reports if r.phase in (Phase.STATUS, Phase.PROGRESS)]
+    assert reported
+    for report in reported:
+        assert has_key(report.key), report.key
+        rendered = translate(report.key, "en", **report.args)
+        assert rendered.strip()
+        # The formatting args are the sentence's variable parts; a run that handed over
+        # a finished sentence instead would have nowhere left to put them.
+        assert "{" not in rendered
+
+
+def test_a_run_defaults_to_what_the_desktop_app_persists():
+    """Both entry points start from the same settings, read once rather than copied."""
+    defaults = PipelineSettings(audio_path="anything.wav")
+
+    assert defaults.engine == DEFAULT_SETTINGS["engine"]
+    assert defaults.language == DEFAULT_SETTINGS["language"]
+    assert defaults.template == DEFAULT_SETTINGS["template"]
+    assert defaults.preprocess == DEFAULT_SETTINGS["preprocess"]
+    # Chunking is the one deliberate divergence: this run transcribes the whole
+    # recording as a single Chunk, so 0 rather than the desktop's default.
+    assert defaults.chunk_minutes == 0
+
+
+def test_a_cancelled_run_transcribes_nothing():
+    """A Pipeline run handed a set cancel event reports nothing and calls nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False)
+        observer = RecordingObserver()
+        provider = pipeline_run_provider("[00:01] Speaker 1: Setuju.", "# Minit")
+        already_cancelled = threading.Event()
+        already_cancelled.set()
+
+        try:
+            run_pipeline(settings, observer, cancel_event=already_cancelled, client=provider)
+            raise AssertionError("a cancelled Pipeline run should not return a result")
+        except CancelledError:
+            pass
+
+    assert provider.calls == []
+    assert observer.reports == []
+
+
+def test_preprocessing_decides_which_audio_is_transcribed_and_reports_its_own_progress():
+    """The whole recording is preprocessed first, and what Preprocessing says is reported."""
+    from src import pipeline as pipeline_module
+
+    transcript = "[00:01] Speaker 1: Setuju."
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        preprocessed = Path(tmp) / "preprocessed_meeting.mp3"
+        preprocessed.write_bytes(b"16kHz mono, allegedly")
+
+        def fake_preprocess(input_path, progress_callback=None, **kwargs):
+            assert input_path == str(audio)
+            for message in ("Converting audio (converting to 16kHz mono MP3)...",
+                            "Found existing optimized preprocessed audio."):
+                if progress_callback:
+                    progress_callback(message)
+            return str(preprocessed)
+
+        original = pipeline_module.preprocess_audio
+        pipeline_module.preprocess_audio = fake_preprocess
+        try:
+            settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=True)
+            observer = RecordingObserver()
+            provider = pipeline_run_provider(transcript, "# Minit")
+            run_pipeline(settings, observer, client=provider)
+        finally:
+            pipeline_module.preprocess_audio = original
+
+        uploaded = provider.files.uploads[0]["file"]
+
+    assert uploaded == str(preprocessed)
+    detail_reports = [r for r in observer.reports if r.key == "status.step1_detail"]
+    assert [r.args["detail"] for r in detail_reports] == [
+        "Converting audio (converting to 16kHz mono MP3)...",
+        "Found existing optimized preprocessed audio.",
+    ]
+    # Preprocessing was not skipped, and the run badged it so.
+    assert ("step1", "working") in observer.steps()
+    step1_done = [r for r in observer.reports
+                  if r.phase == Phase.STEP and r.key == "step1" and r.state == "done"][0]
+    assert step1_done.args["skipped"] is False
+
+
+def test_importing_the_pipeline_run_pulls_in_no_ui_toolkit():
+    """
+    Importing the Pipeline run on its own must not drag in a UI toolkit, the desktop
+    package, or the translation table: a headless caller has none of them and needs none
+    of them. Checked in a fresh interpreter so this suite's own imports cannot mask it.
+    """
+    script = (
+        "import sys\n"
+        "import src.pipeline\n"
+        "ui = sorted(m for m in sys.modules\n"
+        "           if m.split('.')[0] in ('tkinter', '_tkinter', 'customtkinter', 'darkdetect')\n"
+        "           or m.startswith('src.ui'))\n"
+        "table = sorted(m for m in sys.modules if m.startswith('src.i18n'))\n"
+        "print(ui)\nprint(table)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], cwd=str(REPO_ROOT),
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    ui_modules, translation_table = proc.stdout.strip().splitlines()[-2:]
+    assert ui_modules == "[]", ui_modules
+    assert translation_table == "[]", translation_table
+
+
+def test_the_pipeline_run_module_reaches_no_ui_package_and_no_translation_table():
+    """The rule behind the previous test, read off the module's own imports."""
+    tree = ast.parse((REPO_ROOT / "src" / "pipeline.py").read_text(encoding="utf-8"))
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+        elif isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+
+    assert not [name for name in imported if "ui" in name.split(".")]
+    assert not [name for name in imported if "tkinter" in name]
+    assert not [name for name in imported if name.endswith("i18n")]
+
+
+def test_the_pipeline_run_takes_its_settings_as_a_plain_data_object():
+    """
+    Settings are data, and nothing else: no widget handle, no live value to read off
+    another thread. That is what closes the thread-safety leak structurally.
+    """
+    assert dataclasses.is_dataclass(PipelineSettings)
+    fields = {f.name for f in dataclasses.fields(PipelineSettings)}
+    # A settings object carries values and nothing an observer could read state from.
+    assert not [
+        name for name in dir(PipelineSettings)
+        if not name.startswith("_") and name not in fields
+    ]
+    defaults = PipelineSettings(audio_path="anything.wav")
+    for name in fields - {"audio_path"}:
+        value = getattr(defaults, name)
+        assert isinstance(value, (str, bool, int)), (name, value)
+
+
+def test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk():
+    """The whole point of the second adapter: an Audio file in, two documents out."""
+    from src.headless import EXIT_OK, run_headless
+
+    transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Kita teruskan."
+    minutes = "# Minit Tindakan Mesyuarat\n\n## Tindakan\n- En. Razak: susun draf."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        outcome = run_headless(
+            str(audio), output_dir=tmp, preprocess=False,
+            client=pipeline_run_provider(transcript, minutes),
+        )
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+        assert outcome.exit_code == EXIT_OK
+        assert written == ["meeting_minutes.md", "meeting_transcript.md"]
+        assert Path(outcome.transcript_path).read_text(encoding="utf-8") == transcript
+        assert Path(outcome.minutes_path).read_text(encoding="utf-8") == minutes
+
+
+def test_a_headless_run_keeps_the_transcript_when_minutes_fail():
+    from src.headless import EXIT_NO_MINUTES, run_headless
+
+    transcript = "[00:01] Speaker 1: Setuju."
+    script = {model: [quota_failure_error()] for model in MINUTES_FALLBACK_MODELS}
+    script[MODEL_NAME] = [transcript]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        outcome = run_headless(
+            str(audio), output_dir=tmp, preprocess=False,
+            client=FakeGeminiProvider(script),
+        )
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+
+    assert outcome.exit_code == EXIT_NO_MINUTES
+    assert outcome.minutes_path is None
+    assert written == ["meeting_transcript.md"]
+
+
+def test_a_console_report_prints_its_key_and_arguments_without_a_translation_table():
+    """A headless reader gets the key and its args even when no wording is available."""
+    import io
+
+    from src.headless import ConsoleObserver
+    from src.pipeline import PipelineReport
+
+    stream = io.StringIO()
+    observer = ConsoleObserver(stream)
+    observer.report(PipelineReport(phase=Phase.STATUS, key="status.step3_chunk",
+                                   args={"index": 1, "total": 1}))
+    observer.report(PipelineReport(phase=Phase.CHUNK, key="chunk.done", index=0))
+    observer.report(PipelineReport(phase=Phase.STATUS, key="status.no.such.key"))
+
+    printed = stream.getvalue()
+    assert "[status] status.step3_chunk index=1 total=1" in printed
+    assert "[chunk] chunk.done (#0)" in printed
+    assert "status.no.such.key" in printed
+
+
+def test_the_headless_flag_on_the_entry_point_configures_the_run():
+    """--headless on the existing entry point reaches the headless adapter."""
+    import src.headless as headless_module
+    import main as entry_point
+
+    captured = {}
+
+    def fake_run_headless(audio_path, **kwargs):
+        captured["audio_path"] = audio_path
+        captured.update(kwargs)
+        return headless_module.HeadlessOutcome(exit_code=0, result=None)
+
+    original = headless_module.run_headless
+    headless_module.run_headless = fake_run_headless
+    try:
+        exit_code = entry_point.main([
+            "--headless", "meeting.mp3",
+            "--output-dir", "out",
+            "--engine", "gemini-3.5-flash-lite",
+            "--language", "English",
+            "--template", "board_governance",
+            "--no-preprocess",
+        ])
+    finally:
+        headless_module.run_headless = original
+
+    assert exit_code == 0
+    assert captured["audio_path"] == "meeting.mp3"
+    assert captured["output_dir"] == "out"
+    assert captured["engine"] == "☁️ Gemini 3.5 Flash Lite"
+    assert captured["language"] == "English"
+    assert captured["template"] == "board_governance"
+    assert captured["preprocess"] is False
+
+
+def test_the_engine_and_its_model_name_name_the_same_choice_both_ways():
+    for choice, model in ENGINE_MODEL_OVERRIDES.items():
+        assert model_for_engine(choice) == model
+        assert engine_for_model(model) == choice
+    # Auto-failover pins nothing, and is spelled out rather than left blank.
+    assert model_for_engine(DEFAULT_SETTINGS["engine"]) is None
+    assert model_for_engine("") is None
+
+
+def test_every_test_in_this_suite_is_registered_to_run():
+    """
+    main() calls tests from a hardcoded list, so a test that is defined but not
+    registered never runs and never fails. This suite has been bitten by that before,
+    so the list is checked against the file rather than trusted.
+    """
+    tree = ast.parse((REPO_ROOT / "test_pipeline.py").read_text(encoding="utf-8"))
+    defined = {
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    }
+    entry_point = [node for node in tree.body if isinstance(node, ast.If)]
+    registered = {
+        node.func.id
+        for block in entry_point
+        for node in ast.walk(block)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert defined, "no tests found to register"
+    assert defined <= registered, sorted(defined - registered)
+
+
+def test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why():
+    """A terminal gets an answer, not a traceback, when the recording cannot be read."""
+    from src.headless import EXIT_NO_TRANSCRIPT, run_headless
+
+    # Every model of the transcription chain refuses for the day.
+    provider = FakeGeminiProvider(
+        {model: [quota_failure_error()] for model in FALLBACK_MODELS}
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        outcome = run_headless(str(audio), output_dir=tmp, preprocess=False, client=provider)
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+
+    assert outcome.exit_code == EXIT_NO_TRANSCRIPT
+    assert outcome.transcript_path is None and outcome.minutes_path is None
+    assert written == []
+
+
 if __name__ == "__main__":
     test_audio_setup_wizard_integration()
     test_time_conversions()
@@ -1573,5 +2039,22 @@ if __name__ == "__main__":
     test_minutes_and_action_items_delegate_their_failure_policy_to_the_shared_module()
     test_minutes_keep_their_own_failover_chain_apart_from_transcription()
     test_tooltip_text_provider()
+    test_a_whole_pipeline_run_reports_what_it_is_doing_and_yields_transcript_and_minutes()
+    test_a_minutes_failure_never_costs_the_transcript()
+    test_the_run_honours_the_engine_and_the_processing_language()
+    test_every_report_a_run_makes_renders_from_its_key_and_args()
+    test_a_run_defaults_to_what_the_desktop_app_persists()
+    test_a_cancelled_run_transcribes_nothing()
+    test_preprocessing_decides_which_audio_is_transcribed_and_reports_its_own_progress()
+    test_importing_the_pipeline_run_pulls_in_no_ui_toolkit()
+    test_the_pipeline_run_module_reaches_no_ui_package_and_no_translation_table()
+    test_the_pipeline_run_takes_its_settings_as_a_plain_data_object()
+    test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk()
+    test_a_headless_run_keeps_the_transcript_when_minutes_fail()
+    test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why()
+    test_a_console_report_prints_its_key_and_arguments_without_a_translation_table()
+    test_the_headless_flag_on_the_entry_point_configures_the_run()
+    test_the_engine_and_its_model_name_name_the_same_choice_both_ways()
+    test_every_test_in_this_suite_is_registered_to_run()
     print("All unit tests passed successfully!")
 
