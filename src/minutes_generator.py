@@ -12,13 +12,30 @@ the exported documents read as mixed-language.
 """
 from typing import Dict, Any, Callable, Optional, List
 from google import genai
-from google.genai import types
 
-from .cancellation import CancelledError, cancellable_sleep, raise_if_cancelled
-from .config import MODEL_NAME, FALLBACK_MODELS, MINUTES_MODEL_NAME, MINUTES_FALLBACK_MODELS, MAX_OUTPUT_TOKENS
+from .config import MINUTES_MODEL_NAME, MINUTES_FALLBACK_MODELS
+from .gemini_failover import FailoverCall, generate_with_failover
 from .logger import get_logger
 
 log = get_logger(__name__)
+
+# Divergence between the generation call sites is deliberate and user-visible,
+# so it is spelled out here rather than inherited silently. The Minutes and
+# Action items paths happen to agree with Recap today; they are named apart so
+# that changing one path's policy cannot silently change another's.
+MINUTES_BACKOFF_STEP_SECONDS = 5
+MINUTES_TEMPERATURE = 0.2
+MINUTES_QUOTA_FAILURE_MESSAGE = (
+    "All available Gemini models ({models}) exceeded daily free quotas or failed.\n"
+    "Please check your Google AI Studio quota limits or retry tomorrow."
+)
+
+ACTION_ITEMS_BACKOFF_STEP_SECONDS = 5
+ACTION_ITEMS_TEMPERATURE = 0.2
+ACTION_ITEMS_QUOTA_FAILURE_MESSAGE = (
+    "All available Gemini models ({models}) exceeded daily free quotas or failed.\n"
+    "Please check your Google AI Studio quota limits or retry tomorrow."
+)
 
 # Template-based synthesis prompts structured per template and language.
 TEMPLATES_PROMPTS = {
@@ -484,7 +501,10 @@ def generate_meeting_minutes(
 ) -> str:
     """
     Synthesize meeting transcript into structured meeting minutes using the specified template.
-    Includes automatic retry with exponential backoff for temporary 503 spikes.
+
+    Retry, backoff, Quota failure detection and failover are owned by the shared
+    policy in gemini_failover; this module keeps the Minutes prompt table and
+    describes what makes a Minutes call different.
 
     Pass a threading.Event as cancel_event to abandon the run; raises CancelledError.
     """
@@ -501,64 +521,18 @@ def generate_meeting_minutes(
     preferred = model_override or MINUTES_MODEL_NAME
     models_to_try = [preferred] + [m for m in MINUTES_FALLBACK_MODELS if m != preferred]
 
-    for model_candidate in models_to_try:
-        raise_if_cancelled(cancel_event)
-        log.info("Attempting minutes generation with model: %s", model_candidate)
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                raise_if_cancelled(cancel_event)
-                log.info("Calling Gemini model '%s' for minutes synthesis (Attempt %d/%d)...", model_candidate, attempt, max_retries)
-                if progress_callback:
-                    progress_callback(f"Generating minutes with {model_candidate} (Attempt {attempt}/{max_retries})...")
-
-                response = client.models.generate_content(
-                    model=model_candidate,
-                    contents=[full_prompt],
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        temperature=0.2
-                    )
-                )
-                # The call cannot be interrupted; discard its result if a cancel
-                # was requested while it was in flight.
-                raise_if_cancelled(cancel_event)
-                result = response.text or ""
-                log.info("Meeting minutes generated successfully with '%s' (%d chars).", model_candidate, len(result))
-                return result
-
-            except CancelledError:
-                # Must precede the generic handler or the cancel would be retried.
-                raise
-
-            except Exception as e:
-                err_str = str(e)
-
-                # Check for 429 quota exhaustion specifically
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota exceeded" in err_str.lower():
-                    log.warning(
-                        "Quota exhausted for model '%s' during minutes synthesis. Triggering automatic failover.",
-                        model_candidate
-                    )
-                    if progress_callback:
-                        progress_callback(f"Quota reached for {model_candidate}. Auto-switching model...")
-                    break  # Try next model candidate immediately!
-
-                # Temporary 503 or transient network error
-                if attempt < max_retries:
-                    wait_sec = attempt * 5
-                    if progress_callback:
-                        progress_callback(f"Server busy. Retrying in {wait_sec}s (Attempt {attempt + 1}/{max_retries})...")
-                    if not cancellable_sleep(cancel_event, wait_sec):
-                        raise CancelledError("Retry backoff cancelled by user.")
-                else:
-                    log.error("All %d minutes synthesis attempts failed for '%s': %s", max_retries, model_candidate, err_str[:80])
-                    break
-
-    raise RuntimeError(
-        f"All available Gemini models ({', '.join(models_to_try)}) exceeded daily free quotas or failed.\n"
-        "Please check your Google AI Studio quota limits or retry tomorrow."
-    )
+    return generate_with_failover(client, FailoverCall(
+        description="minutes synthesis",
+        label="minutes",
+        contents=[full_prompt],
+        models=models_to_try,
+        max_retries=max_retries,
+        backoff_step=MINUTES_BACKOFF_STEP_SECONDS,
+        temperature=MINUTES_TEMPERATURE,
+        final_error=MINUTES_QUOTA_FAILURE_MESSAGE.format(models=", ".join(models_to_try)),
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    ))
 
 
 ACTION_ITEMS_PROMPTS = {
@@ -621,7 +595,10 @@ def generate_action_items(
 ) -> str:
     """
     Synthesize meeting transcript into a standalone Action Item Register.
-    Includes automatic retry with exponential backoff and candidate model failover.
+
+    Retry, backoff, Quota failure detection and failover are owned by the shared
+    policy in gemini_failover; this module keeps the Action items prompt table
+    and describes what makes an Action items call different.
     """
     log.info(
         "Generating action items in language '%s' (transcript length: %d chars)",
@@ -636,58 +613,18 @@ def generate_action_items(
     preferred = model_override or MINUTES_MODEL_NAME
     models_to_try = [preferred] + [m for m in MINUTES_FALLBACK_MODELS if m != preferred]
 
-    for model_candidate in models_to_try:
-        raise_if_cancelled(cancel_event)
-        log.info("Attempting action items generation with model: %s", model_candidate)
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                raise_if_cancelled(cancel_event)
-                log.info("Calling Gemini model '%s' for action items (Attempt %d/%d)...", model_candidate, attempt, max_retries)
-                if progress_callback:
-                    progress_callback(f"Generating action items with {model_candidate} (Attempt {attempt}/{max_retries})...")
-
-                response = client.models.generate_content(
-                    model=model_candidate,
-                    contents=[full_prompt],
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        temperature=0.2
-                    )
-                )
-                raise_if_cancelled(cancel_event)
-                result = response.text or ""
-                log.info("Action items generated successfully with '%s' (%d chars).", model_candidate, len(result))
-                return result
-
-            except CancelledError:
-                raise
-
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota exceeded" in err_str.lower():
-                    log.warning(
-                        "Quota exhausted for model '%s' during action items synthesis. Auto-switching candidate.",
-                        model_candidate
-                    )
-                    if progress_callback:
-                        progress_callback(f"Quota reached for {model_candidate}. Auto-switching model...")
-                    break
-
-                if attempt < max_retries:
-                    wait_sec = attempt * 5
-                    if progress_callback:
-                        progress_callback(f"Server busy. Retrying in {wait_sec}s (Attempt {attempt + 1}/{max_retries})...")
-                    if not cancellable_sleep(cancel_event, wait_sec):
-                        raise CancelledError("Retry backoff cancelled by user.")
-                else:
-                    log.error("All %d action items synthesis attempts failed for '%s': %s", max_retries, model_candidate, err_str[:80])
-                    break
-
-    raise RuntimeError(
-        f"All available Gemini models ({', '.join(models_to_try)}) exceeded daily free quotas or failed.\n"
-        "Please check your Google AI Studio quota limits or retry tomorrow."
-    )
+    return generate_with_failover(client, FailoverCall(
+        description="action items synthesis",
+        label="action items",
+        contents=[full_prompt],
+        models=models_to_try,
+        max_retries=max_retries,
+        backoff_step=ACTION_ITEMS_BACKOFF_STEP_SECONDS,
+        temperature=ACTION_ITEMS_TEMPERATURE,
+        final_error=ACTION_ITEMS_QUOTA_FAILURE_MESSAGE.format(models=", ".join(models_to_try)),
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    ))
 
 
 def parse_minutes_sections(minutes_text: str) -> Dict[str, str]:

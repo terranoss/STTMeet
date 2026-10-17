@@ -65,6 +65,8 @@ from src.session_store import (
 from src.minutes_generator import (
     ACTION_ITEMS_PROMPTS,
     TEMPLATES_PROMPTS,
+    generate_action_items,
+    generate_meeting_minutes,
     get_synthesis_prompt,
     get_action_items_prompt,
     parse_minutes_sections,
@@ -948,6 +950,177 @@ def test_resource_is_released_even_when_a_models_sweep_fails():
     assert released == ["upload"]
 
 
+def minutes_failover_chain(lead_model):
+    """The Failover chain the Minutes path walks when the Engine pins a model."""
+    return [lead_model] + [m for m in MINUTES_FALLBACK_MODELS if m != lead_model]
+
+
+def test_minutes_path_fails_over_to_the_next_model_on_a_quota_failure():
+    """Minutes delegates Quota failure handling, so it behaves as Recap does."""
+    chain = minutes_failover_chain("model-a")
+    lead, fallback = chain[0], chain[1]
+    provider = FakeGeminiProvider({
+        lead: [quota_failure_error()],
+        fallback: ["# Minutes from the fallback model"],
+    })
+
+    minutes = generate_meeting_minutes(
+        provider, "a long transcript", language="English", model_override=lead
+    )
+
+    assert minutes == "# Minutes from the fallback model"
+    # A Quota failure ends this model's retry sweep at once, exactly as it does
+    # for the Recap path.
+    assert provider.attempts_on(lead) == 1
+    assert provider.attempts_on(fallback) == 1
+
+
+def test_minutes_path_retries_a_transient_error_with_backoff_then_answers():
+    """A transient fault spends the retry count, then Minutes answers."""
+    chain = minutes_failover_chain("model-a")
+    lead = chain[0]
+    provider = FakeGeminiProvider({
+        lead: [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            "# Minutes from model-a",
+        ],
+    })
+    messages = []
+    waits = []
+    from src import gemini_failover
+
+    original_sleep = gemini_failover.cancellable_sleep
+    # Backoff is a boundary of the shared policy, so record the waits it asks
+    # for instead of spending them.
+    gemini_failover.cancellable_sleep = lambda cancel_event, seconds: waits.append(seconds) or True
+    try:
+        minutes = generate_meeting_minutes(
+            provider, "a long transcript", language="English", model_override=lead,
+            progress_callback=messages.append,
+        )
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert minutes == "# Minutes from model-a"
+    # Today's Minutes path backs off by attempt * 5 seconds...
+    assert waits == [5, 10]
+    # ...and pins the text-generation temperature.
+    assert provider.calls[0]["config"]["temperature"] == 0.2
+    # The progress wording a user reads is unchanged.
+    assert "Server busy. Retrying in 5s (Attempt 2/3)..." in messages
+    assert "Server busy. Retrying in 10s (Attempt 3/3)..." in messages
+    assert "Generating minutes with %s (Attempt 1/3)..." % lead in messages
+
+
+def test_minutes_quota_failure_message_is_unchanged():
+    chain = minutes_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        generate_meeting_minutes(
+            provider, "a long transcript", language="English", model_override="model-a"
+        )
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please check your Google AI Studio quota limits or retry tomorrow." % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+def test_minutes_and_action_items_delegate_their_failure_policy_to_the_shared_module():
+    """The Quota failure predicate is written once, and both paths use that one."""
+    source = (Path(__file__).parent / "src" / "minutes_generator.py").read_text(encoding="utf-8")
+
+    assert "RESOURCE_EXHAUSTED" not in source
+    assert "quota exceeded" not in source
+    assert "is_quota_failure" not in source
+    # Both generation paths hand their request to the shared policy.
+    assert source.count("generate_with_failover(client") == 2
+
+
+def test_action_items_path_fails_over_to_the_next_model_on_a_quota_failure():
+    """Action items delegates Quota failure handling, so it behaves as Recap does."""
+    chain = minutes_failover_chain("model-a")
+    lead, fallback = chain[0], chain[1]
+    provider = FakeGeminiProvider({
+        lead: [quota_failure_error()],
+        fallback: ["| 1 | Draft the brief | Deen | 2026-01-01 | Open |"],
+    })
+
+    register = generate_action_items(
+        provider, "a long transcript", language="English", model_override=lead
+    )
+
+    assert register == "| 1 | Draft the brief | Deen | 2026-01-01 | Open |"
+    # A Quota failure ends this model's retry sweep at once, exactly as it does
+    # for the Recap path.
+    assert provider.attempts_on(lead) == 1
+    assert provider.attempts_on(fallback) == 1
+
+
+def test_action_items_path_retries_a_transient_error_with_backoff_then_answers():
+    """A transient fault spends the retry count, then Action items answers."""
+    chain = minutes_failover_chain("model-a")
+    lead = chain[0]
+    provider = FakeGeminiProvider({
+        lead: [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            "| 1 | Draft the brief | Deen | 2026-01-01 | Open |",
+        ],
+    })
+    messages = []
+    waits = []
+    from src import gemini_failover
+
+    original_sleep = gemini_failover.cancellable_sleep
+    gemini_failover.cancellable_sleep = lambda cancel_event, seconds: waits.append(seconds) or True
+    try:
+        register = generate_action_items(
+            provider, "a long transcript", language="English", model_override=lead,
+            progress_callback=messages.append,
+        )
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert register == "| 1 | Draft the brief | Deen | 2026-01-01 | Open |"
+    # Today's Action items path backs off by attempt * 5 seconds...
+    assert waits == [5, 10]
+    # ...and pins the text-generation temperature.
+    assert provider.calls[0]["config"]["temperature"] == 0.2
+    # The progress wording a user reads is unchanged.
+    assert "Server busy. Retrying in 5s (Attempt 2/3)..." in messages
+    assert "Generating action items with %s (Attempt 1/3)..." % lead in messages
+
+
+def test_action_items_quota_failure_message_is_unchanged():
+    chain = minutes_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        generate_action_items(
+            provider, "a long transcript", language="English", model_override="model-a"
+        )
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please check your Google AI Studio quota limits or retry tomorrow." % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+def test_minutes_keep_their_own_failover_chain_apart_from_transcription():
+    """The Minutes Failover chain is not the transcription Failover chain."""
+    from src.config import FALLBACK_MODELS, MINUTES_FALLBACK_MODELS, MINUTES_MODEL_NAME, MODEL_NAME
+
+    assert MINUTES_MODEL_NAME != MODEL_NAME
+    assert MINUTES_FALLBACK_MODELS != FALLBACK_MODELS
+
+
 def test_tooltip_text_provider():
     from src.ui.tooltip import Tooltip
 
@@ -1046,6 +1219,14 @@ if __name__ == "__main__":
     test_recap_path_keeps_its_backoff_step_and_temperature()
     test_recap_quota_failure_message_is_unchanged()
     test_recap_path_delegates_its_failure_policy_to_the_shared_module()
+    test_minutes_path_fails_over_to_the_next_model_on_a_quota_failure()
+    test_minutes_quota_failure_message_is_unchanged()
+    test_minutes_path_retries_a_transient_error_with_backoff_then_answers()
+    test_action_items_path_fails_over_to_the_next_model_on_a_quota_failure()
+    test_action_items_path_retries_a_transient_error_with_backoff_then_answers()
+    test_action_items_quota_failure_message_is_unchanged()
+    test_minutes_and_action_items_delegate_their_failure_policy_to_the_shared_module()
+    test_minutes_keep_their_own_failover_chain_apart_from_transcription()
     test_tooltip_text_provider()
     print("All unit tests passed successfully!")
 
