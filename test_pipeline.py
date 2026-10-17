@@ -4,8 +4,9 @@ import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
-from src.config import API_KEY_URL, DOCS_DIR
+from src.config import API_KEY_URL, DOCS_DIR, MINUTES_FALLBACK_MODELS
 
 from src.transcript_processor import (
     parse_time_to_seconds,
@@ -71,7 +72,47 @@ from src.minutes_generator import (
 from src.recap_generator import (
     RECAP_PROMPTS,
     get_recap_prompt,
+    generate_meeting_recap,
 )
+from src.gemini_failover import (
+    FailoverCall,
+    generate_with_failover,
+    is_quota_failure,
+)
+
+
+class FakeGeminiProvider:
+    """
+    Scripted stand-in for the Gemini client used by the Failover chain.
+
+    Costs no quota and makes no network call. Each model in the script gets a
+    list of outcomes consumed one per call: a string comes back as the
+    response text, an exception is raised for the caller to deal with.
+    """
+
+    def __init__(self, script):
+        self._script = {model: list(outcomes) for model, outcomes in script.items()}
+        self.calls = []
+        self.models = SimpleNamespace(generate_content=self._generate_content)
+
+    def _generate_content(self, model, contents, config):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        outcomes = self._script.get(model)
+        if not outcomes:
+            raise AssertionError("FakeGeminiProvider: unexpected call to model '%s'" % model)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(text=outcome)
+
+    def attempts_on(self, model):
+        """How many times the Failover chain reached for this model."""
+        return sum(1 for call in self.calls if call["model"] == model)
+
+
+def quota_failure_error():
+    """The provider's own wording for a Quota failure."""
+    return RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded for this project")
 
 def test_time_conversions():
     assert parse_time_to_seconds("01:30") == 90
@@ -664,6 +705,249 @@ def test_weak_model_diarization_policy():
     assert has_key("msg.speaker_mapping_weak_model")
     assert has_key("settings.chunk_note")
 
+def test_quota_failure_skips_retries_and_fails_over_to_the_next_model():
+    provider = FakeGeminiProvider({
+        "model-a": [quota_failure_error()],
+        "model-b": ["# Recap from model-b"],
+    })
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        max_retries=3,
+        backoff_step=0,
+        temperature=0.2,
+        final_error="no model left in the chain",
+    )
+
+    result = generate_with_failover(provider, call)
+
+    assert result == "# Recap from model-b"
+    # A Quota failure ends this model's retry sweep at once, so model-a is
+    # reached for exactly once despite max_retries being 3.
+    assert provider.attempts_on("model-a") == 1
+    assert provider.attempts_on("model-b") == 1
+
+
+def test_transient_error_retries_with_backoff_then_fails_over():
+    provider = FakeGeminiProvider({
+        "model-a": [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+        ],
+        "model-b": ["# Recap from model-b"],
+    })
+    messages = []
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        max_retries=3,
+        backoff_step=0,
+        temperature=0.2,
+        final_error="no model left in the chain",
+        progress_callback=messages.append,
+    )
+
+    result = generate_with_failover(provider, call)
+
+    assert result == "# Recap from model-b"
+    # Three transient failures spend the retry count for model-a before the
+    # chain moves on; the backoff in between is reported at attempt * step.
+    assert provider.attempts_on("model-a") == 3
+    assert provider.attempts_on("model-b") == 1
+    assert "Server busy. Retrying in 0s (Attempt 2/3)..." in messages
+    assert "Server busy. Retrying in 0s (Attempt 3/3)..." in messages
+
+
+def test_success_ends_the_failover_chain_without_touching_later_models():
+    provider = FakeGeminiProvider({
+        "model-a": ["# Recap from model-a"],
+        "model-b": ["# Recap nobody asked for"],
+    })
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        backoff_step=0,
+        temperature=0.2,
+    )
+
+    assert generate_with_failover(provider, call) == "# Recap from model-a"
+    assert provider.attempts_on("model-b") == 0
+
+
+def test_exhausted_failover_chain_raises_the_calls_final_error():
+    provider = FakeGeminiProvider({
+        "model-a": [quota_failure_error()],
+        "model-b": [quota_failure_error()],
+    })
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        backoff_step=0,
+        temperature=0.2,
+        final_error="Both models are out of allowance today.",
+    )
+
+    try:
+        generate_with_failover(provider, call)
+    except RuntimeError as error:
+        assert str(error) == "Both models are out of allowance today."
+    else:
+        raise AssertionError("an exhausted Failover chain must raise RuntimeError")
+
+
+def test_quota_failure_predicate_separates_quota_from_transient_errors():
+    assert is_quota_failure(RuntimeError("429 Too Many Requests")) is True
+    assert is_quota_failure(RuntimeError("RESOURCE_EXHAUSTED")) is True
+    assert is_quota_failure(RuntimeError("Quota exceeded for the day")) is True
+    assert is_quota_failure(RuntimeError("503 UNAVAILABLE: overloaded")) is False
+
+
+def recap_failover_chain(lead_model):
+    """The Failover chain the Recap path walks when the Engine pins a model."""
+    return [lead_model] + [m for m in MINUTES_FALLBACK_MODELS if m != lead_model]
+
+
+def test_recap_path_keeps_its_backoff_step_and_temperature():
+    """Divergence from the other call sites is deliberate, so it stays pinned."""
+    from src import gemini_failover
+
+    waits = []
+    original_sleep = gemini_failover.cancellable_sleep
+    # Backoff is a boundary of this policy, so record the waits it asks for
+    # instead of spending them.
+    gemini_failover.cancellable_sleep = lambda cancel_event, seconds: waits.append(seconds) or True
+    try:
+        provider = FakeGeminiProvider({
+            "model-a": [RuntimeError("503 UNAVAILABLE"), RuntimeError("503 UNAVAILABLE"), "# Recap from model-a"],
+        })
+        recap = generate_meeting_recap(
+            provider, "a long transcript", language="English", model_override="model-a"
+        )
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert recap == "# Recap from model-a"
+    # Today's Recap path backs off by attempt * 5 seconds...
+    assert waits == [5, 10]
+    # ...and pins the text-generation temperature.
+    assert provider.calls[0]["config"]["temperature"] == 0.2
+
+
+def test_recap_quota_failure_message_is_unchanged():
+    chain = recap_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        generate_meeting_recap(provider, "a long transcript", language="English", model_override="model-a")
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please check your Google AI Studio quota limits or retry tomorrow." % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+def test_recap_path_delegates_its_failure_policy_to_the_shared_module():
+    """The Quota failure predicate is written once, and Recap uses that one."""
+    source = (Path(__file__).parent / "src" / "recap_generator.py").read_text(encoding="utf-8")
+
+    assert "RESOURCE_EXHAUSTED" not in source
+    assert "quota exceeded" not in source
+    assert "generate_with_failover" in source
+    assert "is_quota_failure" not in source
+
+
+def test_failover_policy_module_owns_the_policy_and_nothing_else():
+    """The policy is a sibling of cancellation, not a client of the generators."""
+    source = (Path(__file__).parent / "src" / "gemini_failover.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+
+    allowed = {"dataclasses", "typing", "cancellation", "config", "logger"}
+    assert imported <= allowed, "unexpected imports: %s" % sorted(imported - allowed)
+
+
+def test_failover_description_carries_no_provider_types():
+    """A caller can describe its request in plain data, with no provider objects."""
+    for field in FailoverCall.__dataclass_fields__.values():
+        annotation = str(field.type)
+        assert "genai" not in annotation and "types." not in annotation, annotation
+
+
+def test_resource_lifecycle_brackets_one_models_whole_retry_sweep():
+    provider = FakeGeminiProvider({
+        "model-a": [RuntimeError("503 UNAVAILABLE"), RuntimeError("503 UNAVAILABLE")],
+        "model-b": ["# Recap from model-b"],
+    })
+    prepared = []
+    released = []
+
+    def prepare(model):
+        prepared.append(model)
+        return f"upload for {model}"
+
+    def cleanup(resource):
+        released.append(resource)
+
+    call = FailoverCall(
+        description="chunk transcription",
+        label="transcription",
+        contents=["audio", "prompt"],
+        models=["model-a", "model-b"],
+        max_retries=2,
+        backoff_step=0,
+        temperature=0.1,
+        prepare=prepare,
+        cleanup=cleanup,
+    )
+
+    assert generate_with_failover(provider, call) == "# Recap from model-b"
+    # Each model uploads before its retry sweep and releases afterwards, so a
+    # retry reuses the upload instead of paying for it again.
+    assert prepared == ["model-a", "model-b"]
+    assert released == ["upload for model-a", "upload for model-b"]
+
+
+def test_resource_is_released_even_when_a_models_sweep_fails():
+    provider = FakeGeminiProvider({"model-a": [RuntimeError("503 UNAVAILABLE")]})
+    released = []
+
+    call = FailoverCall(
+        description="chunk transcription",
+        label="transcription",
+        contents=["audio", "prompt"],
+        models=["model-a"],
+        max_retries=1,
+        backoff_step=0,
+        prepare=lambda model: "upload",
+        cleanup=released.append,
+    )
+
+    try:
+        generate_with_failover(provider, call)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an exhausted Failover chain must raise RuntimeError")
+    assert released == ["upload"]
+
+
 def test_tooltip_text_provider():
     from src.ui.tooltip import Tooltip
 
@@ -750,6 +1034,18 @@ if __name__ == "__main__":
     test_recap_prompts()
     test_action_items_prompts()
     test_weak_model_diarization_policy()
+    test_quota_failure_predicate_separates_quota_from_transient_errors()
+    test_quota_failure_skips_retries_and_fails_over_to_the_next_model()
+    test_transient_error_retries_with_backoff_then_fails_over()
+    test_success_ends_the_failover_chain_without_touching_later_models()
+    test_exhausted_failover_chain_raises_the_calls_final_error()
+    test_resource_lifecycle_brackets_one_models_whole_retry_sweep()
+    test_resource_is_released_even_when_a_models_sweep_fails()
+    test_failover_policy_module_owns_the_policy_and_nothing_else()
+    test_failover_description_carries_no_provider_types()
+    test_recap_path_keeps_its_backoff_step_and_temperature()
+    test_recap_quota_failure_message_is_unchanged()
+    test_recap_path_delegates_its_failure_policy_to_the_shared_module()
     test_tooltip_text_provider()
     print("All unit tests passed successfully!")
 
