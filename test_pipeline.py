@@ -70,11 +70,13 @@ from src.ui.theme import (
 )
 from src.session_store import (
     DEFAULT_SETTINGS,
+    MINUTES_CACHE_VERSION,
     SCHEMA_VERSION,
     VALID_LANGUAGES,
     VALID_TEMPLATES,
     build_session_payload,
     load_session,
+    minutes_cache_is_current,
     normalize_settings,
     save_session,
     session_path
@@ -382,6 +384,92 @@ def test_session_loads_v1_without_settings():
         assert loaded["status"]["chunks"] == []
         assert loaded["processed_transcript"] == "old transcript"
         assert loaded["speaker_mapping"] == {}
+
+def test_a_session_saved_and_reloaded_at_the_current_cache_version_still_uses_its_minutes():
+    """
+    The per-Template cache exists so the same Minutes are never paid for twice, so a
+    session written by this build and read back by this build still finds them. The
+    version is checked over the real round trip through disk, because a version that
+    did not survive the write would silently turn every cache into a miss.
+    """
+    minutes = "# Minit Tindakan Mesyuarat\n\n- En. Razak: susun draf (00:04)."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "session_anchored.json"
+        payload = build_session_payload(
+            audio_hash="anchored",
+            audio_path=None,
+            settings=_sample_settings(),
+            status=_sample_status(),
+            generated_minutes=minutes,
+            cached_minutes_by_template={"action_minutes": minutes},
+        )
+        assert save_session(payload, path)
+
+        loaded = load_session(path)
+
+    assert loaded is not None
+    assert loaded["cached_minutes_by_template"]["action_minutes"] == minutes
+    assert minutes_cache_is_current(loaded) is True
+
+
+def test_a_session_cached_before_time_anchors_existed_reads_as_a_cache_miss():
+    """
+    Minutes cached before anchors existed are a document in which the feature appears
+    to do nothing, so they must read as a miss and be generated again. A session with
+    no version recorded at all is what every pre-anchor session looks like, and it is
+    older than any version number rather than a current one.
+    """
+    stale = "# Minit Tindakan Mesyuarat\n\n- En. Razak: susun draf."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        versionless = Path(tmp) / "session_pre_anchor.json"
+        versionless.write_text(json.dumps({
+            "audio_hash": "pre-anchor",
+            "generated_minutes": stale,
+            "cached_minutes_by_template": {"action_minutes": stale},
+        }), encoding="utf-8")
+
+        older = Path(tmp) / "session_older_version.json"
+        older.write_text(json.dumps({
+            "audio_hash": "older",
+            "generated_minutes": stale,
+            "minutes_cache_version": MINUTES_CACHE_VERSION - 1,
+            "cached_minutes_by_template": {"action_minutes": stale},
+        }), encoding="utf-8")
+
+        pre_anchor = load_session(versionless)
+        from_before = load_session(older)
+
+    # The entries are still carried, so nothing is lost by the miss -- what changes is
+    # that this build is no longer willing to serve them as its own output.
+    assert pre_anchor["cached_minutes_by_template"]["action_minutes"] == stale
+    assert from_before["cached_minutes_by_template"]["action_minutes"] == stale
+    assert minutes_cache_is_current(pre_anchor) is False
+    assert minutes_cache_is_current(from_before) is False
+
+
+def test_a_session_reopen_only_serves_minutes_this_build_could_have_written():
+    """
+    The version only earns its keep where the cache is restored, so reopening a
+    session has to consult it -- otherwise a pre-anchor document comes back and the
+    feature appears to do nothing. Driving that method needs a real window, and this
+    suite constructs no widgets, so this scans the method's own body, which is the same
+    trade the generation-thread test makes.
+    """
+    source = (REPO_ROOT / "src" / "ui" / "app_window.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    app = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "STTMeetApp")
+    restore = next(node for node in app.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "_load_full_session_if_exists")
+
+    restore_source = ast.get_source_segment(source, restore)
+
+    assert "minutes_cache_is_current" in restore_source, (
+        "reopening a session must not serve Minutes cached by prompts that differ from this build's"
+    )
+
 
 def test_normalize_settings_rejects_stale_values():
     stale = {
@@ -794,7 +882,44 @@ def test_prefs_roundtrip_and_tolerance():
             prefs_module.PREFS_PATH = original_path
     assert original_dir is not None
 
+# The metadata field each Template's own prompt writes its meeting time into. A rule
+# written in the prompt's own language has to name that field in that language, so a
+# Bahasa Melayu prompt cannot satisfy this with the English rule pasted in.
+ANCHOR_RULE_METADATA_FIELDS = {
+    ("action_minutes", "English"): "Date & Time",
+    ("action_minutes", "Bahasa Melayu"): "Tarikh & Masa",
+    ("discussion_minutes", "English"): "Date & Time",
+    ("discussion_minutes", "Bahasa Melayu"): "Tarikh & Masa",
+    ("three_column", "English"): "Meeting Date",
+    ("three_column", "Bahasa Melayu"): "Tarikh Mesyuarat",
+    ("board_governance", "English"): "Date & Time",
+    ("board_governance", "Bahasa Melayu"): "Tarikh & Masa",
+}
+
+
+def _anchor_rule_block(prompt: str) -> str:
+    """
+    The trailing paragraph before the Transcript marker, which is where the rule sits.
+
+    Placement is part of what is being promised: the rule reads as the last thing said
+    about the document, after the last content section and before the transcript it
+    points into. Taking the final paragraph is therefore the whole of the definition.
+    """
+    marker = "TRANSKRIP MESYUARAT:" if "TRANSKRIP MESYUARAT:" in prompt else "TRANSCRIPT:"
+    paragraphs = [p.strip() for p in prompt.split(marker)[0].split("\n\n") if p.strip()]
+    return paragraphs[-1] if paragraphs else ""
+
+
 def test_template_prompts_and_displays():
+    """
+    Every Template, in both languages, is a Template a caller can get anchors from.
+
+    The rule's wording is deliberately not pinned. It is prose written for a model to
+    follow, and a test that quoted it would break on every rewording while proving
+    nothing about what actually matters -- that all eight prompts carry a rule, that
+    each gives the anchor format, and that each says so in its own language. Those are
+    structural, and they are what can go wrong.
+    """
     assert set(VALID_TEMPLATES) == set(TEMPLATE_DISPLAY.keys())
     assert set(VALID_TEMPLATES) == set(TEMPLATES_PROMPTS.keys())
     for tmpl in VALID_TEMPLATES:
@@ -803,6 +928,32 @@ def test_template_prompts_and_displays():
         for lang in VALID_LANGUAGES:
             prompt = get_synthesis_prompt(template=tmpl, language=lang)
             assert "{transcript}" in prompt
+
+            rule = _anchor_rule_block(prompt)
+            assert rule, f"{tmpl}/{lang} carries no anchor rule"
+            # The anchor format itself, both ways round: the minute form every item
+            # takes, and the hour form past one hour that matches the Transcript's
+            # own markers. Neither is stated as an example that cannot be mistaken
+            # for something else -- both appear as a parenthesised time.
+            assert re.search(r"\(\d{1,2}:\d{2}\)", rule), f"{tmpl}/{lang}: no minute form"
+            assert re.search(r"\(\d{1,2}:\d{2}:\d{2}\)", rule), f"{tmpl}/{lang}: no hour form"
+            # Own language: the rule names the metadata field this prompt actually
+            # writes, as that prompt spells it. An English rule in a Bahasa Melayu
+            # prompt names a field this prompt does not have.
+            field = ANCHOR_RULE_METADATA_FIELDS[(tmpl, lang)]
+            assert field in rule, f"{tmpl}/{lang}: rule does not name '{field}'"
+
+    # The rule is not one English paragraph reused everywhere: each language's rule is
+    # its own, and the English action-minutes rule appears in no Bahasa Melayu prompt.
+    for tmpl in VALID_TEMPLATES:
+        english_rule = _anchor_rule_block(get_synthesis_prompt(template=tmpl, language="English"))
+        melayu_rule = _anchor_rule_block(get_synthesis_prompt(template=tmpl, language="Bahasa Melayu"))
+        assert english_rule != melayu_rule, f"{tmpl}: both languages carry the same rule"
+
+    seeded = _anchor_rule_block(get_synthesis_prompt(template="action_minutes", language="English"))
+    for tmpl in VALID_TEMPLATES:
+        melayu_prompt = get_synthesis_prompt(template=tmpl, language="Bahasa Melayu")
+        assert seeded not in melayu_prompt, f"{tmpl}: English rule pasted into a Malay prompt"
 
 def test_parse_minutes_sections_for_templates():
     three_col_sample = """# Three-Column Meeting Minutes
@@ -2005,7 +2156,10 @@ def test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk():
     from src.headless import EXIT_OK, run_headless
 
     transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Kita teruskan."
-    minutes = "# Minit Tindakan Mesyuarat\n\n## Tindakan\n- En. Razak: susun draf."
+    minutes = (
+        "# Minit Tindakan Mesyuarat\n\n## Tindakan\n"
+        "- En. Razak: susun draf (00:04).\n- En. Lee: semak kos (1:07:45)."
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         audio = a_recording_audio_file(tmp)
@@ -2018,6 +2172,34 @@ def test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk():
         assert written == ["meeting_minutes.md", "meeting_transcript.md"]
         assert Path(outcome.transcript_path).read_text(encoding="utf-8") == transcript
         assert Path(outcome.minutes_path).read_text(encoding="utf-8") == minutes
+        # Anchors reach disk untouched, both ways round. Nothing on this path reads
+        # the minutes, so nothing here could have dropped one.
+        on_disk = Path(outcome.minutes_path).read_text(encoding="utf-8")
+        assert "(00:04)" in on_disk and "(1:07:45)" in on_disk
+
+
+def test_the_headless_adapter_never_consults_the_export_writers():
+    """
+    A terminal run gets anchors without a flag, because this adapter writes what the
+    Pipeline run produced and never calls the export writers -- the only place a
+    document is reformatted on its way out. A source scan, because that is a claim
+    about every line of the module rather than about one run, and a test that ran it
+    could only ever prove the branch it happened to take.
+    """
+    source = (REPO_ROOT / "src" / "headless.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert not [name for name in called if name.startswith("export_to_")], (
+        "the headless adapter must write its own documents, not through the exporters"
+    )
+    assert "exporter" not in source
+    # No switch for it either: anchors are what the run produces, not an option.
+    assert "anchor" not in source.lower()
 
 
 def test_a_headless_run_keeps_the_transcript_when_minutes_fail():
@@ -3695,6 +3877,9 @@ if __name__ == "__main__":
     test_session_roundtrip()
     test_session_never_stores_api_key()
     test_session_loads_v1_without_settings()
+    test_a_session_saved_and_reloaded_at_the_current_cache_version_still_uses_its_minutes()
+    test_a_session_cached_before_time_anchors_existed_reads_as_a_cache_miss()
+    test_a_session_reopen_only_serves_minutes_this_build_could_have_written()
     test_normalize_settings_rejects_stale_values()
     test_load_session_missing_and_corrupt()
     test_every_string_has_english_and_malay()
@@ -3787,6 +3972,7 @@ if __name__ == "__main__":
     test_the_pipeline_run_module_reaches_no_ui_package_and_no_translation_table()
     test_the_pipeline_run_takes_its_settings_as_a_plain_data_object()
     test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk()
+    test_the_headless_adapter_never_consults_the_export_writers()
     test_a_headless_run_keeps_the_transcript_when_minutes_fail()
     test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why()
     test_chunking_splits_a_long_audio_file_and_every_chunk_is_transcribed()

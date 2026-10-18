@@ -90,6 +90,9 @@ Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Tindakan Mesyuarat (Act
 * **Tarikh & Masa:** [Tarikh & Masa jika dibincangkan]  
 * **Agenda Cadangan:** [Perkara utama untuk sesi akan datang]  
 
+PENANDA MASA:
+Tutup setiap titik senarai, setiap ayat dalam perenggan, dan setiap sel jadual dengan satu penanda masa dalam kurungan yang menunjukkan tempat dalam transkrip mana kandungan itu dicatat — contohnya (12:34). Salin masa itu daripada penanda berkurungan pada giliran transkrip yang ia datang daripada ([12:34]) dan buang kurungannya; apabila penanda itu sendiri membawa jam ([01:12:34]), penanda masanya membawa jam juga (1:12:34). Berhijrah kepada bentuk jam pada sempadan yang sama seperti penanda transkrip menggunakan: bawah satu jam (MM:SS), dari satu jam ke atas (H:MM:SS). Jika sesuatu item tiada apa-apa dalam transkrip untuk ditunjuk, biarkan ia tanpa penanda langsung — jangan sekali-kali tulis ruang letak seperti (00:00) atau (--:--). Tajuk, blok maklumat di bahagian atas, dan medan Tarikh & Masa tidak membawa sebarang penanda, supaya masa mesyuarat tidak pernah dibaca sebagai satu titik dalam rakaman.
+
 TRANSKRIP MESYUARAT:
 {transcript}
 """,
@@ -208,6 +211,9 @@ Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Perbincangan Topikal (D
 Mesyuarat ditangguhkan pada jam [Masa].  
 **Sesi Seterusnya:** [Tarikh & Masa jika ada].
 
+PENANDA MASA:
+Tutup setiap titik senarai, setiap ayat dalam perenggan, dan setiap sel jadual dengan satu penanda masa dalam kurungan yang menunjukkan tempat dalam transkrip mana kandungan itu dicatat — contohnya (12:34). Salin masa itu daripada penanda berkurungan pada giliran transkrip yang ia datang daripada ([12:34]) dan buang kurungnya; apabila penanda itu sendiri membawa jam ([01:12:34]), penanda masanya membawa jam juga (1:12:34). Berhijrah kepada bentuk jam pada sempadan yang sama seperti penanda transkrip menggunakan: bawah satu jam (MM:SS), dari satu jam ke atas (H:MM:SS). Jika sesuatu item tiada apa-apa dalam transkrip untuk ditunjuk, biarkan ia tanpa penanda langsung — jangan sekali-kali tulis ruang letak seperti (00:00) atau (--:--). Tajuk, blok maklumat di bahagian atas, dan medan Tarikh & Masa tidak membawa sebarang penanda, supaya masa mesyuarat tidak pernah dibaca sebagai satu titik dalam rakaman.
+
 TRANSKRIP MESYUARAT:
 {transcript}
 """,
@@ -268,6 +274,9 @@ Based on the meeting transcript below, generate detailed Discussion (Topical) Mi
 The meeting adjourned at [HH:MM AM/PM].  
 **Next Session:** [DD Month YYYY, HH:MM AM/PM at Location if mentioned].  
 
+TIME ANCHORS:
+Close every bullet, every sentence of prose, and every table cell with a parenthesised time anchor giving the point in the transcript where that content was recorded — for example (12:34). Copy the time from the bracketed marker on the transcript turn it came from ([12:34]) and drop the brackets; when the marker itself carries hours ([01:12:34]), the anchor carries hours too (1:12:34). Switch to the hour form on the same boundary the markers use: under an hour (MM:SS), from one hour onwards (H:MM:SS). If an item has nothing in the transcript to point at, leave it with no anchor at all — never write a placeholder such as (00:00) or (--:--). Headings, the metadata block at the top, and the Date & Time fields carry no anchor, so a meeting time is never read as a point in the recording.
+
 TRANSCRIPT:
 {transcript}
 """,
@@ -298,6 +307,9 @@ Berdasarkan transkrip mesyuarat di bawah, hasilkan Minit Tiga Lajur (Three-Colum
 
 **Butiran Mesyuarat Seterusnya:** [Tarikh dan Masa jika dibincangkan]
 
+PENANDA MASA:
+Badan minit ini satu jadual besar, jadi setiap sel yang membawa kandungan ditutup dengan satu penanda masa dalam kurungan yang menunjukkan tempat dalam transkrip mana kandungan itu dicatat — contohnya (12:34). Salin masa itu daripada penanda berkurungan pada giliran transkrip yang ia datang daripada ([12:34]) dan buang kurungnya; apabila penanda itu sendiri membawa jam ([01:12:34]), penanda masanya membawa jam juga (1:12:34). Berhijrah kepada bentuk jam pada sempadan yang sama seperti penanda transkrip menggunakan: bawah satu jam (MM:SS), dari satu jam ke atas (H:MM:SS). Jika sesuatu sel tiada apa-apa dalam transkrip untuk ditunjuk, biarkan ia tanpa penanda langsung — jangan sekali-kali tulis ruang letak seperti (00:00) atau (--:--). Nama lajur, baris kepala jadual, tajuk, blok maklumat di bahagian atas, dan medan Tarikh Mesyuarat tidak membawa sebarang penanda, supaya masa mesyuarat tidak pernah dibaca sebagai satu titik dalam rakaman.
+
 TRANSKRIP MESYUARAT:
 {transcript}
 """,
@@ -324,6 +336,9 @@ Based on the meeting transcript below, generate structured Three-Column Meeting 
 ---
 
 **Next Meeting Details:** [DD Month YYYY at HH:MM AM/PM if mentioned]
+
+TIME ANCHORS:
+The body of this Template is one large table, so every cell that carries content closes with a parenthesised time anchor giving the point in the transcript where that content was recorded — for example (12:34). Without them the document would carry none at all. Copy the time from the bracketed marker on the transcript turn it came from ([12:34]) and drop the brackets; when the marker itself carries hours ([01:12:34]), the anchor carries hours too (1:12:34). Switch to the hour form on the same boundary the markers use: under an hour (MM:SS), from one hour onwards (H:MM:SS). If a cell has nothing in the transcript to point at, leave it with no anchor at all — never write a placeholder such as (00:00) or (--:--). Column headers, the table's own header row, headings, the metadata block at the top, and the Meeting Date and Time fields carry no anchor, so a meeting time is never read as a point in the recording.
 
 TRANSCRIPT:
 {transcript}
@@ -402,6 +417,9 @@ ____________________________________
 [Nama Pengerusi], Pengerusi Lembaga Pengarah  
 Tarikh: [Tarikh]  
 
+PENANDA MASA:
+Tutup setiap titik senarai, setiap ayat dalam perenggan, dan setiap sel jadual dengan satu penanda masa dalam kurungan yang menunjukkan tempat dalam transkrip mana kandungan itu dicatat — contohnya (12:34). Salin masa itu daripada penanda berkurungan pada giliran transkrip yang ia datang daripada ([12:34]) dan buang kurungnya; apabila penanda itu sendiri membawa jam ([01:12:34]), penanda masanya membawa jam juga (1:12:34). Berhijrah kepada bentuk jam pada sempadan yang sama seperti penanda transkrip menggunakan: bawah satu jam (MM:SS), dari satu jam ke atas (H:MM:SS). Jika sesuatu item tiada apa-apa dalam transkrip untuk ditunjuk, biarkan ia tanpa penanda langsung — jangan sekali-kali tulis ruang letak seperti (00:00) atau (--:--). Tajuk, blok maklumat di bahagian atas, dan medan Tarikh & Masa tidak membawa sebarang penanda, supaya masa mesyuarat tidak pernah dibaca sebagai satu titik dalam rakaman.
+
 TRANSKRIP MESYUARAT:
 {transcript}
 """,
@@ -475,6 +493,9 @@ Date: [DD/MM/YYYY]
 ____________________________________  
 [Chairperson Name], Chairperson of the Board  
 Date: [DD/MM/YYYY]  
+
+TIME ANCHORS:
+Close every bullet, every sentence of prose, and every table cell with a parenthesised time anchor giving the point in the transcript where that content was recorded — for example (12:34). Copy the time from the bracketed marker on the transcript turn it came from ([12:34]) and drop the brackets; when the marker itself carries hours ([01:12:34]), the anchor carries hours too (1:12:34). Switch to the hour form on the same boundary the markers use: under an hour (MM:SS), from one hour onwards (H:MM:SS). If an item has nothing in the transcript to point at, leave it with no anchor at all — never write a placeholder such as (00:00) or (--:--). Headings, the metadata block at the top, and the Date & Time fields carry no anchor, so a meeting time is never read as a point in the recording.
 
 TRANSCRIPT:
 {transcript}

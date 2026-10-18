@@ -107,6 +107,7 @@ from ..session_store import (
     VALID_TEMPLATES,
     build_session_payload,
     load_session,
+    minutes_cache_is_current,
     normalize_settings,
     save_session,
     session_path
@@ -3092,11 +3093,18 @@ class STTMeetApp(ctk.CTk):
             self.generated_minutes = data["generated_minutes"]
             self.generated_recap = data.get("generated_recap", "") or ""
             self.generated_actions = data.get("generated_actions", "") or ""
-            self.cached_minutes_by_template = dict(data.get("cached_minutes_by_template", {}) or {})
-            # If a legacy session has generated_minutes but empty cached_minutes_by_template, backfill it
-            saved_template = data.get("settings", {}).get("template", "action_minutes")
-            if self.generated_minutes and saved_template not in self.cached_minutes_by_template:
-                self.cached_minutes_by_template[saved_template] = self.generated_minutes
+            # Cached Minutes are served only when this build could have written them.
+            # A session from before the prompts asked for time anchors would otherwise
+            # reopen on a document in which the feature does nothing, and the backfill
+            # below would resurrect exactly that document, so the whole restore -- cache
+            # and backfill together -- is what a cache miss skips.
+            if minutes_cache_is_current(data):
+                self.cached_minutes_by_template = dict(data.get("cached_minutes_by_template") or {})
+                saved_template = data.get("settings", {}).get("template", "action_minutes")
+                if self.generated_minutes and saved_template not in self.cached_minutes_by_template:
+                    self.cached_minutes_by_template[saved_template] = self.generated_minutes
+            else:
+                self.cached_minutes_by_template = {}
 
             self.detected_speakers = data["detected_speakers"]
             self.speaker_mapping = data["speaker_mapping"]
