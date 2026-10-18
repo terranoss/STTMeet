@@ -86,8 +86,12 @@ _Avoid_: action item template, actions template
 The substitution of real names for the model's placeholder speaker tags, where the meeting makes the attribution clear.
 _Avoid_: speaker renaming, name mapping
 
+**Time anchor**:
+The `(MM:SS)` marker closing a **minutes** bullet, prose sentence or table cell, pointing to where in the **transcript** that content was recorded. Written by the model, and absent where it had nothing to point at — a **minutes** document may carry no anchors at all.
+_Avoid_: timestamp, citation, time reference
+
 **Export**:
-Writing a **transcript**, **minutes**, **recap** or **action items** out as a Word or plain-text document.
+Writing a **transcript**, **minutes**, **recap** or **action items** out as a Word or plain-text document. May or may not carry **time anchors**, which is a property of the **export** rather than of the **minutes** it was written from.
 _Avoid_: download, save-as, output
 
 ## Language discipline
