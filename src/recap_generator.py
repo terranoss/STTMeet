@@ -15,13 +15,21 @@ the exported documents read as mixed-language.
 """
 from typing import Dict, Any, Callable, Optional, List
 from google import genai
-from google.genai import types
 
-from .cancellation import CancelledError, cancellable_sleep, raise_if_cancelled
-from .config import MINUTES_MODEL_NAME, MINUTES_FALLBACK_MODELS, MAX_OUTPUT_TOKENS
+from .config import MINUTES_MODEL_NAME, MINUTES_FALLBACK_MODELS
+from .gemini_failover import FailoverCall, generate_with_failover
 from .logger import get_logger
 
 log = get_logger(__name__)
+
+# Divergence from the other generation call sites is deliberate and
+# user-visible, so it is spelled out here rather than inherited silently.
+RECAP_BACKOFF_STEP_SECONDS = 5
+RECAP_TEMPERATURE = 0.2
+RECAP_QUOTA_FAILURE_MESSAGE = (
+    "All available Gemini models ({models}) exceeded daily free quotas or failed.\n"
+    "Please check your Google AI Studio quota limits or retry tomorrow."
+)
 
 RECAP_PROMPTS = {
     "English": """You are an executive-level executive assistant and project management professional.
@@ -193,7 +201,10 @@ def generate_meeting_recap(
 ) -> str:
     """
     Synthesize meeting transcript into an Executive Meeting Recap.
-    Includes automatic retry with exponential backoff and failover across candidate models.
+
+    Retry, backoff, Quota failure detection and failover are owned by the
+    shared policy in gemini_failover; this module keeps the Recap prompt table
+    and describes what makes a Recap call different.
     """
     log.info(
         "Generating executive meeting recap in language '%s' (transcript length: %d chars)",
@@ -208,55 +219,15 @@ def generate_meeting_recap(
     preferred = model_override or MINUTES_MODEL_NAME
     models_to_try = [preferred] + [m for m in MINUTES_FALLBACK_MODELS if m != preferred]
 
-    for model_candidate in models_to_try:
-        raise_if_cancelled(cancel_event)
-        log.info("Attempting recap generation with model: %s", model_candidate)
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                raise_if_cancelled(cancel_event)
-                log.info("Calling Gemini model '%s' for recap synthesis (Attempt %d/%d)...", model_candidate, attempt, max_retries)
-                if progress_callback:
-                    progress_callback(f"Generating recap with {model_candidate} (Attempt {attempt}/{max_retries})...")
-
-                response = client.models.generate_content(
-                    model=model_candidate,
-                    contents=[full_prompt],
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        temperature=0.2
-                    )
-                )
-                raise_if_cancelled(cancel_event)
-                result = response.text or ""
-                log.info("Executive meeting recap generated successfully with '%s' (%d chars).", model_candidate, len(result))
-                return result
-
-            except CancelledError:
-                raise
-
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota exceeded" in err_str.lower():
-                    log.warning(
-                        "Quota exhausted for model '%s' during recap synthesis. Auto-switching candidate.",
-                        model_candidate
-                    )
-                    if progress_callback:
-                        progress_callback(f"Quota reached for {model_candidate}. Auto-switching model...")
-                    break
-
-                if attempt < max_retries:
-                    wait_sec = attempt * 5
-                    if progress_callback:
-                        progress_callback(f"Server busy. Retrying in {wait_sec}s (Attempt {attempt + 1}/{max_retries})...")
-                    if not cancellable_sleep(cancel_event, wait_sec):
-                        raise CancelledError("Retry backoff cancelled by user.")
-                else:
-                    log.error("All %d recap synthesis attempts failed for '%s': %s", max_retries, model_candidate, err_str[:80])
-                    break
-
-    raise RuntimeError(
-        f"All available Gemini models ({', '.join(models_to_try)}) exceeded daily free quotas or failed.\n"
-        "Please check your Google AI Studio quota limits or retry tomorrow."
-    )
+    return generate_with_failover(client, FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=[full_prompt],
+        models=models_to_try,
+        max_retries=max_retries,
+        backoff_step=RECAP_BACKOFF_STEP_SECONDS,
+        temperature=RECAP_TEMPERATURE,
+        final_error=RECAP_QUOTA_FAILURE_MESSAGE.format(models=", ".join(models_to_try)),
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    ))
