@@ -7,7 +7,7 @@ Nuitka and Inno Setup, so bump it here before building an installer.
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def get_app_version() -> str:

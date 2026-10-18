@@ -129,6 +129,42 @@ def set_cell_background(cell, hex_color: str):
     shd.set(qn('w:fill'), hex_color)
     tcPr.append(shd)
 
+# A time anchor is the Minutes closing a bullet, a sentence or a table cell with the
+# point in the recording that content came from: (MM:SS) under an hour, (H:MM:SS) past
+# it, or comma-separated multiples when referencing multiple turns: (MM:SS, MM:SS).
+# The pattern insists on the anchor standing on its own -- beginning a line or a cell,
+# or preceded by a space or pipe -- so that nothing inside a word and nothing written
+# in brackets is caught by accident, which is what keeps the Transcript's own [MM:SS]
+# markers and any ordinary parenthesised aside intact.
+_TIME_PATTERN = r'(?:\d{1,2}:)?[0-5]?\d:[0-5]\d'
+_TIME_ANCHOR_RE = re.compile(
+    r'(?:(?<=^)|(?<=[ \t|]))[ \t]*\(' + _TIME_PATTERN + r'(?:\s*,\s*' + _TIME_PATTERN + r')*\)[ \t]?'
+)
+
+
+def strip_time_anchors(text: str) -> str:
+    """
+    Remove the time anchors from a Minutes document, leaving the rest untouched.
+
+    A pure text transform over the Markdown, run before the content reaches the Word
+    and text writers: it removes an anchor terminating a bullet, a line of prose or a
+    table cell, and leaves everything that makes the document render -- bold spans,
+    pipes, the alignment row -- exactly as it was. A document with no anchors in it
+    comes back unchanged rather than raising, because a Minutes may legitimately carry
+    none at all.
+
+    Scoped to the Minutes branch by its caller: the Transcript carries markers of its
+    own and is never handed here.
+    """
+    if not text:
+        return text
+    lines = []
+    for line in text.split("\n"):
+        stripped_line = _TIME_ANCHOR_RE.sub("", line)
+        cleaned_line = re.sub(r'[ \t]+([.,;:])', r'\1', stripped_line)
+        lines.append(cleaned_line)
+    return "\n".join(lines)
+
 def export_to_docx(
     file_path: str,
     title: str,

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.1.0] - 2026-10-18
+
+### Added
+- **Time Anchors in Minutes**: Meeting minutes generated across all four templates and both English and Bahasa Melayu now anchor decisions, bullets, and table cells with timestamps (e.g. `(12:34)` or `(1:12:34)`) directly referencing the transcript.
+- **Export Toggle for Time Anchors**: Added a switch in the bottom bar beside Export buttons (defaulting to ON and remembered per session) to strip anchors on demand for `.docx`, `.txt`, and Export All while keeping on-screen minutes intact.
+- **Headless Pipeline Architecture**: Headless pipeline seam for running transcription and minutes synthesis cleanly without UI dependencies.
+- **Minutes Cache Invalidation**: Cached minutes record a cache version to cleanly regenerate older pre-anchor minutes caches.
+
+### Fixed
+- **Multi-Timestamp Anchor Export Stripping**: Handled multi-timestamp comma-separated anchors (e.g. `(28:44, 38:00)`) when exporting with the anchor toggle off.
+
+---
+
 ## [v1.0.0] - 2026-10-16
 
 ### Initial Public Release

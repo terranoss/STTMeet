@@ -1,10 +1,29 @@
 # Unit tests for STTMeet logic modules
+import ast
+import dataclasses
 import json
+import re
+import subprocess
+import sys
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+import types
 
-from src.config import API_KEY_URL, DOCS_DIR
+REPO_ROOT = Path(__file__).resolve().parent
+
+from src.config import (
+    API_KEY_URL,
+    DOCS_DIR,
+    FALLBACK_MODELS,
+    MINUTES_FALLBACK_MODELS,
+    MINUTES_MODEL_NAME,
+    MODEL_NAME,
+)
 
 from src.transcript_processor import (
     parse_time_to_seconds,
@@ -51,11 +70,13 @@ from src.ui.theme import (
 )
 from src.session_store import (
     DEFAULT_SETTINGS,
+    MINUTES_CACHE_VERSION,
     SCHEMA_VERSION,
     VALID_LANGUAGES,
     VALID_TEMPLATES,
     build_session_payload,
     load_session,
+    minutes_cache_is_current,
     normalize_settings,
     save_session,
     session_path
@@ -63,6 +84,8 @@ from src.session_store import (
 from src.minutes_generator import (
     ACTION_ITEMS_PROMPTS,
     TEMPLATES_PROMPTS,
+    generate_action_items,
+    generate_meeting_minutes,
     get_synthesis_prompt,
     get_action_items_prompt,
     parse_minutes_sections,
@@ -70,7 +93,179 @@ from src.minutes_generator import (
 from src.recap_generator import (
     RECAP_PROMPTS,
     get_recap_prompt,
+    generate_meeting_recap,
 )
+from src.gemini_failover import (
+    FailoverCall,
+    generate_with_failover,
+    is_quota_failure,
+)
+from src.gemini_transcriber import (
+    transcribe_audio_chunk,
+    upload_and_wait_file,
+)
+from src.audio_processor import compute_file_hash
+from src.cancellation import CancelledError
+from src.checkpoint_store import checkpoint_path, load_checkpoint
+from src.pipeline import (
+    ENGINE_MODEL_OVERRIDES,
+    Phase,
+    PipelineSettings,
+    engine_for_model,
+    model_for_engine,
+    reprocess_chunk,
+    run_pipeline,
+)
+
+
+class RecordingObserver:
+    """
+    An observer that keeps every report the Pipeline run makes.
+
+    The Pipeline run's whole contract with a caller is what it reports, so a
+    test that asserts on this list is asserting on the seam, not on internals.
+    """
+
+    def __init__(self):
+        self.reports = []
+
+    def report(self, report):
+        self.reports.append(report)
+
+    def keys(self, phase=None):
+        return [r.key for r in self.reports if phase is None or r.phase == phase]
+
+    def steps(self):
+        """(step, badge state) for every step-badge report, in order."""
+        return [(r.key, r.state) for r in self.reports if r.phase == Phase.STEP]
+
+    def phases(self):
+        return [r.phase for r in self.reports]
+
+    def percents(self):
+        return [r.percent for r in self.reports if r.percent is not None]
+
+
+class FakeFilesApi:
+    """
+    Stand-in for the provider's Files API, where transcription's audio is uploaded.
+
+    Records what was uploaded and deleted so a test can see whether provider
+    storage leaked, and can hand back a file that is still PROCESSING so the
+    upload's poll-and-wait path runs.
+    """
+
+    def __init__(self, processing_polls=0, on_upload=None):
+        self._processing_polls = processing_polls
+        self._on_upload = on_upload
+        self.uploads = []
+        self.deleted = []
+        self._next_name = 0
+
+    def upload(self, file):
+        self._next_name += 1
+        name = "files/fake-%d" % self._next_name
+        self.uploads.append({"file": file, "name": name})
+        if self._on_upload:
+            self._on_upload()
+        return self._file(name, self._processing_polls > 0)
+
+    def get(self, name):
+        self._processing_polls -= 1
+        return self._file(name, self._processing_polls > 0)
+
+    def delete(self, name):
+        self.deleted.append(name)
+
+    @staticmethod
+    def _file(name, processing):
+        state = "PROCESSING" if processing else "ACTIVE"
+        return SimpleNamespace(name=name, state=SimpleNamespace(name=state))
+
+
+class FakeGeminiProvider:
+    """
+    Scripted stand-in for the Gemini client used by the Failover chain.
+
+    Costs no quota and makes no network call. Each model in the script gets a
+    list of outcomes consumed one per call: a string comes back as the
+    response text, an exception is raised for the caller to deal with, and a
+    response object is handed back as-is for a script that needs to shape the
+    response itself (an empty transcription, say).
+    """
+
+    def __init__(self, script, files=None):
+        self._script = {model: list(outcomes) for model, outcomes in script.items()}
+        self.calls = []
+        self.models = SimpleNamespace(generate_content=self._generate_content)
+        self.files = files if files is not None else FakeFilesApi()
+
+    def _generate_content(self, model, contents, config):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        outcomes = self._script.get(model)
+        if not outcomes:
+            raise AssertionError("FakeGeminiProvider: unexpected call to model '%s'" % model)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, str):
+            return SimpleNamespace(text=outcome, candidates=None)
+        return outcome
+
+    def attempts_on(self, model):
+        """How many times the Failover chain reached for this model."""
+        return sum(1 for call in self.calls if call["model"] == model)
+
+
+def quota_failure_error():
+    """The provider's own wording for a Quota failure."""
+    return RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded for this project")
+
+
+def empty_transcription_response(finish_reason="MAX_TOKENS"):
+    """A response the provider answered with nothing usable in it."""
+    return SimpleNamespace(
+        text="",
+        candidates=[SimpleNamespace(content=None, finish_reason=finish_reason)],
+    )
+
+
+def recording_waits(module):
+    """
+    Context manager that records the backoff a policy asks for instead of
+    spending it, since backoff is a boundary of that policy.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _recording():
+        waits = []
+        original = module.cancellable_sleep
+        module.cancellable_sleep = lambda cancel_event, seconds, *args: waits.append(seconds) or True
+        try:
+            yield waits
+        finally:
+            module.cancellable_sleep = original
+
+    return _recording()
+
+
+def wait_until(predicate, timeout=5.0):
+    """
+    Wait for work the window started on a thread of its own, without sleeping.
+
+    A generation run is handed to a daemon thread; a test drives the same seam and
+    then waits for the window to report itself finished. The wait is short polling
+    rather than a fixed sleep, so it costs nothing when the work is already done and
+    fails loudly by timeout when it never finishes.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        threading.Event().wait(0.005)
+    return predicate()
+
 
 def test_time_conversions():
     assert parse_time_to_seconds("01:30") == 90
@@ -113,6 +308,7 @@ def _sample_settings():
         "chunk_minutes": 20,
         "preprocess": False,
         "template": "action_minutes",
+        "include_time_anchors": True,
     }
 
 def _sample_status():
@@ -189,6 +385,144 @@ def test_session_loads_v1_without_settings():
         assert loaded["status"]["chunks"] == []
         assert loaded["processed_transcript"] == "old transcript"
         assert loaded["speaker_mapping"] == {}
+
+def test_the_time_anchor_toggle_is_remembered_per_session():
+    """
+    The switch is a per-session setting, so someone who chose a clean export does not
+    choose it again at the next meeting. Checked over the real round trip through disk,
+    because a value that did not survive the write is a toggle that resets every time
+    the session is reopened.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = session_path(Path(tmp), "abc123")
+        payload = build_session_payload(
+            audio_hash="abc123",
+            audio_path="D:/meetings/agm.mp3",
+            settings=dict(_sample_settings(), include_time_anchors=False),
+            status=_sample_status(),
+        )
+        assert save_session(payload, path)
+
+        loaded = load_session(path)
+
+    assert loaded is not None
+    assert loaded["settings"]["include_time_anchors"] is False
+
+
+def test_a_session_written_before_the_time_anchor_toggle_existed_loads_with_it_on():
+    """
+    A session this build did not write has no record of the toggle, and the documented
+    default is on -- the feature works without anyone opting in. It has to arrive as a
+    setting rather than a missing key, or the first export after an upgrade would find
+    nothing to read.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "session_pre_toggle.json"
+        path.write_text(json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "audio_hash": "pre-toggle",
+            "settings": {
+                "engine": "☁️ Gemini 3.5 Flash",
+                "language": "English",
+                "chunk_minutes": 20,
+                "preprocess": False,
+                "template": "action_minutes",
+            },
+            "generated_minutes": "old minutes",
+        }), encoding="utf-8")
+
+        loaded = load_session(path)
+
+    assert loaded is not None
+    assert DEFAULT_SETTINGS["include_time_anchors"] is True
+    assert loaded["settings"]["include_time_anchors"] is True
+
+
+def test_a_session_saved_and_reloaded_at_the_current_cache_version_still_uses_its_minutes():
+    """
+    The per-Template cache exists so the same Minutes are never paid for twice, so a
+    session written by this build and read back by this build still finds them. The
+    version is checked over the real round trip through disk, because a version that
+    did not survive the write would silently turn every cache into a miss.
+    """
+    minutes = "# Minit Tindakan Mesyuarat\n\n- En. Razak: susun draf (00:04)."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "session_anchored.json"
+        payload = build_session_payload(
+            audio_hash="anchored",
+            audio_path=None,
+            settings=_sample_settings(),
+            status=_sample_status(),
+            generated_minutes=minutes,
+            cached_minutes_by_template={"action_minutes": minutes},
+        )
+        assert save_session(payload, path)
+
+        loaded = load_session(path)
+
+    assert loaded is not None
+    assert loaded["cached_minutes_by_template"]["action_minutes"] == minutes
+    assert minutes_cache_is_current(loaded) is True
+
+
+def test_a_session_cached_before_time_anchors_existed_reads_as_a_cache_miss():
+    """
+    Minutes cached before anchors existed are a document in which the feature appears
+    to do nothing, so they must read as a miss and be generated again. A session with
+    no version recorded at all is what every pre-anchor session looks like, and it is
+    older than any version number rather than a current one.
+    """
+    stale = "# Minit Tindakan Mesyuarat\n\n- En. Razak: susun draf."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        versionless = Path(tmp) / "session_pre_anchor.json"
+        versionless.write_text(json.dumps({
+            "audio_hash": "pre-anchor",
+            "generated_minutes": stale,
+            "cached_minutes_by_template": {"action_minutes": stale},
+        }), encoding="utf-8")
+
+        older = Path(tmp) / "session_older_version.json"
+        older.write_text(json.dumps({
+            "audio_hash": "older",
+            "generated_minutes": stale,
+            "minutes_cache_version": MINUTES_CACHE_VERSION - 1,
+            "cached_minutes_by_template": {"action_minutes": stale},
+        }), encoding="utf-8")
+
+        pre_anchor = load_session(versionless)
+        from_before = load_session(older)
+
+    # The entries are still carried, so nothing is lost by the miss -- what changes is
+    # that this build is no longer willing to serve them as its own output.
+    assert pre_anchor["cached_minutes_by_template"]["action_minutes"] == stale
+    assert from_before["cached_minutes_by_template"]["action_minutes"] == stale
+    assert minutes_cache_is_current(pre_anchor) is False
+    assert minutes_cache_is_current(from_before) is False
+
+
+def test_a_session_reopen_only_serves_minutes_this_build_could_have_written():
+    """
+    The version only earns its keep where the cache is restored, so reopening a
+    session has to consult it -- otherwise a pre-anchor document comes back and the
+    feature appears to do nothing. Driving that method needs a real window, and this
+    suite constructs no widgets, so this scans the method's own body, which is the same
+    trade the generation-thread test makes.
+    """
+    source = (REPO_ROOT / "src" / "ui" / "app_window.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    app = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "STTMeetApp")
+    restore = next(node for node in app.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "_load_full_session_if_exists")
+
+    restore_source = ast.get_source_segment(source, restore)
+
+    assert "minutes_cache_is_current" in restore_source, (
+        "reopening a session must not serve Minutes cached by prompts that differ from this build's"
+    )
+
 
 def test_normalize_settings_rejects_stale_values():
     stale = {
@@ -429,6 +763,42 @@ def test_translate_missing_key_raises():
         return
     raise AssertionError("expected KeyError for an unknown i18n key")
 
+def test_every_literal_translation_key_resolves():
+    # translate() raises on a missing key rather than falling back, which is
+    # only a guarantee if callers stay inside it. Walk every literal key passed
+    # to _t()/translate() across src/ and assert each one resolves in every
+    # locale. Parsed rather than grepped so the check survives either quote
+    # style and f-strings, and so failures name a line.
+    #
+    # Only literal arguments are checked. Twenty-odd call sites build their key
+    # at runtime (toolbar tips via str.replace, docs titles via f-string slug),
+    # and those are covered by the has_key assertions elsewhere in this file.
+    checked = 0
+    for path in sorted(Path("src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name not in ("t", "_t", "translate") or not node.args:
+                continue
+            first = node.args[0]
+            if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+                continue
+            checked += 1
+            for locale in ALL_MODES:
+                try:
+                    translate(first.value, locale)
+                except KeyError:
+                    raise AssertionError(
+                        f"{path}:{node.lineno} translates unresolvable key "
+                        f"{first.value!r} (locale {locale!r})"
+                    )
+    # Guard the test itself: if the walk ever stops finding call sites, it is
+    # no longer checking anything and would pass vacuously.
+    assert checked > 200, f"only {checked} literal translation calls found; walk is broken"
+
 def test_translate_falls_back_to_english_for_unknown_mode():
     assert translate("menubar.tools", "klingon") == translate("menubar.tools", "en")
     # A locale written by an older build is no longer valid and must not raise.
@@ -565,7 +935,44 @@ def test_prefs_roundtrip_and_tolerance():
             prefs_module.PREFS_PATH = original_path
     assert original_dir is not None
 
+# The metadata field each Template's own prompt writes its meeting time into. A rule
+# written in the prompt's own language has to name that field in that language, so a
+# Bahasa Melayu prompt cannot satisfy this with the English rule pasted in.
+ANCHOR_RULE_METADATA_FIELDS = {
+    ("action_minutes", "English"): "Date & Time",
+    ("action_minutes", "Bahasa Melayu"): "Tarikh & Masa",
+    ("discussion_minutes", "English"): "Date & Time",
+    ("discussion_minutes", "Bahasa Melayu"): "Tarikh & Masa",
+    ("three_column", "English"): "Meeting Date",
+    ("three_column", "Bahasa Melayu"): "Tarikh Mesyuarat",
+    ("board_governance", "English"): "Date & Time",
+    ("board_governance", "Bahasa Melayu"): "Tarikh & Masa",
+}
+
+
+def _anchor_rule_block(prompt: str) -> str:
+    """
+    The trailing paragraph before the Transcript marker, which is where the rule sits.
+
+    Placement is part of what is being promised: the rule reads as the last thing said
+    about the document, after the last content section and before the transcript it
+    points into. Taking the final paragraph is therefore the whole of the definition.
+    """
+    marker = "TRANSKRIP MESYUARAT:" if "TRANSKRIP MESYUARAT:" in prompt else "TRANSCRIPT:"
+    paragraphs = [p.strip() for p in prompt.split(marker)[0].split("\n\n") if p.strip()]
+    return paragraphs[-1] if paragraphs else ""
+
+
 def test_template_prompts_and_displays():
+    """
+    Every Template, in both languages, is a Template a caller can get anchors from.
+
+    The rule's wording is deliberately not pinned. It is prose written for a model to
+    follow, and a test that quoted it would break on every rewording while proving
+    nothing about what actually matters -- that all eight prompts carry a rule, that
+    each gives the anchor format, and that each says so in its own language. Those are
+    structural, and they are what can go wrong.
+    """
     assert set(VALID_TEMPLATES) == set(TEMPLATE_DISPLAY.keys())
     assert set(VALID_TEMPLATES) == set(TEMPLATES_PROMPTS.keys())
     for tmpl in VALID_TEMPLATES:
@@ -574,6 +981,73 @@ def test_template_prompts_and_displays():
         for lang in VALID_LANGUAGES:
             prompt = get_synthesis_prompt(template=tmpl, language=lang)
             assert "{transcript}" in prompt
+
+            rule = _anchor_rule_block(prompt)
+            assert rule, f"{tmpl}/{lang} carries no anchor rule"
+            # The anchor format itself, both ways round: the minute form every item
+            # takes, and the hour form past one hour that matches the Transcript's
+            # own markers. Neither is stated as an example that cannot be mistaken
+            # for something else -- both appear as a parenthesised time.
+            assert re.search(r"\(\d{1,2}:\d{2}\)", rule), f"{tmpl}/{lang}: no minute form"
+            assert re.search(r"\(\d{1,2}:\d{2}:\d{2}\)", rule), f"{tmpl}/{lang}: no hour form"
+            # Own language: the rule names the metadata field this prompt actually
+            # writes, as that prompt spells it. An English rule in a Bahasa Melayu
+            # prompt names a field this prompt does not have.
+            field = ANCHOR_RULE_METADATA_FIELDS[(tmpl, lang)]
+            assert field in rule, f"{tmpl}/{lang}: rule does not name '{field}'"
+
+    # The rule is not one English paragraph reused everywhere: each language's rule is
+    # its own, and the English action-minutes rule appears in no Bahasa Melayu prompt.
+    for tmpl in VALID_TEMPLATES:
+        english_rule = _anchor_rule_block(get_synthesis_prompt(template=tmpl, language="English"))
+        melayu_rule = _anchor_rule_block(get_synthesis_prompt(template=tmpl, language="Bahasa Melayu"))
+        assert english_rule != melayu_rule, f"{tmpl}: both languages carry the same rule"
+
+    seeded = _anchor_rule_block(get_synthesis_prompt(template="action_minutes", language="English"))
+    for tmpl in VALID_TEMPLATES:
+        melayu_prompt = get_synthesis_prompt(template=tmpl, language="Bahasa Melayu")
+        assert seeded not in melayu_prompt, f"{tmpl}: English rule pasted into a Malay prompt"
+
+
+def test_template_reference_documents_match_prompts():
+    """
+    Each Template has a reference document describing its section structure for
+    developers to read. Those documents describe the section structure the prompts
+    produce, and this check enforces that they agree on their section heading sets.
+
+    Only headings are compared: full-text comparison would fail on harmless
+    placeholder wording that differs between the copies.
+    This check covers English prompts because there are no Malay reference
+    documents currently maintained.
+    """
+    reference_docs = {
+        "action_minutes": Path("docs/meeting_minute/action_minutes_template.md"),
+        "discussion_minutes": Path("docs/meeting_minute/discussion_minutes_template.md"),
+        "three_column": Path("docs/meeting_minute/three_column_minutes_template.md"),
+        "board_governance": Path("docs/meeting_minute/board_governance_minutes_template.md"),
+    }
+
+    assert set(reference_docs.keys()) == set(VALID_TEMPLATES), (
+        "Every valid template must have a reference document defined in the check"
+    )
+
+    def extract_headings(text: str) -> list[str]:
+        return [line.strip() for line in text.splitlines() if line.strip().startswith("#")]
+
+    for tmpl, doc_path in reference_docs.items():
+        assert doc_path.exists(), f"Reference document for {tmpl} missing at {doc_path}"
+        doc_headings = extract_headings(doc_path.read_text(encoding="utf-8"))
+        prompt_headings = extract_headings(get_synthesis_prompt(template=tmpl, language="English"))
+
+        # Non-trivial heading count so a broken parse cannot produce a silent pass
+        assert len(doc_headings) >= 1, f"{tmpl}: reference document has no headings"
+        assert len(prompt_headings) >= 1, f"{tmpl}: prompt has no headings"
+        assert doc_headings == prompt_headings, (
+            f"Headings mismatch for template {tmpl}:\n"
+            f"Doc: {doc_headings}\n"
+            f"Prompt: {prompt_headings}"
+        )
+
 
 def test_parse_minutes_sections_for_templates():
     three_col_sample = """# Three-Column Meeting Minutes
@@ -627,6 +1101,1318 @@ def test_weak_model_diarization_policy():
     assert has_key("msg.speaker_mapping_weak_model")
     assert has_key("settings.chunk_note")
 
+def test_quota_failure_skips_retries_and_fails_over_to_the_next_model():
+    provider = FakeGeminiProvider({
+        "model-a": [quota_failure_error()],
+        "model-b": ["# Recap from model-b"],
+    })
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        max_retries=3,
+        backoff_step=0,
+        temperature=0.2,
+        final_error="no model left in the chain",
+    )
+
+    result = generate_with_failover(provider, call)
+
+    assert result == "# Recap from model-b"
+    # A Quota failure ends this model's retry sweep at once, so model-a is
+    # reached for exactly once despite max_retries being 3.
+    assert provider.attempts_on("model-a") == 1
+    assert provider.attempts_on("model-b") == 1
+
+
+def test_transient_error_retries_with_backoff_then_fails_over():
+    provider = FakeGeminiProvider({
+        "model-a": [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+        ],
+        "model-b": ["# Recap from model-b"],
+    })
+    messages = []
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        max_retries=3,
+        backoff_step=0,
+        temperature=0.2,
+        final_error="no model left in the chain",
+        progress_callback=messages.append,
+    )
+
+    result = generate_with_failover(provider, call)
+
+    assert result == "# Recap from model-b"
+    # Three transient failures spend the retry count for model-a before the
+    # chain moves on; the backoff in between is reported at attempt * step.
+    assert provider.attempts_on("model-a") == 3
+    assert provider.attempts_on("model-b") == 1
+    assert "Server busy. Retrying in 0s (Attempt 2/3)..." in messages
+    assert "Server busy. Retrying in 0s (Attempt 3/3)..." in messages
+
+
+def test_success_ends_the_failover_chain_without_touching_later_models():
+    provider = FakeGeminiProvider({
+        "model-a": ["# Recap from model-a"],
+        "model-b": ["# Recap nobody asked for"],
+    })
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        backoff_step=0,
+        temperature=0.2,
+    )
+
+    assert generate_with_failover(provider, call) == "# Recap from model-a"
+    assert provider.attempts_on("model-b") == 0
+
+
+def test_exhausted_failover_chain_raises_the_calls_final_error():
+    provider = FakeGeminiProvider({
+        "model-a": [quota_failure_error()],
+        "model-b": [quota_failure_error()],
+    })
+    call = FailoverCall(
+        description="recap synthesis",
+        label="recap",
+        contents=["transcript"],
+        models=["model-a", "model-b"],
+        backoff_step=0,
+        temperature=0.2,
+        final_error="Both models are out of allowance today.",
+    )
+
+    try:
+        generate_with_failover(provider, call)
+    except RuntimeError as error:
+        assert str(error) == "Both models are out of allowance today."
+    else:
+        raise AssertionError("an exhausted Failover chain must raise RuntimeError")
+
+
+def test_quota_failure_predicate_separates_quota_from_transient_errors():
+    assert is_quota_failure(RuntimeError("429 Too Many Requests")) is True
+    assert is_quota_failure(RuntimeError("RESOURCE_EXHAUSTED")) is True
+    assert is_quota_failure(RuntimeError("Quota exceeded for the day")) is True
+    assert is_quota_failure(RuntimeError("503 UNAVAILABLE: overloaded")) is False
+
+
+def recap_failover_chain(lead_model):
+    """The Failover chain the Recap path walks when the Engine pins a model."""
+    return [lead_model] + [m for m in MINUTES_FALLBACK_MODELS if m != lead_model]
+
+
+def test_recap_path_keeps_its_backoff_step_and_temperature():
+    """Divergence from the other call sites is deliberate, so it stays pinned."""
+    from src import gemini_failover
+
+    waits = []
+    original_sleep = gemini_failover.cancellable_sleep
+    # Backoff is a boundary of this policy, so record the waits it asks for
+    # instead of spending them.
+    gemini_failover.cancellable_sleep = lambda cancel_event, seconds: waits.append(seconds) or True
+    try:
+        provider = FakeGeminiProvider({
+            "model-a": [RuntimeError("503 UNAVAILABLE"), RuntimeError("503 UNAVAILABLE"), "# Recap from model-a"],
+        })
+        recap = generate_meeting_recap(
+            provider, "a long transcript", language="English", model_override="model-a"
+        )
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert recap == "# Recap from model-a"
+    # Today's Recap path backs off by attempt * 5 seconds...
+    assert waits == [5, 10]
+    # ...and pins the text-generation temperature.
+    assert provider.calls[0]["config"]["temperature"] == 0.2
+
+
+def test_recap_quota_failure_message_is_unchanged():
+    chain = recap_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        generate_meeting_recap(provider, "a long transcript", language="English", model_override="model-a")
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please check your Google AI Studio quota limits or retry tomorrow." % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+def test_recap_path_delegates_its_failure_policy_to_the_shared_module():
+    """The Quota failure predicate is written once, and Recap uses that one."""
+    source = (Path(__file__).parent / "src" / "recap_generator.py").read_text(encoding="utf-8")
+
+    assert "RESOURCE_EXHAUSTED" not in source
+    assert "quota exceeded" not in source
+    assert "generate_with_failover" in source
+    assert "is_quota_failure" not in source
+
+
+def test_failover_policy_module_owns_the_policy_and_nothing_else():
+    """The policy is a sibling of cancellation, not a client of the generators."""
+    source = (Path(__file__).parent / "src" / "gemini_failover.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+
+    allowed = {"dataclasses", "typing", "cancellation", "config", "logger"}
+    assert imported <= allowed, "unexpected imports: %s" % sorted(imported - allowed)
+
+
+def test_failover_description_carries_no_provider_types():
+    """A caller can describe its request in plain data, with no provider objects."""
+    for field in FailoverCall.__dataclass_fields__.values():
+        annotation = str(field.type)
+        assert "genai" not in annotation and "types." not in annotation, annotation
+
+
+def test_resource_lifecycle_brackets_one_models_whole_retry_sweep():
+    provider = FakeGeminiProvider({
+        "model-a": [RuntimeError("503 UNAVAILABLE"), RuntimeError("503 UNAVAILABLE")],
+        "model-b": ["# Recap from model-b"],
+    })
+    prepared = []
+    released = []
+
+    def prepare(model):
+        prepared.append(model)
+        return f"upload for {model}"
+
+    def cleanup(resource):
+        released.append(resource)
+
+    call = FailoverCall(
+        description="chunk transcription",
+        label="transcription",
+        contents=["audio", "prompt"],
+        models=["model-a", "model-b"],
+        max_retries=2,
+        backoff_step=0,
+        temperature=0.1,
+        prepare=prepare,
+        cleanup=cleanup,
+    )
+
+    assert generate_with_failover(provider, call) == "# Recap from model-b"
+    # Each model uploads before its retry sweep and releases afterwards, so a
+    # retry reuses the upload instead of paying for it again.
+    assert prepared == ["model-a", "model-b"]
+    assert released == ["upload for model-a", "upload for model-b"]
+
+
+def test_resource_is_released_even_when_a_models_sweep_fails():
+    provider = FakeGeminiProvider({"model-a": [RuntimeError("503 UNAVAILABLE")]})
+    released = []
+
+    call = FailoverCall(
+        description="chunk transcription",
+        label="transcription",
+        contents=["audio", "prompt"],
+        models=["model-a"],
+        max_retries=1,
+        backoff_step=0,
+        prepare=lambda model: "upload",
+        cleanup=released.append,
+    )
+
+    try:
+        generate_with_failover(provider, call)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an exhausted Failover chain must raise RuntimeError")
+    assert released == ["upload"]
+
+
+def transcription_failover_chain(lead_model):
+    """The Failover chain the transcription path walks when the Engine pins a model."""
+    return [lead_model] + [m for m in FALLBACK_MODELS if m != lead_model]
+
+
+def test_transcribed_chunk_is_uploaded_once_and_the_upload_is_deleted():
+    """One upload brackets that model's whole retry sweep, and is deleted after."""
+    provider = FakeGeminiProvider({"model-a": ["[00:01] Speaker 1: Setuju."]})
+
+    transcript = transcribe_audio_chunk(provider, "chunk_0.wav", model_override="model-a")
+
+    assert transcript == "[00:01] Speaker 1: Setuju."
+    assert provider.attempts_on("model-a") == 1
+    assert [upload["file"] for upload in provider.files.uploads] == ["chunk_0.wav"]
+    assert provider.files.deleted == ["files/fake-1"]
+
+
+def test_transcription_reuses_one_upload_across_a_models_retries():
+    """A retry reaches for the same upload rather than paying for it again."""
+    from src import gemini_failover
+
+    provider = FakeGeminiProvider({
+        "model-a": [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            "[00:01] Speaker 1: Setuju.",
+        ],
+    })
+    with recording_waits(gemini_failover) as waits:
+        transcript = transcribe_audio_chunk(
+            provider, "chunk_0.wav", max_retries=3, model_override="model-a"
+        )
+
+    assert transcript == "[00:01] Speaker 1: Setuju."
+    assert provider.attempts_on("model-a") == 3
+    # Three generations, but the chunk was uploaded to the provider only once.
+    assert len(provider.files.uploads) == 1
+    assert provider.files.deleted == ["files/fake-1"]
+    # Transcription backs off by attempt * 4 seconds, unlike the text paths'
+    # attempt * 5.
+    assert waits == [4, 8]
+
+
+def test_transcription_fails_over_to_a_later_model_after_a_transient_error():
+    """One flaky model does not lose the chunk, and each model pays for its own upload."""
+    from src import gemini_failover
+
+    next_model = FALLBACK_MODELS[0]
+    provider = FakeGeminiProvider({
+        "model-a": [RuntimeError("503 UNAVAILABLE")] * 2,
+        next_model: ["[00:02] Speaker 2: Baik."],
+    })
+    with recording_waits(gemini_failover):
+        transcript = transcribe_audio_chunk(
+            provider, "chunk_0.wav", max_retries=2, model_override="model-a"
+        )
+
+    assert transcript == "[00:02] Speaker 2: Baik."
+    assert provider.attempts_on("model-a") == 2
+    assert provider.attempts_on(next_model) == 1
+    # Each model uploads before its own retry sweep, so model-a's upload is
+    # gone before the next model's begins, and both are deleted.
+    assert [upload["name"] for upload in provider.files.uploads] == ["files/fake-1", "files/fake-2"]
+    assert provider.files.deleted == ["files/fake-1", "files/fake-2"]
+
+
+def test_transcription_deletes_the_uploaded_audio_when_the_run_is_cancelled():
+    from src import gemini_failover
+
+    cancel_event = threading.Event()
+    provider = FakeGeminiProvider({"model-a": [RuntimeError("503 UNAVAILABLE")]})
+    original_sleep = gemini_failover.cancellable_sleep
+
+    # The user cancels while the retry backoff is running.
+    def cancel_during_backoff(event, seconds, *args):
+        cancel_event.set()
+        return True
+
+    gemini_failover.cancellable_sleep = cancel_during_backoff
+    try:
+        transcribe_audio_chunk(
+            provider, "chunk_0.wav", model_override="model-a", cancel_event=cancel_event
+        )
+    except CancelledError:
+        pass
+    else:
+        raise AssertionError("a cancelled transcription must raise CancelledError")
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert provider.files.uploads != []
+    assert provider.files.deleted == ["files/fake-1"]
+
+
+def test_cancellation_during_an_upload_leaves_no_file_in_provider_storage():
+    """An abandoned upload is released even though it never reaches a caller."""
+    cancel_event = threading.Event()
+    # The provider cancels the run the moment it accepts the upload, and the
+    # file is still processing when it is asked for again.
+    provider = FakeGeminiProvider(
+        {"model-a": ["[00:01] Speaker 1: Setuju."]},
+        files=FakeFilesApi(processing_polls=3, on_upload=cancel_event.set),
+    )
+
+    try:
+        transcribe_audio_chunk(
+            provider, "chunk_0.wav", model_override="model-a", cancel_event=cancel_event
+        )
+    except CancelledError:
+        pass
+    else:
+        raise AssertionError("a cancelled transcription must raise CancelledError")
+
+    assert [upload["file"] for upload in provider.files.uploads] == ["chunk_0.wav"]
+    assert provider.files.deleted == ["files/fake-1"]
+    # Nothing was ever transcribed, so nothing reached the provider's models.
+    assert provider.attempts_on("model-a") == 0
+
+
+def test_transcription_diarization_still_turns_off_for_weak_models():
+    """Diarization policy for weak models is out of scope, so it is unchanged."""
+    tail = "[00:58] Speaker 1: Jadi kita sambung."
+
+    provider = FakeGeminiProvider({"model-a": ["[00:01] Speaker 1: Setuju."]})
+    transcribe_audio_chunk(
+        provider, "chunk_0.wav", previous_tail_transcript=tail, model_override="model-a"
+    )
+    prompt = provider.calls[0]["contents"][1]
+
+    assert "Speaker Diarization" in prompt
+    assert "[MM:SS] Speaker X: <Spoken content>" in prompt
+    # Tail context carries across the chunk seam.
+    assert tail in prompt
+
+    provider = FakeGeminiProvider({"gemini-3.5-flash-lite": ["[00:01] Setuju."]})
+    transcribe_audio_chunk(
+        provider,
+        "chunk_0.wav",
+        previous_tail_transcript=tail,
+        model_override="gemini-3.5-flash-lite",
+    )
+    weak_prompt = provider.calls[0]["contents"][1]
+
+    assert "Clean Transcription" in weak_prompt
+    assert "Speaker Diarization" not in weak_prompt
+    assert "SPEAKER CONTINUITY GUIDANCE" not in weak_prompt
+
+
+def test_transcription_reports_its_own_progress_wording():
+    """The transcription progress a user reads today is kept as it was."""
+    from src import gemini_failover
+
+    next_model = FALLBACK_MODELS[0]
+    provider = FakeGeminiProvider({
+        "model-a": [
+            RuntimeError("503 UNAVAILABLE"),
+            RuntimeError("503 UNAVAILABLE"),
+            RuntimeError("503 UNAVAILABLE"),
+        ],
+        next_model: ["[00:03] Speaker 1: Jumpa."],
+    })
+    messages = []
+    with recording_waits(gemini_failover):
+        transcribe_audio_chunk(
+            provider,
+            "chunk_0.wav",
+            progress_callback=messages.append,
+            max_retries=3,
+            model_override="model-a",
+        )
+
+    assert "Uploading chunk to Google Files API..." in messages
+    assert "Calling Gemini model-a (Attempt 1/3)..." in messages
+    assert "Server notice. Retrying in 4s..." in messages
+    assert "Calling Gemini %s (Attempt 1/3)..." % next_model in messages
+    # The text-generation wording must not leak into the transcription path.
+    assert not any(message.startswith("Server busy") for message in messages)
+
+
+def test_transcription_keeps_its_own_quota_failure_message():
+    chain = transcription_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        transcribe_audio_chunk(provider, "chunk_0.wav", model_override="model-a")
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please try again later once your Gemini quota resets, or use a different API key."
+            % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+def minutes_failover_chain(lead_model):
+    """The Failover chain the Minutes path walks when the Engine pins a model."""
+    return [lead_model] + [m for m in MINUTES_FALLBACK_MODELS if m != lead_model]
+
+
+def test_minutes_path_fails_over_to_the_next_model_on_a_quota_failure():
+    """Minutes delegates Quota failure handling, so it behaves as Recap does."""
+    chain = minutes_failover_chain("model-a")
+    lead, fallback = chain[0], chain[1]
+    provider = FakeGeminiProvider({
+        lead: [quota_failure_error()],
+        fallback: ["# Minutes from the fallback model"],
+    })
+
+    minutes = generate_meeting_minutes(
+        provider, "a long transcript", language="English", model_override=lead
+    )
+
+    assert minutes == "# Minutes from the fallback model"
+    # A Quota failure ends this model's retry sweep at once, exactly as it does
+    # for the Recap path.
+    assert provider.attempts_on(lead) == 1
+    assert provider.attempts_on(fallback) == 1
+
+
+def test_minutes_path_retries_a_transient_error_with_backoff_then_answers():
+    """A transient fault spends the retry count, then Minutes answers."""
+    chain = minutes_failover_chain("model-a")
+    lead = chain[0]
+    provider = FakeGeminiProvider({
+        lead: [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            "# Minutes from model-a",
+        ],
+    })
+    messages = []
+    waits = []
+    from src import gemini_failover
+
+    original_sleep = gemini_failover.cancellable_sleep
+    # Backoff is a boundary of the shared policy, so record the waits it asks
+    # for instead of spending them.
+    gemini_failover.cancellable_sleep = lambda cancel_event, seconds: waits.append(seconds) or True
+    try:
+        minutes = generate_meeting_minutes(
+            provider, "a long transcript", language="English", model_override=lead,
+            progress_callback=messages.append,
+        )
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert minutes == "# Minutes from model-a"
+    # Today's Minutes path backs off by attempt * 5 seconds...
+    assert waits == [5, 10]
+    # ...and pins the text-generation temperature.
+    assert provider.calls[0]["config"]["temperature"] == 0.2
+    # The progress wording a user reads is unchanged.
+    assert "Server busy. Retrying in 5s (Attempt 2/3)..." in messages
+    assert "Server busy. Retrying in 10s (Attempt 3/3)..." in messages
+    assert "Generating minutes with %s (Attempt 1/3)..." % lead in messages
+
+
+def test_minutes_quota_failure_message_is_unchanged():
+    chain = minutes_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        generate_meeting_minutes(
+            provider, "a long transcript", language="English", model_override="model-a"
+        )
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please check your Google AI Studio quota limits or retry tomorrow." % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+ANCHORED_ACTION_MINUTES = """# Action Minutes of Meeting
+
+**Meeting Title:** Q3 Platform Steering Sync
+**Date & Time:** 14 October 2026, 10:30 AM
+**Location / Link:** Video Conference Link
+**Chairperson:** Aisha Rahman
+**Minute Taker:** Lim Wei
+**Attendees:** Priya, Danial, Aisha, Lim
+**Absentees:** -
+
+---
+
+## 1. Meeting Objective
+Confirm the launch sequence for the payments rollout and agree who owns each gate. (03:41)
+
+---
+
+## 2. Review of Prior Action Items
+* **Circulate the revised rollout plan:** Completed — *Notes:* Plan reissued after the March review.
+
+---
+
+## 3. Agenda Items & Decisions Reached
+
+### Agenda Item 1: Payments rollout staging
+* **Summary of Outcome:** The team agreed to stage the rollout behind a feature flag. (12:34)
+* **Formal Decision:** Stage two goes live only after the error budget holds for 72 hours. (15:02)
+
+### Agenda Item 2: Support readiness
+* **Summary of Outcome:** Support needs the staging window confirmed before sign-off.
+* **Formal Decision:** Sign-off is delegated to the duty manager.
+
+---
+
+## 4. Action Item Register
+
+| # | Action Item / Deliverable | Owner | Target Due Date | Status |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | Circulate the revised rollout plan | Priya | 20/10/2026 | Open (12:34) |
+| 2 | Confirm the staging window with Support | Danial | 17/10/2026 | Open (1:07:45) |
+(Extract all concrete commitments and tasks)
+
+---
+
+## 5. Next Meeting
+* **Date & Time:** 28 October 2026, 10:30 AM
+* **Tentative Agenda:** Rollout review, error budget, support readiness
+
+"""
+
+
+def a_transcript_carrying_its_own_markers():
+    """A meeting long enough to cross the hour boundary the markers switch on."""
+    return (
+        "[00:12] Aisha: Welcome, let us start with the rollout sequence.\n"
+        "[03:41] Priya: The objective today is to confirm the staging plan.\n"
+        "[12:34] Priya: I propose we stage the rollout behind a feature flag.\n"
+        "[15:02] Aisha: Agreed, stage two waits on the error budget.\n"
+        "[22:14] Danial: Support needs the staging window confirmed first.\n"
+        "[01:07:45] Danial: I will confirm the staging window with Support.\n"
+    )
+
+
+def an_anchored_document_from_the_fake_provider():
+    """Minutes as a caller receives them: generated, then handed back whole."""
+    provider = FakeGeminiProvider({"model-a": [ANCHORED_ACTION_MINUTES]})
+    minutes = generate_meeting_minutes(
+        provider,
+        a_transcript_carrying_its_own_markers(),
+        language="English",
+        template="action_minutes",
+        model_override="model-a",
+    )
+    return minutes
+
+
+def test_english_action_minutes_hands_the_caller_a_document_anchored_to_the_transcript():
+    """
+    Anchors are the model's job, so what a caller receives is the place to see them:
+    a bullet points back to the marker it came from, one past the hour takes the
+    hour form, and an item the model had nothing to point at carries none.
+    """
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    anchored_bullets = [line for line in minutes.splitlines() if line.startswith("* ")]
+    assert any(line.endswith("(12:34)") for line in anchored_bullets), anchored_bullets
+    assert any(line.endswith("(15:02)") for line in anchored_bullets), anchored_bullets
+    # Past the hour the anchor takes the hour form the Transcript's own markers use.
+    assert "(1:07:45)" in minutes
+    # An item with nothing in the Transcript to point at gets no anchor and no
+    # placeholder -- its neighbours carry one, and absence is still correct.
+    assert any(
+        line.startswith("* **Summary of Outcome:** Support needs the staging window")
+        and not line.endswith(")")
+        for line in anchored_bullets
+    ), anchored_bullets
+
+
+def test_time_anchors_stay_off_the_metadata_and_the_headings():
+    """Anchors record where content came from, so structure carries none."""
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    anchored_structure = [
+        line for line in minutes.splitlines()
+        if line.startswith("#") or line.startswith("**")
+    ]
+    assert anchored_structure
+    assert [line for line in anchored_structure if re.search(r"\(\d{1,2}:\d{2}(:\d{2})?\)\s*$", line)] == []
+    # The Date & Time fields read as written, never as something that looks like
+    # a point in the recording.
+    date_lines = [line for line in minutes.splitlines() if line.startswith("**Date & Time:**")]
+    assert date_lines and all(re.search(r"\(\d{1,2}:\d{2}\)", line) is None for line in date_lines)
+
+
+def test_anchors_disturb_the_buckets_parsed_out_of_the_generated_document():
+    """
+    The document is what gets displayed and exported; the buckets are parsed from
+    it and must come out carrying the anchors rather than trimmed of them.
+    """
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    sections = parse_minutes_sections(minutes)
+
+    assert sections["full_text"] == minutes
+    assert "(03:41)" in sections["summary"]
+    assert "(12:34)" in sections["highlights"]
+    assert "(1:07:45)" in sections["action_items"]
+
+
+def test_the_minutes_tab_renders_an_anchored_document_with_the_renderer_it_has():
+    """
+    Anchors are plain text inside an existing bullet, so the Minutes tab needs no
+    change to show them. The viewer needs a display to construct, so its rendering
+    is driven through an object that keeps what it was asked to draw.
+    """
+    from src.ui.markdown_view import MarkdownViewer
+
+    class AViewerThatOnlyRecords:
+        """The renderer's whole output surface, answered without a display."""
+
+        # The renderer walks the document through these two, and both of them do
+        # nothing but insert -- which is what the recording stands in for.
+        _render_inline_spans = MarkdownViewer._render_inline_spans
+        _render_table = MarkdownViewer._render_table
+
+        def __init__(self):
+            self.drawn = []
+
+        def insert(self, index, text, tags=None):
+            self.drawn.append((tags, text))
+
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    viewer = AViewerThatOnlyRecords()
+    MarkdownViewer._render_markdown(viewer, minutes)
+    rendered = "".join(text for _tags, text in viewer.drawn)
+
+    # Every anchored bullet and cell is drawn, anchor included.
+    assert "The team agreed to stage the rollout behind a feature flag. (12:34)" in rendered
+    assert "Open (1:07:45)" in rendered
+    assert "Confirm the staging window with Support" in rendered
+    # And the unanchored item renders whole, rather than being cut short by a
+    # renderer looking for an anchor to strip.
+    assert "Support needs the staging window confirmed before sign-off." in rendered
+    # Headings stay headings, so the structure is not cluttered by markers.
+    assert not [tags for tags, text in viewer.drawn if tags == "h1" and "(1:07:45)" in text]
+
+
+# ---------------------------------------------------------------------------
+# The export seam
+#
+# Anchors are written by the model, so whether they reach the exported document is
+# only visible on the file that comes out. Every test below writes into a temporary
+# directory and reads that file back -- the highest point at which the toggle's
+# behaviour exists -- and never reaches into the strip itself.
+# ---------------------------------------------------------------------------
+
+ANCHORED_RECAP = """# Meeting Recap
+
+The team agreed to stage the payments rollout behind a feature flag. (12:34)
+
+| Item | Owner |
+| :- | :- |
+| Staging window confirmed | Danial (5:02) |
+"""
+
+ANCHORED_ACTIONS = """# Action Item Register
+
+| # | Action | Owner |
+| :- | :- | :- |
+| 1 | Circulate the rollout plan | Priya (12:34) |
+"""
+
+UNANCHORED_MINUTES = """# Minutes of Meeting
+
+**Date & Time:** 14 October 2026, 10:30 AM
+
+## 1. Objective
+The team confirmed the staging plan before breaking for lunch.
+
+## 2. Action Item Register
+
+| # | Action | Owner |
+| :- | :- | :- |
+| 1 | Circulate the rollout plan | Priya |
+"""
+
+MINUTES_WITH_AN_ITEM_THAT_HAS_NO_ANCHOR = """# Minutes of Meeting
+
+**Date & Time:** 14 October 2026, 10:30 AM
+
+## 1. Decisions Reached
+
+* **Summary of Outcome:** The team agreed to stage the rollout behind a feature flag. (12:34)
+* **Summary of Outcome:** Sign-off is delegated to the duty manager (as at last quarter).
+
+## 2. Action Item Register
+
+| # | Action | Owner |
+| :- | :- | :- |
+| 1 | Circulate the rollout plan | Priya |
+| 2 | Confirm the staging window with Support | Danial |
+"""
+
+MEETING_DOCUMENTS = {
+    "minutes": ANCHORED_ACTION_MINUTES,
+    "transcript": None,  # filled in below, once the transcript fixture exists
+    "recap": ANCHORED_RECAP,
+    "actions": ANCHORED_ACTIONS,
+}
+MEETING_DOCUMENTS["transcript"] = a_transcript_carrying_its_own_markers()
+
+
+class RecordingMessageboxes:
+    """The message boxes the export handler reaches for, keeping rather than showing."""
+
+    def __init__(self):
+        self.shown = []
+
+    def showinfo(self, title, message):
+        self.shown.append(("info", message))
+
+    def showwarning(self, title, message):
+        self.shown.append(("warning", message))
+
+    def showerror(self, title, message):
+        self.shown.append(("error", message))
+
+
+class ExportWindow:
+    """
+    The window the export handler reads, with nothing constructed and nothing drawn.
+
+    The save dialog and the message boxes are the only things between a person and a
+    written file, so both are answered here and the file is left for the test to read.
+    """
+
+    def __init__(self, tab, documents, save_dir, include_time_anchors=True):
+        self.tabview = SimpleNamespace(get=lambda: tab)
+        self.selected_audio_file = str(Path(save_dir) / "q3_platform_sync.wav")
+        self.processed_transcript = documents["transcript"]
+        self.generated_minutes = documents["minutes"]
+        self.generated_recap = documents["recap"]
+        self.generated_actions = documents["actions"]
+        self.ui_locale = "en"
+        self.include_time_anchors = include_time_anchors
+        self.include_time_anchors_var = SimpleNamespace(get=lambda: self.include_time_anchors)
+        self.saved = []
+        self.box = None
+
+    def borrow_export_from(self, app_class):
+        for name in ("_t", "_export_document"):
+            setattr(self, name, types.MethodType(getattr(app_class, name), self))
+        return self
+
+    def answer_the_save_dialog(self, **kwargs):
+        """Where a file asked to be saved is actually saved, inside the temp directory."""
+        self.saved.append(kwargs["initialfile"])
+        return str(Path(self.selected_audio_file).parent / kwargs["initialfile"])
+
+
+@contextmanager
+def exported_documents(tab, documents=None, include_time_anchors=True, fmt="txt"):
+    """Run one export into a temporary directory and hand back what it wrote."""
+    from src.ui import app_window
+
+    documents = MEETING_DOCUMENTS if documents is None else documents
+    with tempfile.TemporaryDirectory() as tmp:
+        window = ExportWindow(tab, documents, tmp, include_time_anchors).borrow_export_from(
+            app_window.STTMeetApp
+        )
+        window.box = RecordingMessageboxes()
+        original_dialog = app_window.filedialog.asksaveasfilename
+        original_messagebox = app_window.messagebox
+        app_window.filedialog.asksaveasfilename = window.answer_the_save_dialog
+        app_window.messagebox = window.box
+        try:
+            app_window.STTMeetApp._export_document(window, fmt)
+            yield window, {name: Path(tmp) / name for name in window.saved}
+        finally:
+            app_window.filedialog.asksaveasfilename = original_dialog
+            app_window.messagebox = original_messagebox
+
+
+def the_only_file(written):
+    """The single file an export produced, asserted to be the only one."""
+    assert len(written) == 1, written
+    return next(iter(written.values()))
+
+
+def read_docx(path):
+    """A Word document as a caller receives it: its paragraphs and its tables."""
+    from docx import Document
+
+    document = Document(str(path))
+    paragraphs = [p.text for p in document.paragraphs]
+    tables = [[cell.text for cell in row.cells]
+              for table in document.tables for row in table.rows]
+    return paragraphs, tables
+
+
+def read_docx_bold_runs(path):
+    """Every run of every paragraph, with whether Word renders it bold."""
+    from docx import Document
+
+    document = Document(str(path))
+    return [(run.text, bool(run.font.bold))
+            for paragraph in document.paragraphs for run in paragraph.runs]
+
+
+def test_the_time_anchor_toggle_decides_what_the_text_export_carries():
+    """
+    The whole point of the switch: the person writing minutes out chooses whether the
+    trail goes with them. Off means the document reads as a finished record, and the
+    anchors are gone from a bullet, from a line of prose and from a table cell alike.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False) as (_window, written):
+        clean = the_only_file(written).read_text(encoding="utf-8")
+
+    with exported_documents("tab_minutes", include_time_anchors=True) as (_window, written):
+        anchored = the_only_file(written).read_text(encoding="utf-8")
+
+    # Off: no anchor of either form survives anywhere in the document.
+    assert "(12:34)" not in clean, clean
+    assert "(1:07:45)" not in clean, clean
+    # And what the anchors were attached to is still there, whole.
+    assert "The team agreed to stage the rollout behind a feature flag." in clean
+    assert "Confirm the staging window with Support" in clean
+    assert "Stage two goes live only after the error budget holds for 72 hours." in clean
+    # On: the trail is back in the exported document, on all three kinds of line.
+    assert "(12:34)" in anchored
+    assert "(1:07:45)" in anchored
+
+
+def test_the_time_anchor_toggle_decides_what_the_word_export_carries():
+    """
+    The same question asked of the Word document, which is where stripping has the most
+    to lose: the anchors sit inside bullets and inside table cells, and a strip that
+    damaged the Markdown would show up as a table that no longer has its columns.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False, fmt="docx") as (_w, written):
+        clean_paragraphs, clean_tables = read_docx(the_only_file(written))
+
+    with exported_documents("tab_minutes", include_time_anchors=True, fmt="docx") as (_w, written):
+        anchored_paragraphs, anchored_tables = read_docx(the_only_file(written))
+
+    everything = "\n".join(clean_paragraphs + [cell for row in clean_tables for cell in row])
+    assert "(12:34)" not in everything, everything
+    assert "(1:07:45)" not in everything, everything
+    # The content the anchors closed is still there, on the bullet and in the cell.
+    assert "Summary of Outcome: The team agreed to stage the rollout behind a feature flag." in clean_paragraphs
+    assert any(row[-1] == "Open" for row in clean_tables), clean_tables
+    # On, the trail is back in the Word document too.
+    assert any("(12:34)" in p for p in anchored_paragraphs)
+    assert any("(1:07:45)" in cell for row in anchored_tables for cell in row)
+
+
+def test_the_time_anchor_toggle_reaches_only_the_minutes_branch():
+    """
+    Stripping belongs to the Minutes and to nothing else. The Transcript's markers are
+    how that document is read at all, the Recap and Action items were never anchored,
+    and the appendix hung off a Minutes export is still the Transcript -- so every one
+    of them comes out of the export in either position of the switch, unchanged.
+    """
+    for tab in ("tab_transcript", "tab_recap", "tab_actions"):
+        with exported_documents(tab, include_time_anchors=False) as (_window, off):
+            without = the_only_file(off).read_bytes()
+        with exported_documents(tab, include_time_anchors=True) as (_window, on):
+            with_anchors = the_only_file(on).read_bytes()
+
+        assert without == with_anchors, tab
+
+    # And the markers themselves are visibly still in the Transcript export, which is
+    # the thing being protected rather than a coincidence of identical bytes.
+    with exported_documents("tab_transcript", include_time_anchors=False) as (_window, written):
+        transcript = the_only_file(written).read_text(encoding="utf-8")
+    assert "[12:34] Priya: I propose we stage the rollout behind a feature flag." in transcript
+
+
+def test_the_transcript_appended_to_a_minutes_export_keeps_its_own_markers():
+    """
+    The appendix in a Minutes Word export is the Transcript, and its markers are the
+    Transcript's own. They are the one marker the switch must not reach, or a clean
+    export would hand over an appendix with every turn unplaceable in the recording.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False, fmt="docx") as (_w, written):
+        paragraphs, _tables = read_docx(the_only_file(written))
+
+    appendix = [p for p in paragraphs if p.startswith("[")]
+    assert appendix, "the Minutes export carries no transcript appendix at all"
+    assert "[12:34] Priya: I propose we stage the rollout behind a feature flag." in appendix
+    assert "[01:07:45] Danial: I will confirm the staging window with Support." in appendix
+
+
+def test_stripping_does_not_damage_the_markdown_around_the_anchors():
+    """
+    The strip runs before the renderers, so a mistake in it arrives as a broken table
+    rather than as an error -- a dropped pipe, a swallowed bold span, a cell lost to
+    the cell after it. This is the failure that would be least likely to be noticed by
+    eye, so it is asserted structurally: the exported table has the shape the Minutes
+    document declares, and the bold spans are still bold.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False, fmt="docx") as (_w, written):
+        clean = the_only_file(written)
+        _paragraphs, clean_tables = read_docx(clean)
+        clean_bold = read_docx_bold_runs(clean)
+
+    with exported_documents("tab_minutes", include_time_anchors=True, fmt="docx") as (_w, written):
+        anchored = the_only_file(written)
+        _paragraphs, anchored_tables = read_docx(anchored)
+        anchored_bold = read_docx_bold_runs(anchored)
+
+    # The register is the last table written, and it is five columns wide in both
+    # positions -- pipes intact, the alignment row still skipped rather than exported.
+    clean_register = clean_tables[2:]
+    anchored_register = anchored_tables[2:]
+    assert anchored_register and len(anchored_register[0]) == 5
+    assert [len(row) for row in clean_register] == [len(row) for row in anchored_register]
+    assert [row[0] for row in clean_register] == [row[0] for row in anchored_register]
+    # The header survives whole, so the separator row was recognised as markdown.
+    assert clean_register[0][1] == "Action Item / Deliverable"
+    # Every cell of the document is intact, minus its anchor.
+    assert clean_register[1][4] == "Open"
+    assert clean_register[2][1] == "Confirm the staging window with Support"
+    # Bold spans are still bold in both positions: stripping the anchor did not
+    # flatten the emphasis around it.
+    assert [text for text, bold in clean_bold if bold]
+    assert [text for text, bold in clean_bold if bold] == [text for text, bold in anchored_bold if bold]
+    assert ("Formal Decision:", True) in clean_bold
+
+
+def test_a_minutes_document_with_no_anchors_exports_the_same_in_either_position():
+    """
+    A Minutes may carry no anchors at all -- the model writes them only where it had
+    something to point at. Turning the switch off on such a document is a request for
+    nothing, so the file is identical rather than the export failing, and nothing is
+    shown to the person as having gone wrong.
+    """
+    documents = dict(MEETING_DOCUMENTS, minutes=UNANCHORED_MINUTES)
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False) as (window, off):
+        without = the_only_file(off).read_bytes()
+    with exported_documents("tab_minutes", documents, include_time_anchors=True) as (window, on):
+        with_anchors = the_only_file(on).read_bytes()
+
+    assert without == with_anchors
+    assert "Circulate the rollout plan" in without.decode("utf-8")
+    assert [kind for kind, _message in window.box.shown] == ["info"]
+
+
+def test_an_item_with_no_anchor_is_exported_whole_rather_than_damaged():
+    """
+    Half a document is anchored and half is not, which is the ordinary case. The items
+    with no anchor -- and the ordinary parenthesised aside one of them happens to
+    carry -- come through the strip untouched, since there is nothing there to remove.
+    """
+    documents = dict(MEETING_DOCUMENTS, minutes=MINUTES_WITH_AN_ITEM_THAT_HAS_NO_ANCHOR)
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False, fmt="docx") as (_w, written):
+        paragraphs, tables = read_docx(the_only_file(written))
+
+    # The anchored bullet loses its anchor and nothing else.
+    assert "Summary of Outcome: The team agreed to stage the rollout behind a feature flag." in paragraphs
+    # The unanchored one is not shortened, and its aside is not mistaken for an anchor.
+    assert "Summary of Outcome: Sign-off is delegated to the duty manager (as at last quarter)." in paragraphs
+    # A table row whose cells carry no anchor keeps both of its values.
+    assert "Confirm the staging window with Support" in [cell for row in tables for cell in row]
+
+
+def test_multi_timestamp_anchors_are_stripped_cleanly():
+    """
+    Minutes synthesis often references multiple points in the transcript for a single
+    decision or action, producing comma-separated anchors such as (28:44, 38:00) or
+    (1:50, 3:42, 5:10). The strip must remove these completely without leaving orphaned
+    timestamps behind or damaging surrounding punctuation.
+    """
+    sample_with_multi_anchors = (
+        "# Action Minutes of Meeting\n\n"
+        "## 1. Meeting Objective\n"
+        "Review pro-tem federation proposals (1:50, 3:42).\n\n"
+        "## 2. Review of Prior Action Items\n"
+        "* **Action 1:** Finalize documents (28:44, 38:00).\n"
+        "* **Action 2:** Multi-stage review completed (12:34, 15:20, 1:05:40).\n\n"
+        "## 3. Action Item Register\n\n"
+        "| # | Deliverable | Owner | Deadline | Status |\n"
+        "| :- | :--- | :--- | :--- | :--- |\n"
+        "| 1 | Pro-tem registration (28:44, 38:00) | Secretariat | ASAP (22:04) | Open |\n"
+    )
+    documents = dict(MEETING_DOCUMENTS, minutes=sample_with_multi_anchors)
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False, fmt="txt") as (_w, written):
+        text = the_only_file(written).read_text(encoding="utf-8")
+
+    assert "(1:50, 3:42)" not in text
+    assert "(28:44, 38:00)" not in text
+    assert "(12:34, 15:20, 1:05:40)" not in text
+    assert "(22:04)" not in text
+    assert "Review pro-tem federation proposals." in text
+    assert "Finalize documents." in text
+    assert "Multi-stage review completed." in text
+    assert "Pro-tem registration" in text
+    assert "Secretariat" in text
+
+
+def without_the_generation_stamp(path):
+    """
+    A written file with the line every export stamps on itself removed.
+
+    The stamp is the moment of writing rather than part of the document, and two runs
+    a second apart would differ on it alone -- which would make a byte-for-byte
+    comparison a coin toss rather than a fact about the toggle.
+    """
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines()
+             if not line.startswith(translate("export.generated_on", "en"))]
+    return "\n".join(lines).encode("utf-8")
+
+
+def test_with_the_switch_on_the_exported_documents_are_what_they_were():
+    """
+    A switch that changes a document in its off position has changed it in its on
+    position too, so the on position is checked against the writers themselves: the
+    same text, the same title, handed straight to the writer with nothing in between.
+    Any transform that leaked into the on position would show up here as a difference.
+    """
+    from src.exporter import export_to_docx, export_to_text
+
+    title = translate("export.title_minutes", "en", name="q3_platform_sync")
+    transcript = a_transcript_carrying_its_own_markers()
+
+    with exported_documents("tab_minutes", include_time_anchors=True) as (_window, written):
+        exported_text = without_the_generation_stamp(the_only_file(written))
+    with exported_documents("tab_minutes", include_time_anchors=True, fmt="docx") as (_window, written):
+        exported_docx = the_only_file(written)
+        exported_word = (read_docx(exported_docx), read_docx_bold_runs(exported_docx))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reference_text = Path(tmp) / "reference.txt"
+        reference_docx = Path(tmp) / "reference.docx"
+        export_to_text(str(reference_text), title, ANCHORED_ACTION_MINUTES, transcript, "en")
+        export_to_docx(str(reference_docx), title, ANCHORED_ACTION_MINUTES,
+                       raw_transcript=transcript, locale="en")
+
+        assert exported_text == without_the_generation_stamp(reference_text)
+        assert exported_word == (read_docx(reference_docx), read_docx_bold_runs(reference_docx))
+
+
+def test_turning_the_switch_off_leaves_the_minutes_on_screen_exactly_as_they_were():
+    """
+    The Minutes always carry their anchors, in either position of the switch -- that is
+    what makes flipping it back on instant and free. Nothing is regenerated to do it,
+    and the document the tab is showing is the same object it was before the flip.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=True) as (window, written):
+        on_screen = window.generated_minutes
+        anchored = the_only_file(written).read_text(encoding="utf-8")
+
+    # The person turns it off, and exports again from the same window.
+    with exported_documents("tab_minutes", include_time_anchors=False) as (window, written):
+        clean = the_only_file(written).read_text(encoding="utf-8")
+
+    assert window.generated_minutes == on_screen
+    assert "(12:34)" in on_screen
+    assert "(12:34)" in anchored and "(12:34)" not in clean
+
+
+def test_export_all_carries_the_toggle_to_both_of_the_files_it_writes():
+    """
+    Export All is two exports, and setting the switch twice for it would be a decision
+    nobody should have to make. Both files it writes obey the one setting.
+    """
+    for include_time_anchors in (True, False):
+        with exported_documents("tab_minutes", include_time_anchors=include_time_anchors,
+                                fmt="all") as (_window, written):
+            assert len(written) == 2, written
+            documents = []
+            for path in written.values():
+                if path.suffix == ".docx":
+                    paragraphs, tables = read_docx(path)
+                    documents.append("\n".join(paragraphs + [c for r in tables for c in r]))
+                else:
+                    documents.append(path.read_text(encoding="utf-8"))
+
+        for document in documents:
+            assert ("(12:34)" in document) is include_time_anchors, document
+            # The Transcript goes out with both files and keeps its markers either way.
+            assert "[12:34] Priya: I propose we stage the rollout behind a feature flag." in document
+
+
+def test_the_conversion_the_writers_perform_survives_an_export_of_its_own():
+    """
+    The export module's Markdown conversion had no coverage at all until this, and the
+    constructs a generated document does not usually contain -- links, inline code,
+    images, emphasis -- are the ones a real meeting is most likely to carry by accident.
+    Asserted on the written file, in the plain-text form that has no Markdown left in
+    it: the readable text survives, and none of the syntax does.
+    """
+    documents = dict(MEETING_DOCUMENTS, minutes=(
+        "# Minutes of Meeting\n"
+        "\n"
+        "## 1. Reference Material\n"
+        "* **Rollout plan:** see the [staging runbook](https://example.invalid/runbook) for detail.\n"
+        "* **Flag name:** set `PAYMENTS_STAGED` before promoting.\n"
+        "* **Chart:** ![error budget](https://example.invalid/budget.png) had two breaches.\n"
+        "* **Decision:** hold the release until the *error budget* holds.\n"
+        "\n"
+    ))
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False) as (_window, written):
+        exported = the_only_file(written).read_text(encoding="utf-8")
+
+    # The readable text is all there...
+    assert "see the staging runbook for detail" in exported
+    assert "set PAYMENTS_STAGED before promoting" in exported
+    assert "had two breaches" in exported
+    assert "hold the release until the error budget holds" in exported
+    # ...and none of the syntax that was carrying it is.
+    assert "https://example.invalid/runbook" not in exported
+    assert "![error budget]" not in exported
+    assert "`PAYMENTS_STAGED`" not in exported
+    assert "**Rollout plan:**" not in exported
+
+
+def test_transcription_retries_an_empty_transcription_on_its_own_backoff():
+    """An empty transcription is not a chunk: it retries, then moves down the chain."""
+    from src import gemini_failover
+
+    next_model = FALLBACK_MODELS[0]
+    provider = FakeGeminiProvider({
+        "model-a": [empty_transcription_response(), empty_transcription_response()],
+        next_model: ["[00:04] Speaker 1: Lagi."],
+    })
+    with recording_waits(gemini_failover) as waits:
+        transcript = transcribe_audio_chunk(
+            provider, "chunk_0.wav", max_retries=2, model_override="model-a"
+        )
+
+    assert transcript == "[00:04] Speaker 1: Lagi."
+    assert provider.attempts_on("model-a") == 2
+    # An empty transcription backs off by attempt * 3 seconds, which is not the
+    # step a transient error backs off by.
+    assert waits == [3]
+
+
+def test_a_chunk_that_only_ever_comes_back_empty_is_not_a_transcript():
+    """Silence is never banked as the chunk's transcript."""
+    from src import gemini_failover
+
+    chain = transcription_failover_chain("model-a")
+    provider = FakeGeminiProvider({
+        model: [empty_transcription_response()] for model in chain
+    })
+    with recording_waits(gemini_failover):
+        try:
+            transcribe_audio_chunk(provider, "chunk_0.wav", max_retries=1, model_override="model-a")
+        except RuntimeError as error:
+            assert str(error).startswith("All available Gemini models (")
+        else:
+            raise AssertionError("an empty transcription must not pass for a transcript")
+
+
+def test_transcription_path_delegates_its_failure_policy_to_the_shared_module():
+    """The Quota failure predicate is written once, and transcription uses that one."""
+    source = (Path(__file__).parent / "src" / "gemini_transcriber.py").read_text(encoding="utf-8")
+
+    assert "RESOURCE_EXHAUSTED" not in source
+    assert "quota exceeded" not in source
+    assert "generate_with_failover" in source
+    assert "is_quota_failure" not in source
+
+
+def test_upload_lifecycle_is_an_input_to_the_policy_not_part_of_it():
+    """The policy brackets whatever a caller prepares; it never learns what it is."""
+    source = (Path(__file__).parent / "src" / "gemini_failover.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported = {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    assert "gemini_transcriber" not in imported
+
+    # The policy only ever reaches for the caller's resource through its
+    # prepare/cleanup callbacks: it names no provider file API of its own.
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert "files" not in attributes
+
+def test_minutes_and_action_items_delegate_their_failure_policy_to_the_shared_module():
+    """The Quota failure predicate is written once, and both paths use that one."""
+    source = (Path(__file__).parent / "src" / "minutes_generator.py").read_text(encoding="utf-8")
+
+    assert "RESOURCE_EXHAUSTED" not in source
+    assert "quota exceeded" not in source
+    assert "is_quota_failure" not in source
+    # Both generation paths hand their request to the shared policy.
+    assert source.count("generate_with_failover(client") == 2
+
+
+def test_action_items_path_fails_over_to_the_next_model_on_a_quota_failure():
+    """Action items delegates Quota failure handling, so it behaves as Recap does."""
+    chain = minutes_failover_chain("model-a")
+    lead, fallback = chain[0], chain[1]
+    provider = FakeGeminiProvider({
+        lead: [quota_failure_error()],
+        fallback: ["| 1 | Draft the brief | Deen | 2026-01-01 | Open |"],
+    })
+
+    register = generate_action_items(
+        provider, "a long transcript", language="English", model_override=lead
+    )
+
+    assert register == "| 1 | Draft the brief | Deen | 2026-01-01 | Open |"
+    # A Quota failure ends this model's retry sweep at once, exactly as it does
+    # for the Recap path.
+    assert provider.attempts_on(lead) == 1
+    assert provider.attempts_on(fallback) == 1
+
+
+def test_action_items_path_retries_a_transient_error_with_backoff_then_answers():
+    """A transient fault spends the retry count, then Action items answers."""
+    chain = minutes_failover_chain("model-a")
+    lead = chain[0]
+    provider = FakeGeminiProvider({
+        lead: [
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            RuntimeError("503 UNAVAILABLE: the model is overloaded"),
+            "| 1 | Draft the brief | Deen | 2026-01-01 | Open |",
+        ],
+    })
+    messages = []
+    waits = []
+    from src import gemini_failover
+
+    original_sleep = gemini_failover.cancellable_sleep
+    gemini_failover.cancellable_sleep = lambda cancel_event, seconds: waits.append(seconds) or True
+    try:
+        register = generate_action_items(
+            provider, "a long transcript", language="English", model_override=lead,
+            progress_callback=messages.append,
+        )
+    finally:
+        gemini_failover.cancellable_sleep = original_sleep
+
+    assert register == "| 1 | Draft the brief | Deen | 2026-01-01 | Open |"
+    # Today's Action items path backs off by attempt * 5 seconds...
+    assert waits == [5, 10]
+    # ...and pins the text-generation temperature.
+    assert provider.calls[0]["config"]["temperature"] == 0.2
+    # The progress wording a user reads is unchanged.
+    assert "Server busy. Retrying in 5s (Attempt 2/3)..." in messages
+    assert "Generating action items with %s (Attempt 1/3)..." % lead in messages
+
+
+def test_action_items_quota_failure_message_is_unchanged():
+    chain = minutes_failover_chain("model-a")
+    provider = FakeGeminiProvider({model: [quota_failure_error()] for model in chain})
+
+    try:
+        generate_action_items(
+            provider, "a long transcript", language="English", model_override="model-a"
+        )
+    except RuntimeError as error:
+        assert str(error) == (
+            "All available Gemini models (%s) exceeded daily free quotas or failed.\n"
+            "Please check your Google AI Studio quota limits or retry tomorrow." % ", ".join(chain)
+        )
+    else:
+        raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+def test_minutes_keep_their_own_failover_chain_apart_from_transcription():
+    """The Minutes Failover chain is not the transcription Failover chain."""
+    from src.config import FALLBACK_MODELS, MINUTES_FALLBACK_MODELS, MINUTES_MODEL_NAME, MODEL_NAME
+
+    assert MINUTES_MODEL_NAME != MODEL_NAME
+    assert MINUTES_FALLBACK_MODELS != FALLBACK_MODELS
+
+
 def test_tooltip_text_provider():
     from src.ui.tooltip import Tooltip
 
@@ -660,6 +2446,1998 @@ def test_audio_setup_wizard_integration():
     assert hasattr(STTMeetApp, "_open_audio_setup_wizard")
     assert hasattr(STTMeetApp, "_open_audio_setup_wizard_manual")
 
+def pipeline_run_provider(transcript_text, minutes_text, transcription_lead=None, minutes_lead=None):
+    """
+    A fake Gemini client serving one whole-Audio-file transcription and one Minutes
+    synthesis.
+
+    The two leads default to what each Failover chain leads with on its own; a pinned
+    Engine makes them the same model, which then answers both calls in order. Any other
+    model being reached for is a test failure, because nothing here should fail over.
+    """
+    transcription_lead = transcription_lead or MODEL_NAME
+    minutes_lead = minutes_lead or MINUTES_MODEL_NAME
+    script = {transcription_lead: [transcript_text]}
+    if minutes_lead == transcription_lead:
+        script[minutes_lead].append(minutes_text)
+    else:
+        script[minutes_lead] = [minutes_text]
+    return FakeGeminiProvider(script)
+
+
+def a_recording_audio_file(directory):
+    """A stand-in Audio file on disk: enough bytes to be hashed."""
+    path = Path(directory) / "meeting.mp3"
+    path.write_bytes(b"not really an mp3, but it is a file with a hash")
+    return path
+
+
+def test_a_whole_pipeline_run_reports_what_it_is_doing_and_yields_transcript_and_minutes():
+    """
+    A Pipeline run is reachable without a window: an Audio file with Chunking
+    off goes in, a Transcript and Minutes come out, and the only thing the run
+    says to its caller is reports.
+    """
+    transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Setuju, kita teruskan."
+    minutes = "# Minit\n\n## Keputusan\nSetuju."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
+        observer = RecordingObserver()
+
+        result = run_pipeline(
+            settings, observer, client=pipeline_run_provider(transcript, minutes)
+        )
+
+    assert result.transcript == transcript
+    assert result.minutes == minutes
+
+    # Per-Chunk status arrives on one channel, distinguished by phase. With
+    # Chunking off the whole recording is the one Chunk, at index 0.
+    assert observer.keys(Phase.CHUNK) == ["chunk.working", "chunk.done"]
+    assert [r.index for r in observer.reports if r.phase == Phase.CHUNK] == [0, 0]
+
+    # All four steps are badged through the same channel.
+    assert observer.steps() == [
+        ("step1", "working"), ("step1", "done"),
+        ("step2", "working"), ("step2", "done"),
+        ("step3", "working"), ("step3", "done"),
+        ("step4", "working"), ("step4", "done"),
+    ]
+
+
+def test_a_minutes_failure_never_costs_the_transcript():
+    """The Transcript is worth more than the Minutes, and says so without raising."""
+    transcript = "[00:01] Speaker 1: Setuju."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
+        observer = RecordingObserver()
+        # Every model of the Minutes chain refuses for the day.
+        script = {model: [quota_failure_error()] for model in MINUTES_FALLBACK_MODELS}
+        script[MODEL_NAME] = [transcript]
+        provider = FakeGeminiProvider(script)
+
+        result = run_pipeline(settings, observer, client=provider)
+
+    assert result.transcript == transcript
+    assert result.minutes == ""
+    assert result.minutes_error
+    assert "status.minutes_failed" in observer.keys()
+    assert observer.steps()[-1] == ("step4", "error")
+    # The Chunk still finished, and the Transcript was assembled from it.
+    assert observer.keys(Phase.CHUNK) == ["chunk.working", "chunk.done"]
+
+
+def test_the_run_honours_the_engine_and_the_processing_language():
+    """The Engine leads both Failover chains; the Processing language reaches the prompt."""
+    transcript = "[00:01] Speaker 1: Setuju."
+    minutes = "# Action Minutes of Meeting"
+    pinned = "☁️ Gemini 3.8 Flash"
+    provider = pipeline_run_provider(transcript, minutes, "gemini-3.8-flash", "gemini-3.8-flash")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            engine=pinned, language="English",
+            cache_dir=tmp,
+        )
+        observer = RecordingObserver()
+
+        result = run_pipeline(settings, observer, client=provider)
+
+    assert result.engine == "gemini-3.8-flash"
+    # Both calls went to the model the Engine pinned, and to no other model.
+    assert [call["model"] for call in provider.calls] == ["gemini-3.8-flash"] * 2
+    # The run said which Engine it is using, rather than the caller having to know.
+    engine_report = [r for r in observer.reports if r.key == "status.step3_engine"][0]
+    assert engine_report.args["engine"] == "gemini-3.8-flash"
+    # The Minutes were asked for in the Processing language.
+    minutes_prompt = provider.calls[1]["contents"][0]
+    assert "in English" in minutes_prompt
+    assert "Bahasa Melayu" not in minutes_prompt
+
+
+def test_every_report_a_run_makes_renders_from_its_key_and_args():
+    """
+    Reports carry a translation key and formatting arguments, never a finished
+    sentence: every one of them renders from the English table using only its own args.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
+        observer = RecordingObserver()
+
+        run_pipeline(settings, observer,
+                     client=pipeline_run_provider("[00:01] Speaker 1: Setuju.", "# Minit"))
+
+    reported = [r for r in observer.reports if r.phase in (Phase.STATUS, Phase.PROGRESS)]
+    assert reported
+    for report in reported:
+        assert has_key(report.key), report.key
+        rendered = translate(report.key, "en", **report.args)
+        assert rendered.strip()
+        # The formatting args are the sentence's variable parts; a run that handed over
+        # a finished sentence instead would have nowhere left to put them.
+        assert "{" not in rendered
+
+
+def test_a_run_defaults_to_what_the_desktop_app_persists():
+    """Both entry points start from the same settings, read once rather than copied."""
+    defaults = PipelineSettings(audio_path="anything.wav")
+
+    assert defaults.engine == DEFAULT_SETTINGS["engine"]
+    assert defaults.language == DEFAULT_SETTINGS["language"]
+    assert defaults.template == DEFAULT_SETTINGS["template"]
+    assert defaults.preprocess == DEFAULT_SETTINGS["preprocess"]
+    # Chunking is the one deliberate divergence: this run transcribes the whole
+    # recording as a single Chunk, so 0 rather than the desktop's default.
+    assert defaults.chunk_minutes == 0
+
+
+def test_a_cancelled_run_transcribes_nothing():
+    """A Pipeline run handed a set cancel event reports nothing and calls nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=False, cache_dir=tmp)
+        observer = RecordingObserver()
+        provider = pipeline_run_provider("[00:01] Speaker 1: Setuju.", "# Minit")
+        already_cancelled = threading.Event()
+        already_cancelled.set()
+
+        try:
+            run_pipeline(settings, observer, cancel_event=already_cancelled, client=provider)
+            raise AssertionError("a cancelled Pipeline run should not return a result")
+        except CancelledError:
+            pass
+
+    assert provider.calls == []
+    assert observer.reports == []
+
+
+def test_preprocessing_decides_which_audio_is_transcribed_and_reports_its_own_progress():
+    """The whole recording is preprocessed first, and what Preprocessing says is reported."""
+    from src import pipeline as pipeline_module
+
+    transcript = "[00:01] Speaker 1: Setuju."
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        preprocessed = Path(tmp) / "preprocessed_meeting.mp3"
+        preprocessed.write_bytes(b"16kHz mono, allegedly")
+
+        def fake_preprocess(input_path, progress_callback=None, **kwargs):
+            assert input_path == str(audio)
+            for message in ("Converting audio (converting to 16kHz mono MP3)...",
+                            "Found existing optimized preprocessed audio."):
+                if progress_callback:
+                    progress_callback(message)
+            return str(preprocessed)
+
+        original = pipeline_module.preprocess_audio
+        pipeline_module.preprocess_audio = fake_preprocess
+        try:
+            settings = PipelineSettings(audio_path=str(audio), api_key="key", preprocess=True, cache_dir=tmp)
+            observer = RecordingObserver()
+            provider = pipeline_run_provider(transcript, "# Minit")
+            run_pipeline(settings, observer, client=provider)
+        finally:
+            pipeline_module.preprocess_audio = original
+
+        uploaded = provider.files.uploads[0]["file"]
+
+    assert uploaded == str(preprocessed)
+    detail_reports = [r for r in observer.reports if r.key == "status.step1_detail"]
+    assert [r.args["detail"] for r in detail_reports] == [
+        "Converting audio (converting to 16kHz mono MP3)...",
+        "Found existing optimized preprocessed audio.",
+    ]
+    # Preprocessing was not skipped, and the run badged it so.
+    assert ("step1", "working") in observer.steps()
+    step1_done = [r for r in observer.reports
+                  if r.phase == Phase.STEP and r.key == "step1" and r.state == "done"][0]
+    assert step1_done.args["skipped"] is False
+
+
+def test_importing_the_pipeline_run_pulls_in_no_ui_toolkit():
+    """
+    Importing the Pipeline run on its own must not drag in a UI toolkit, the desktop
+    package, or the translation table: a headless caller has none of them and needs none
+    of them. Checked in a fresh interpreter so this suite's own imports cannot mask it.
+    """
+    script = (
+        "import sys\n"
+        "import src.pipeline\n"
+        "ui = sorted(m for m in sys.modules\n"
+        "           if m.split('.')[0] in ('tkinter', '_tkinter', 'customtkinter', 'darkdetect')\n"
+        "           or m.startswith('src.ui'))\n"
+        "table = sorted(m for m in sys.modules if m.startswith('src.i18n'))\n"
+        "print(ui)\nprint(table)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], cwd=str(REPO_ROOT),
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    ui_modules, translation_table = proc.stdout.strip().splitlines()[-2:]
+    assert ui_modules == "[]", ui_modules
+    assert translation_table == "[]", translation_table
+
+
+def test_the_pipeline_run_module_reaches_no_ui_package_and_no_translation_table():
+    """The rule behind the previous test, read off the module's own imports."""
+    tree = ast.parse((REPO_ROOT / "src" / "pipeline.py").read_text(encoding="utf-8"))
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+        elif isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+
+    assert not [name for name in imported if "ui" in name.split(".")]
+    assert not [name for name in imported if "tkinter" in name]
+    assert not [name for name in imported if name.endswith("i18n")]
+
+
+def test_the_pipeline_run_takes_its_settings_as_a_plain_data_object():
+    """
+    Settings are data, and nothing else: no widget handle, no live value to read off
+    another thread. That is what closes the thread-safety leak structurally.
+    """
+    assert dataclasses.is_dataclass(PipelineSettings)
+    fields = {f.name for f in dataclasses.fields(PipelineSettings)}
+    # A settings object carries values and nothing an observer could read state from.
+    assert not [
+        name for name in dir(PipelineSettings)
+        if not name.startswith("_") and name not in fields
+    ]
+    defaults = PipelineSettings(audio_path="anything.wav")
+    for name in fields - {"audio_path"}:
+        value = getattr(defaults, name)
+        assert isinstance(value, (str, bool, int)), (name, value)
+
+
+def test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk():
+    """The whole point of the second adapter: an Audio file in, two documents out."""
+    from src.headless import EXIT_OK, run_headless
+
+    transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Kita teruskan."
+    minutes = (
+        "# Minit Tindakan Mesyuarat\n\n## Tindakan\n"
+        "- En. Razak: susun draf (00:04).\n- En. Lee: semak kos (1:07:45)."
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        outcome = run_headless(
+            str(audio), output_dir=tmp, preprocess=False, cache_dir=tmp,
+            client=pipeline_run_provider(transcript, minutes),
+        )
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+        assert outcome.exit_code == EXIT_OK
+        assert written == ["meeting_minutes.md", "meeting_transcript.md"]
+        assert Path(outcome.transcript_path).read_text(encoding="utf-8") == transcript
+        assert Path(outcome.minutes_path).read_text(encoding="utf-8") == minutes
+        # Anchors reach disk untouched, both ways round. Nothing on this path reads
+        # the minutes, so nothing here could have dropped one.
+        on_disk = Path(outcome.minutes_path).read_text(encoding="utf-8")
+        assert "(00:04)" in on_disk and "(1:07:45)" in on_disk
+
+
+def test_the_headless_adapter_never_consults_the_export_writers():
+    """
+    A terminal run gets anchors without a flag, because this adapter writes what the
+    Pipeline run produced and never calls the export writers -- the only place a
+    document is reformatted on its way out. A source scan, because that is a claim
+    about every line of the module rather than about one run, and a test that ran it
+    could only ever prove the branch it happened to take.
+    """
+    source = (REPO_ROOT / "src" / "headless.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert not [name for name in called if name.startswith("export_to_")], (
+        "the headless adapter must write its own documents, not through the exporters"
+    )
+    assert "exporter" not in source
+    # No switch for it either: anchors are what the run produces, not an option.
+    assert "anchor" not in source.lower()
+
+
+def test_a_headless_run_keeps_the_transcript_when_minutes_fail():
+    from src.headless import EXIT_NO_MINUTES, run_headless
+
+    transcript = "[00:01] Speaker 1: Setuju."
+    script = {model: [quota_failure_error()] for model in MINUTES_FALLBACK_MODELS}
+    script[MODEL_NAME] = [transcript]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        outcome = run_headless(
+            str(audio), output_dir=tmp, preprocess=False, cache_dir=tmp,
+            client=FakeGeminiProvider(script),
+        )
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+
+    assert outcome.exit_code == EXIT_NO_MINUTES
+    assert outcome.minutes_path is None
+    assert written == ["meeting_transcript.md"]
+
+
+def test_a_console_report_prints_its_key_and_arguments_without_a_translation_table():
+    """A headless reader gets the key and its args even when no wording is available."""
+    import io
+
+    from src.headless import ConsoleObserver
+    from src.pipeline import PipelineReport
+
+    stream = io.StringIO()
+    observer = ConsoleObserver(stream)
+    observer.report(PipelineReport(phase=Phase.STATUS, key="status.step3_chunk",
+                                   args={"index": 1, "total": 1}))
+    observer.report(PipelineReport(phase=Phase.CHUNK, key="chunk.done", index=0))
+    observer.report(PipelineReport(phase=Phase.STATUS, key="status.no.such.key"))
+
+    printed = stream.getvalue()
+    assert "[status] status.step3_chunk index=1 total=1" in printed
+    assert "[chunk] chunk.done (#0)" in printed
+    assert "status.no.such.key" in printed
+
+
+def test_the_headless_flag_on_the_entry_point_configures_the_run():
+    """--headless on the existing entry point reaches the headless adapter."""
+    import src.headless as headless_module
+    import main as entry_point
+
+    captured = {}
+
+    def fake_run_headless(audio_path, **kwargs):
+        captured["audio_path"] = audio_path
+        captured.update(kwargs)
+        return headless_module.HeadlessOutcome(exit_code=0, result=None)
+
+    original = headless_module.run_headless
+    headless_module.run_headless = fake_run_headless
+    try:
+        exit_code = entry_point.main([
+            "--headless", "meeting.mp3",
+            "--output-dir", "out",
+            "--model", "gemini-3.5-flash-lite",
+            "--language", "English",
+            "--template", "board_governance",
+            "--no-preprocess",
+            "--chunk-minutes", "20",
+        ])
+    finally:
+        headless_module.run_headless = original
+
+    assert exit_code == 0
+    assert captured["audio_path"] == "meeting.mp3"
+    assert captured["output_dir"] == "out"
+    assert captured["engine"] == "☁️ Gemini 3.5 Flash Lite"
+    assert captured["language"] == "English"
+    assert captured["template"] == "board_governance"
+    assert captured["preprocess"] is False
+    # A terminal reader can ask for Chunking, which is what a long meeting needs.
+    assert captured["chunk_minutes"] == 20
+
+
+def test_the_engine_and_its_model_name_name_the_same_choice_both_ways():
+    for choice, model in ENGINE_MODEL_OVERRIDES.items():
+        assert model_for_engine(choice) == model
+        assert engine_for_model(model) == choice
+    # Auto-failover pins nothing, and is spelled out rather than left blank.
+    assert model_for_engine(DEFAULT_SETTINGS["engine"]) is None
+    assert model_for_engine("") is None
+
+
+def a_chunking_plan(directory, count, chunk_minutes=25):
+    """
+    The Chunks Chunking would produce for a long Audio file: one slice file each, with
+    the timestamps and offset the run needs to stitch them back together.
+
+    Built rather than derived, because finding silence boundaries needs a real decoder.
+    What is under test is what a Pipeline run does with a Chunk plan, not where the
+    boundaries happened to fall.
+    """
+    plan = []
+    for index in range(count):
+        slice_path = Path(directory) / ("chunk_%03d.mp3" % index)
+        slice_path.write_bytes(b"16kHz mono slice %d" % index)
+        plan.append({
+            "chunk_index": index,
+            "file_path": str(slice_path),
+            "start_ms": index * chunk_minutes * 60 * 1000,
+            "end_ms": (index + 1) * chunk_minutes * 60 * 1000,
+            "duration_ms": chunk_minutes * 60 * 1000,
+            "offset_seconds": float(index * chunk_minutes * 60),
+        })
+    return plan
+
+
+@contextmanager
+def chunking_that_splits_into(plan):
+    """Stand in for Chunking with a plan, so a run can be driven without a decoder."""
+    from src import pipeline as pipeline_module
+
+    def split(audio_path, **kwargs):
+        split.calls += 1
+        split.audio_paths.append(audio_path)
+        return list(plan)
+
+    split.calls = 0
+    split.audio_paths = []
+    original = pipeline_module.split_audio_into_chunks
+    pipeline_module.split_audio_into_chunks = split
+    try:
+        yield split
+    finally:
+        pipeline_module.split_audio_into_chunks = original
+
+
+@contextmanager
+def chunking_that_must_not_run():
+    """Fail loudly if a run splits an Audio file it was told not to split."""
+    from src import pipeline as pipeline_module
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("Chunking is off; the recording must not be sliced.")
+
+    original = pipeline_module.split_audio_into_chunks
+    pipeline_module.split_audio_into_chunks = refuse
+    try:
+        yield
+    finally:
+        pipeline_module.split_audio_into_chunks = original
+
+
+def chunked_pipeline_provider(chunk_transcripts, minutes_text, lead=None):
+    """
+    A fake Gemini client serving one transcription per Chunk, then one Minutes synthesis.
+
+    A pinned Engine makes both calls land on the same model, which then answers them in
+    the order the run makes them: every Chunk in turn, then the Minutes.
+    """
+    lead = lead or MODEL_NAME
+    script = {lead: list(chunk_transcripts)}
+    if MINUTES_MODEL_NAME == lead:
+        script[lead].append(minutes_text)
+    else:
+        script[MINUTES_MODEL_NAME] = [minutes_text]
+    return FakeGeminiProvider(script)
+
+
+def test_chunking_splits_a_long_audio_file_and_every_chunk_is_transcribed():
+    """Chunking on: the Audio file becomes many Chunks, and each is sent to the service."""
+    # Each Chunk's timestamps are local to that Chunk, as the service returns them.
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    minutes = "# Minit\n\n## Keputusan\nTutup mesyuarat."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        provider = chunked_pipeline_provider(chunk_texts, minutes)
+        observer = RecordingObserver()
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+
+        with chunking_that_splits_into(plan) as chunking:
+            result = run_pipeline(settings, observer, client=provider)
+
+    assert chunking.calls == 1
+    assert result.chunks == 3
+    assert result.completed_chunks == 3
+    # Each Chunk was uploaded as its own slice, in order, rather than the whole file.
+    assert [upload["file"] for upload in provider.files.uploads] == [
+        chunk["file_path"] for chunk in plan
+    ]
+    # The Transcript is every Chunk's text, in order.
+    # The Transcript is every Chunk's text, in order, each Chunk's clock shifted onto
+    # the meeting's: Chunk 2 starts 25 minutes in, Chunk 3 an hour in.
+    assert result.transcript == "\n\n".join([
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[25:03] Speaker 2: Agenda kedua.",
+        "[50:07] Speaker 1: Kita tutup mesyuarat.",
+    ])
+    assert [(r.index, r.key) for r in observer.reports if r.phase == Phase.CHUNK] == [
+        (0, "chunk.working"), (0, "chunk.done"),
+        (1, "chunk.working"), (1, "chunk.done"),
+        (2, "chunk.working"), (2, "chunk.done"),
+    ]
+    assert ("step2", "done") in observer.steps()
+
+
+def test_chunking_is_skipped_entirely_when_it_is_off():
+    """Chunking off: the recording is never sliced, and is the one Chunk end to end."""
+    transcript = "[00:01] Speaker 1: Setuju.\n[00:04] Speaker 2: Kita teruskan."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        provider = pipeline_run_provider(transcript, "# Minit")
+        observer = RecordingObserver()
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=0, cache_dir=tmp,
+        )
+
+        with chunking_that_must_not_run():
+            result = run_pipeline(settings, observer, client=provider)
+
+        uploaded = [upload["file"] for upload in provider.files.uploads]
+
+    assert result.chunks == 1
+    assert result.completed_chunks == 1
+    assert result.transcript == transcript
+    # The whole Audio file is what reaches the service, uncut.
+    assert uploaded == [str(audio)]
+    assert "status.step2_off" in observer.keys()
+    step2_done = [r for r in observer.reports
+                  if r.phase == Phase.STEP and r.key == "step2" and r.state == "done"][0]
+    assert step2_done.args == {"skipped": True, "chunk_count": 1}
+
+
+class CheckpointWatchingObserver(RecordingObserver):
+    """
+    An observer that reads the Checkpoint off disk at each Chunk report.
+
+    The run's promise is that the Checkpoint is written before it moves on to the next
+    Chunk, so the only honest way to see that is to look at the file when the run says
+    the Chunk is done rather than after the run has finished.
+    """
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.banked_at_chunk_done = []
+
+    def report(self, report):
+        super().report(report)
+        if report.phase == Phase.CHUNK and report.key == "chunk.done":
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            self.banked_at_chunk_done.append(sorted(payload["chunks"]))
+
+
+def test_a_checkpoint_records_each_chunk_as_soon_as_it_is_done():
+    """The Checkpoint is written after every Chunk, not once at the end of the run."""
+    chunk_texts = ["[00:05] Speaker 1: Satu.", "[00:05] Speaker 2: Dua."]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 2)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+        observer = CheckpointWatchingObserver(
+            checkpoint_path(tmp, compute_file_hash(str(audio)))
+        )
+
+        with chunking_that_splits_into(plan):
+            run_pipeline(settings, observer,
+                         client=chunked_pipeline_provider(chunk_texts, "# Minit"))
+
+        saved = json.loads(observer.path.read_text(encoding="utf-8"))
+
+    # Each Chunk was on disk by the time the run reported it done, so an interruption
+    # after Chunk 1 still has Chunk 0 banked.
+    assert observer.banked_at_chunk_done == [["0"], ["0", "1"]]
+    assert saved["chunk_minutes"] == 25
+    # What is banked is the Chunk's final text, on the meeting's clock.
+    assert saved["chunks"]["0"] == "[00:05] Speaker 1: Satu."
+    assert saved["chunks"]["1"] == "[25:05] Speaker 2: Dua."
+
+
+def test_an_interrupted_run_resumes_and_does_not_re_pay_for_chunks_already_done():
+    """
+    The acceptance case: a long meeting interrupted partway, restarted, picks up where it
+    stopped rather than transcribing from the beginning.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    minutes = "# Minit\n\n## Keputusan\nTutup mesyuarat."
+    # One model pinned, so the whole run -- every Chunk and the Minutes -- is answered by
+    # one scripted list, and reaching for any other model is a test failure.
+    lead = MODEL_NAME
+    pinned = "☁️ Gemini 3.8 Flash"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp, engine=pinned,
+        )
+
+        # First run: the first two Chunks transcribe, the third is refused by every model
+        # of the chain -- which is what an exhausted day looks like.
+        first_provider = FakeGeminiProvider(
+            dict(
+                {lead: chunk_texts[:2] + [quota_failure_error(), minutes]},
+                **{model: [quota_failure_error()] for model in FALLBACK_MODELS if model != lead},
+            )
+        )
+        first_observer = RecordingObserver()
+        with chunking_that_splits_into(plan):
+            first = run_pipeline(settings, first_observer, client=first_provider)
+
+        # Second run: a fresh client whose script covers only what is left to do -- the
+        # third Chunk and the Minutes. Anything more would be a re-paid Chunk, so nothing
+        # else is scripted: reaching for an unscripted call is itself the failure.
+        second_provider = FakeGeminiProvider({
+            lead: [chunk_texts[2], minutes],
+        })
+        second_observer = RecordingObserver()
+        with chunking_that_splits_into(plan):
+            second = run_pipeline(settings, second_observer, client=second_provider)
+
+        first_uploads = [upload["file"] for upload in first_provider.files.uploads]
+        second_uploads = [upload["file"] for upload in second_provider.files.uploads]
+
+    # The first run banked the two Chunks it managed and said the step was incomplete.
+    assert first.completed_chunks == 2
+    assert first.chunks == 3
+    assert ("step3", "error") in first_observer.steps()
+    assert (2, "chunk.error") in [
+        (r.index, r.key) for r in first_observer.reports if r.phase == Phase.CHUNK
+    ]
+
+    # The resumed run paid for only the Chunk that was missing, and got the whole
+    # meeting back -- assembled from three Chunks, the first two read from the Checkpoint.
+    assert second.chunks == 3
+    assert second.completed_chunks == 3
+    assert second_uploads == [plan[2]["file_path"]]
+    assert first_uploads[:2] == [plan[0]["file_path"], plan[1]["file_path"]]
+    # Every Chunk's text is in the Transcript exactly once, in the order it was spoken.
+    assert second.transcript.count("Agenda pertama.") == 1
+    assert second.transcript.count("Agenda kedua.") == 1
+    assert second.transcript.count("Kita tutup mesyuarat.") == 1
+    assert second.transcript.index("Agenda pertama.") < second.transcript.index("Agenda kedua.")
+    assert second.transcript.index("Agenda kedua.") < second.transcript.index("Kita tutup mesyuarat.")
+
+    # The resumed run said which Chunks came from the Checkpoint rather than the service.
+    chunk_reports = [(r.index, r.key) for r in second_observer.reports
+                     if r.phase == Phase.CHUNK]
+    assert chunk_reports == [
+        (0, "chunk.cached"), (1, "chunk.cached"),
+        (2, "chunk.working"), (2, "chunk.done"),
+    ]
+
+
+def test_tail_context_carries_the_previous_chunk_across_the_seam():
+    """
+    Each Chunk is sent the tail of the Chunk before it, so speaker names and phrasing
+    stay continuous where the Chunking boundary fell mid-sentence.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: En. Razak akan bentangkan laporan.\n"
+        "[00:09] Speaker 2: Pn. Faridah, sila prepare bahagian wandangian.",
+        "[00:07] Speaker 1: Terima kasih.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        provider = chunked_pipeline_provider(chunk_texts, "# Minit")
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+        with chunking_that_splits_into(plan):
+            result = run_pipeline(settings, RecordingObserver(), client=provider)
+
+        # What the service was actually sent, prompt for prompt.
+        prompts = [call["contents"][1] for call in provider.calls[:3]]
+        transcript = result.transcript
+
+    # The first Chunk has nothing before it, so it carries no Tail context.
+    assert "SPEAKER CONTINUITY GUIDANCE" not in prompts[0]
+    # The second was sent the first Chunk's closing line, and the third the second's --
+    # as they stand in the Transcript, on the meeting's clock rather than the Chunk's.
+    assert transcript.splitlines()[1] in prompts[1]
+    assert transcript.splitlines()[3] in prompts[2]
+    # So the third Chunk was not sent the first Chunk's tail as well.
+    assert transcript.splitlines()[1] not in prompts[2]
+
+
+def test_overlap_is_removed_from_the_seam_between_two_chunks():
+    """
+    Chunking cuts at silence but keeps five seconds of audio either side, so the opening
+    of a Chunk repeats the close of the one before. That Overlap is removed, not kept
+    twice in the Transcript.
+    """
+    repeated = "[00:03] Speaker 2: Baik Tuan, saya sambung."
+    chunk_texts = [
+        "[00:40] Speaker 1: Kita teruskan.\n" + repeated,
+        repeated + "\n[00:12] Speaker 1: Agenda seterusnya.",
+        "[00:05] Speaker 2: Baiknya.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+        with chunking_that_splits_into(plan):
+            result = run_pipeline(settings, RecordingObserver(),
+                                  client=chunked_pipeline_provider(chunk_texts, "# Minit"))
+
+    # The repeated line is in the Transcript once, and the Chunk after the seam keeps
+    # only what was new in it.
+    assert result.transcript.count("Baik Tuan, saya sambung.") == 1
+    assert "Agenda seterusnya." in result.transcript
+    assert "Baiknya." in result.transcript
+
+
+PINNED_ENGINE = "☁️ Gemini 3.8 Flash"
+"""The one Engine choice that pins a single model, so a fake script covers a whole run."""
+
+SEAM_CHUNK_TEXTS = [
+    "[00:40] Speaker 1: Kita teruskan.\n[00:03] Speaker 2: Baik Tuan, saya sambung.",
+    "[00:03] Speaker 2: Baik Tuan, saya sambung.\n[00:12] Speaker 1: Agenda seterusnya.",
+    "[00:05] Speaker 2: Baiknya.",
+]
+"""
+A three-Chunk meeting sliced mid-sentence, so the first seam has both halves of what a
+retry has to handle: Overlap to remove, and Tail context to send in.
+"""
+
+
+def a_meeting_at(directory):
+    """The settings and the Chunk plan for one three-Chunk meeting, all inside `directory`."""
+    audio = a_recording_audio_file(directory)
+    settings = PipelineSettings(
+        audio_path=str(audio), api_key="key", preprocess=False,
+        chunk_minutes=25, cache_dir=directory, engine=PINNED_ENGINE,
+    )
+    return settings, a_chunking_plan(directory, 3)
+
+
+def a_meeting_provider(chunk_texts, failing_chunks=(), minutes="# Minit"):
+    """
+    A fake Gemini client serving one transcription per Chunk, then one Minutes synthesis,
+    with the Chunks named in failing_chunks refused by every model of the Failover chain --
+    which is what an exhausted day looks like.
+    """
+    lead = MODEL_NAME
+    script = {lead: [
+        quota_failure_error() if index in failing_chunks else text
+        for index, text in enumerate(chunk_texts)
+    ] + [minutes]}
+    for model in FALLBACK_MODELS:
+        if model != lead:
+            script[model] = [quota_failure_error()]
+    return FakeGeminiProvider(script)
+
+
+def test_a_reprocessed_chunk_gets_the_seam_handling_a_first_pass_run_gives_it():
+    """
+    The acceptance case for a retry: a Chunk that failed and was reprocessed comes back
+    stitched in exactly as a Chunk that succeeded first time would have been.
+
+    Checked by running the same meeting twice and comparing, rather than by restating what
+    the retry does. One run where all three Chunks transcribe first time; one where the
+    middle Chunk is refused by the whole chain and then reprocessed alone. The retry must
+    have been sent the same prompt the first pass sent, hand back the same text, and leave
+    a Transcript indistinguishable from the run that never failed.
+    """
+    minutes = "# Minit"
+
+    with tempfile.TemporaryDirectory() as whole_run_dir:
+        settings, plan = a_meeting_at(whole_run_dir)
+        first_pass_provider = a_meeting_provider(SEAM_CHUNK_TEXTS, minutes=minutes)
+        with chunking_that_splits_into(plan):
+            whole = run_pipeline(settings, RecordingObserver(),
+                                 client=first_pass_provider)
+        # What the service was sent for the middle Chunk, prompt for prompt.
+        first_pass_prompt = first_pass_provider.calls[1]["contents"][1]
+        banked_whole = load_checkpoint(whole_run_dir, compute_file_hash(settings.audio_path), 25)
+
+    with tempfile.TemporaryDirectory() as retry_dir:
+        settings, plan = a_meeting_at(retry_dir)
+        with chunking_that_splits_into(plan):
+            partial = run_pipeline(
+                settings, RecordingObserver(),
+                client=a_meeting_provider(SEAM_CHUNK_TEXTS, failing_chunks={1},
+                                         minutes=minutes),
+            )
+        file_hash = compute_file_hash(settings.audio_path)
+
+        reprocess_provider = a_meeting_provider([SEAM_CHUNK_TEXTS[1]], minutes=minutes)
+        reprocess_observer = RecordingObserver()
+        retried = reprocess_chunk(settings, plan[1], file_hash, reprocess_observer,
+                                  client=reprocess_provider)
+        retry_prompt = reprocess_provider.calls[0]["contents"][1]
+
+        # The retry is banked in the same Checkpoint the run writes, so the run after it
+        # pays for nothing: every Chunk is read back.
+        banked = load_checkpoint(retry_dir, file_hash, 25)
+        resumed_provider = a_meeting_provider([], minutes=minutes)
+        resumed_observer = RecordingObserver()
+        with chunking_that_splits_into(plan):
+            resumed = run_pipeline(settings, resumed_observer,
+                                   client=resumed_provider)
+
+    # The run really did fail on the middle Chunk, so the comparison means something.
+    assert (partial.completed_chunks, partial.failed_chunks) == (2, 1)
+
+    # The retry was sent the Tail context the first pass would have sent, because it was
+    # worked out from the same neighbour's text, by the same one implementation.
+    assert retry_prompt == first_pass_prompt
+
+    # So it hands back the same text for that Chunk, in the Checkpoint and in the result.
+    assert retried.transcript == banked_whole["1"]
+    assert (retried.completed_chunks, retried.failed_chunks) == (1, 0)
+    assert banked["1"] == banked_whole["1"]
+
+    # And the meeting that failed and was retried reads the same as the one that did not.
+    assert resumed.transcript == whole.transcript
+    # Which means the seam the retry crossed left no duplicated text behind.
+    assert resumed.transcript.count("Baik Tuan, saya sambung.") == 1
+
+    # Nothing was paid for twice: every Chunk came back out of the Checkpoint.
+    assert [(r.index, r.key) for r in resumed_observer.reports
+            if r.phase == Phase.CHUNK] == [
+        (0, "chunk.cached"), (1, "chunk.cached"), (2, "chunk.cached"),
+    ]
+    assert resumed_provider.files.uploads == []
+
+    # The retry reported the one Chunk it touched, working and then done, with its text.
+    assert [(r.index, r.key) for r in reprocess_observer.reports
+            if r.phase == Phase.CHUNK] == [(1, "chunk.working"), (1, "chunk.done")]
+    assert reprocess_observer.reports[-1].args["text"] == banked_whole["1"]
+
+
+def test_a_chunk_that_fails_again_stays_retryable_and_leaves_the_checkpoint_alone():
+    """
+    A retry that fails again is not worse than not having retried: the Chunk stays a
+    failure the Chunk monitor can offer again, and the rest of the meeting is left alone.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        settings, plan = a_meeting_at(tmp)
+        with chunking_that_splits_into(plan):
+            partial = run_pipeline(
+                settings, RecordingObserver(),
+                client=a_meeting_provider(SEAM_CHUNK_TEXTS, failing_chunks={1}),
+            )
+        file_hash = compute_file_hash(settings.audio_path)
+        before = load_checkpoint(tmp, file_hash, 25)
+
+        observer = RecordingObserver()
+        retried = reprocess_chunk(
+            settings, plan[1], file_hash, observer,
+            client=a_meeting_provider([quota_failure_error()]),
+        )
+        after = load_checkpoint(tmp, file_hash, 25)
+
+    assert (retried.completed_chunks, retried.failed_chunks) == (0, 1)
+    assert retried.transcript == ""
+    # The two Chunks that were done are untouched, and the failed one is still missing
+    # rather than banked as empty -- so it can be retried again.
+    assert after == before
+    assert sorted(after) == ["0", "2"]
+    assert (1, "chunk.error") in [
+        (r.index, r.key) for r in observer.reports if r.phase == Phase.CHUNK
+    ]
+
+
+def test_tail_context_is_worked_out_in_exactly_one_place():
+    """
+    Tail context was duplicated when a retry had its own copy, and the copies had already
+    drifted. Now there is one implementation, it belongs to the run, and the window does
+    not even know how many lines a Tail context is -- so it cannot work one out itself.
+    """
+    sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted((REPO_ROOT / "src").rglob("*.py"))
+    }
+    definitions = [
+        name for name, text in sources.items() if "def _tail_context(" in text
+    ]
+    assert definitions == ["pipeline.py"]
+    assert "TAIL_CONTEXT_LINES" in sources["pipeline.py"]
+    assert "TAIL_CONTEXT_LINES" not in sources["app_window.py"]
+
+
+def test_the_window_reprocesses_a_chunk_through_the_pipeline_entry_point():
+    """
+    The retry is a second entry on the same interface, not a second copy of the loop: the
+    window starts the run and renders what it reports, and holds none of the seam handling
+    that used to be duplicated inside it.
+    """
+    source = (REPO_ROOT / "src" / "ui" / "app_window.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    app = next(node for node in tree.body
+              if isinstance(node, ast.ClassDef) and node.name == "STTMeetApp")
+    reprocess = next(node for node in app.body
+                     if isinstance(node, ast.FunctionDef)
+                     and node.name == "_reprocess_single_chunk")
+    body = ast.get_source_segment(source, reprocess)
+
+    assert "reprocess_chunk(" in body
+    for owned_by_the_run in ("transcribe_audio_chunk(", "adjust_chunk_timestamps(",
+                             "deduplicate_overlap(", "load_checkpoint(", "save_checkpoint("):
+        assert owned_by_the_run not in body, owned_by_the_run
+
+
+def test_a_cancelled_run_stops_between_chunks_and_leaves_the_rest_resumable():
+    """
+    A cancel mid-meeting ends the run promptly -- the Chunk after the cancel is never
+    sent -- and what was already transcribed stays in the Checkpoint as done, so the
+    remaining Chunks are resumed rather than failed.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    cancel_event = threading.Event()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp,
+        )
+
+        # The user cancels once the second Chunk has been transcribed.
+        class CancellingObserver(RecordingObserver):
+            def report(self, report):
+                super().report(report)
+                if report.phase == Phase.CHUNK and report.key == "chunk.done" and report.index == 1:
+                    cancel_event.set()
+
+        observer = CancellingObserver()
+        provider = chunked_pipeline_provider(chunk_texts, "# Minit")
+        with chunking_that_splits_into(plan):
+            try:
+                run_pipeline(settings, observer, cancel_event=cancel_event, client=provider)
+                raise AssertionError("a cancelled run must not return a result")
+            except CancelledError:
+                pass
+
+        uploaded = [upload["file"] for upload in provider.files.uploads]
+        checkpoint = json.loads(
+            checkpoint_path(tmp, compute_file_hash(str(audio))).read_text(encoding="utf-8")
+        )
+
+    # It stopped between Chunks: the third was never sent, and no Minutes were asked for.
+    assert uploaded == [plan[0]["file_path"], plan[1]["file_path"]]
+    assert provider.attempts_on(MINUTES_MODEL_NAME) == 0
+
+    # The two finished Chunks are banked as done. The third is absent -- neither done
+    # nor errored -- which is what "resumable rather than failed" means on disk.
+    assert sorted(checkpoint["chunks"]) == ["0", "1"]
+    assert "error" not in json.dumps(checkpoint)
+
+
+def test_ctrl_c_cancels_a_headless_run_and_leaves_it_resumable():
+    """
+    Ctrl+C is how a terminal user stops a run. It must end the run the same way the
+    Cancel button ends it on the desktop -- through the cancel event, not by killing the
+    process -- so the Chunks already transcribed survive to be resumed.
+    """
+    import signal
+
+    from src.headless import EXIT_CANCELLED, run_headless
+
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+
+    class InterruptingObserver:
+        """Raises SIGINT at the terminal, as Ctrl+C would, once Chunk 1 is banked."""
+
+        def __init__(self):
+            self.transcript_path = None
+
+        def report(self, report):
+            if (report.phase == Phase.CHUNK and report.key == "chunk.done"
+                    and report.index == 1):
+                # raise_signal, not os.kill: on Windows os.kill(SIGINT) terminates the
+                # process outright, which is exactly the behaviour being ruled out here.
+                signal.raise_signal(signal.SIGINT)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        # Only the first two Chunks are scripted: if the interrupt did not take, the run
+        # would reach for a third call this provider has no answer for.
+        provider = chunked_pipeline_provider(chunk_texts[:2], "# Minit")
+        original_split = None
+        from src import pipeline as pipeline_module
+        original_split = pipeline_module.split_audio_into_chunks
+        pipeline_module.split_audio_into_chunks = lambda audio_path, **kw: list(plan)
+        try:
+            outcome = run_headless(
+                str(audio), output_dir=tmp, preprocess=False, chunk_minutes=25,
+                cache_dir=tmp, client=provider, observer=InterruptingObserver(),
+            )
+        finally:
+            pipeline_module.split_audio_into_chunks = original_split
+
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+        checkpoint = json.loads(
+            checkpoint_path(tmp, compute_file_hash(str(audio))).read_text(encoding="utf-8")
+        )
+
+    # Ctrl+C did not kill the process: it came back through the adapter's own door code.
+    assert outcome.exit_code == EXIT_CANCELLED
+    # Nothing half-finished was written, and the finished Chunks are still banked.
+    assert written == []
+    assert sorted(checkpoint["chunks"]) == ["0", "1"]
+
+
+def test_a_headless_run_that_failed_partway_is_resumed_by_running_it_again():
+    """
+    The whole acceptance case end to end, through the seam a terminal reader actually
+    uses: a long meeting fails partway, and running the same command again produces the
+    complete Transcript without re-paying for the Chunks already transcribed.
+    """
+    from src.headless import EXIT_OK, run_headless
+
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+    minutes = "# Minit\n\n## Keputusan\nTutup mesyuarat."
+    lead = MODEL_NAME
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 3)
+        with chunking_that_splits_into(plan):
+            # First attempt: the third Chunk is refused by the whole chain.
+            first = FakeGeminiProvider({
+                lead: chunk_texts[:2] + [quota_failure_error(), minutes],
+            })
+            failed = run_headless(
+                str(audio), output_dir=tmp, preprocess=False, chunk_minutes=25,
+                cache_dir=tmp, client=first, engine="☁️ Gemini 3.8 Flash",
+            )
+            after_first = sorted(p.name for p in Path(tmp).glob("*.md"))
+
+            # Second attempt, same command: a client with answers for the rest only.
+            second = FakeGeminiProvider({lead: [chunk_texts[2], minutes]})
+            resumed = run_headless(
+                str(audio), output_dir=tmp, preprocess=False, chunk_minutes=25,
+                cache_dir=tmp, client=second, engine="☁️ Gemini 3.8 Flash",
+            )
+            written = sorted(p.name for p in Path(tmp).glob("*.md"))
+            transcript = Path(resumed.transcript_path).read_text(encoding="utf-8")
+
+    # The failed run wrote nothing, even though it had two Chunks' worth of text: a
+    # Transcript missing a third of the meeting is not the meeting's record.
+    assert failed.exit_code != EXIT_OK
+    assert failed.transcript_path is None
+    assert after_first == []
+
+    # The resumed run wrote both documents, and paid for only the Chunk that was missing.
+    assert resumed.exit_code == EXIT_OK
+    assert written == ["meeting_minutes.md", "meeting_transcript.md"]
+    assert [upload["file"] for upload in second.files.uploads] == [plan[2]["file_path"]]
+    # The Transcript is the whole meeting, in order, each line once.
+    for phrase in ("Agenda pertama.", "Agenda kedua.", "Kita tutup mesyuarat."):
+        assert transcript.count(phrase) == 1
+    assert transcript.index("Agenda pertama.") < transcript.index("Kita tutup mesyuarat.")
+
+
+class FakeWindow:
+    """
+    A stand-in for the desktop window, recording what it was asked to show.
+
+    Every method here is one the real STTMeetApp implements, so the window-as-adapter
+    can be driven through a whole Pipeline run without constructing a CustomTkinter
+    window -- which needs a display, and which no test here should need.
+    """
+
+    def __init__(self, duration_seconds=0.0):
+        self.ui_locale = "en"
+        self.audio_duration_seconds = duration_seconds
+        self.badges = []        # (step, state, extra)
+        self.status = []        # status lines, in the order they were shown
+        self.progress = []      # (percent, status line) -- the bar moved for this one
+        self.monitor_rows = []  # (chunk index, state, detail) for the Chunk monitor
+        self.plans = []         # Chunk plans the run handed over, in order
+        self.monitor_builds = []  # Chunk monitors the window was asked to build
+        self.summaries = []     # (completed, total, has_errors)
+        self.active_chunks_meta = []
+        self.active_chunk_status = {}
+        self.live_transcript = ""
+
+    # --- the surface a Pipeline run's reports are rendered onto ---------------
+
+    def _t(self, key, **fmt):
+        return translate(key, self.ui_locale, **fmt)
+
+    def _update_step_badge(self, step_key, state, extra=""):
+        self.badges.append((step_key, state, extra))
+
+    def _set_status(self, message):
+        self.status.append(message)
+
+    def _set_progress(self, percent, message):
+        self.progress.append((percent, message))
+
+    def _update_chunk_monitor_item(self, chunk_index, state, detail=""):
+        self.monitor_rows.append((chunk_index, state, detail))
+
+    def _adopt_chunk_plan(self, plan):
+        """The run has its Chunks: build the Chunk monitor's rows from them."""
+        self.plans.append(plan)
+        self.active_chunks_meta = list(plan)
+        self.active_chunk_status = {
+            chunk["chunk_index"]: {"status": "pending", "text": "", "error": ""}
+            for chunk in plan
+        }
+
+    def _create_or_show_monitor(self, plan):
+        self.monitor_builds.append(list(plan))
+
+    def _note_chunk(self, chunk_index, status, text="", error=""):
+        self.active_chunk_status[chunk_index] = {
+            "status": status, "text": text, "error": error,
+        }
+
+    def _refresh_live_transcript_view(self):
+        parts = [
+            self.active_chunk_status[c["chunk_index"]]["text"]
+            for c in self.active_chunks_meta
+            if self.active_chunk_status.get(c["chunk_index"], {}).get("text", "").strip()
+        ]
+        self.live_transcript = "\n\n".join(parts)
+
+    def _refresh_monitor_summary(self):
+        states = list(self.active_chunk_status.values())
+        self.summaries.append((
+            sum(1 for s in states if s["status"] == "done"),
+            len(states),
+            any(s["status"] == "error" for s in states),
+        ))
+
+
+def a_window_run(directory, plan=None, **captured):
+    """
+    The pieces one windowed Pipeline run needs: settings as data, an observer bound to
+    a FakeWindow, and the client that answers it. cache_dir is the run's own temporary
+    directory, so its Checkpoint never lands in the repository's cache.
+    """
+    from src.ui.app_window import WindowPipelineObserver
+
+    audio = a_recording_audio_file(directory)
+    window = FakeWindow(duration_seconds=captured.pop("duration_seconds", 0.0))
+    settings = PipelineSettings(
+        audio_path=str(audio), api_key="key", preprocess=False, cache_dir=directory,
+        **captured,
+    )
+    return settings, WindowPipelineObserver(window), window
+
+
+def test_the_window_shows_a_pipeline_run_from_the_reports_it_hears():
+    """
+    The window is an adapter: it starts a Pipeline run and shows what the run reports.
+    Every badge, status line and bar position is one the run reported, in the run's
+    order, so the window orchestrates none of it itself.
+    """
+    from src.ui.app_window import WindowPipelineObserver
+
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 2)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp, synthesize_minutes=False,
+        )
+        window = FakeWindow()
+        with chunking_that_splits_into(plan):
+            result = run_pipeline(
+                settings, WindowPipelineObserver(window),
+                client=chunked_pipeline_provider(chunk_texts, "# Minit"),
+            )
+
+    # The run's Transcript and the window's live view agree, because both come from the
+    # same reported Chunks.
+    assert window.live_transcript == result.transcript
+
+    # Same four steps, same badges, same counts as the window has always badged.
+    assert window.badges == [
+        ("step1", "working", ""),
+        ("step1", "done", "(skipped)"),
+        ("step2", "working", ""),
+        ("step2", "done", "(2 chunks)"),
+        ("step3", "working", "(0/2)"),
+        ("step3", "working", "(1/2)"),
+        ("step3", "working", "(2/2)"),
+        ("step3", "done", "(2/2)"),
+    ]
+
+    # The bar sat where the window has always put it: chunking at the floor, each Chunk
+    # a sixth of the transcription span apart, and the finished Transcript at 80%.
+    assert [percent for percent, _ in window.progress] == [0.0, 0.2, 0.5, 0.8]
+
+    # The Chunk monitor had a row per Chunk, and each row followed its Chunk's life.
+    assert window.monitor_rows == [
+        (0, "working", ""), (0, "done", ""),
+        (1, "working", ""), (1, "done", ""),
+    ]
+
+
+def test_the_window_builds_its_chunk_monitor_from_the_plan_the_run_reports():
+    """
+    A Chunk monitor is one row per Chunk, titled with the span of audio that Chunk
+    covers. The run decides where the boundaries fell, so the window cannot work them
+    out for itself -- it renders the plan the run reported.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        plan = a_chunking_plan(tmp, 3, chunk_minutes=25)
+        settings, observer, window = a_window_run(tmp, chunk_minutes=25)
+        with chunking_that_splits_into(plan):
+            run_pipeline(settings, observer,
+                         client=chunked_pipeline_provider(["x"] * 3, "# Minit"))
+
+    assert len(window.plans) == 1
+    assert [c["chunk_index"] for c in window.plans[0]] == [0, 1, 2]
+    assert window.plans[0][0]["start_ms"] == 0
+    assert window.plans[0][2]["end_ms"] == 75 * 60 * 1000
+
+
+def test_the_window_shows_a_chunk_it_read_back_from_the_checkpoint_as_its_own_state():
+    """
+    A resumed run does not transcribe the Chunks it already has. The Chunk monitor says
+    so -- a banked Chunk reads as "from the Checkpoint", not as one just transcribed --
+    while still counting towards a whole meeting.
+    """
+    from src.ui.app_window import WindowPipelineObserver
+
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        plan = a_chunking_plan(tmp, 2)
+        settings = PipelineSettings(
+            audio_path=str(audio), api_key="key", preprocess=False,
+            chunk_minutes=25, cache_dir=tmp, synthesize_minutes=False,
+        )
+
+        # First run: the first Chunk transcribes, the second is refused for the day.
+        interrupted = FakeGeminiProvider({
+            MODEL_NAME: [chunk_texts[0], quota_failure_error()],
+            **{m: [quota_failure_error()] for m in FALLBACK_MODELS if m != MODEL_NAME},
+        })
+        with chunking_that_splits_into(plan):
+            first_window = FakeWindow()
+            first = run_pipeline(settings, WindowPipelineObserver(first_window),
+                                 client=interrupted)
+
+        # Second run: only the missing Chunk is paid for again.
+        resumed_window = FakeWindow()
+        with chunking_that_splits_into(plan):
+            second = run_pipeline(settings, WindowPipelineObserver(resumed_window),
+                                  client=FakeGeminiProvider({MODEL_NAME: [chunk_texts[1]]}))
+
+    # The failed Chunk was left resumable rather than failed for good: the first run
+    # said step 3 was incomplete, and the second run got the whole meeting back.
+    assert (first.completed_chunks, first.failed_chunks) == (1, 1)
+    assert ("step3", "error", "1/2 chunks done") in first_window.badges
+    assert (1, "error") in [(row[0], row[1]) for row in first_window.monitor_rows]
+
+    assert second.transcript == resumed_window.live_transcript
+    for phrase in ("Agenda pertama.", "Agenda kedua."):
+        assert second.transcript.count(phrase) == 1
+    assert second.transcript.index("Agenda pertama.") < second.transcript.index("Agenda kedua.")
+    # The banked Chunk is shown as read back from the Checkpoint, and the fresh one as
+    # transcribed now -- the two are not the same thing to a person watching.
+    assert resumed_window.monitor_rows == [
+        (0, "cached", ""), (1, "working", ""), (1, "done", ""),
+    ]
+    assert resumed_window.badges[-1] == ("step3", "done", "(2/2)")
+
+
+def test_the_chunk_monitor_shows_the_whole_recording_when_chunking_is_off():
+    """
+    With Chunking off there is one Chunk and nothing is sliced, so the run reports a
+    plan with no boundaries to speak of. The Chunk monitor still titles its row with the
+    recording's own span, which the window knows from the file the person chose.
+    """
+    from src.ui.app_window import STTMeetApp
+
+    window = FakeWindow(duration_seconds=3600.0)
+    unchunked_plan = [{"chunk_index": 0, "file_path": "meeting.mp3", "offset_seconds": 0.0}]
+
+    STTMeetApp._adopt_chunk_plan(window, unchunked_plan)
+
+    assert window.active_chunks_meta[0]["start_ms"] == 0
+    assert window.active_chunks_meta[0]["end_ms"] == 3_600_000
+    # The monitor was built from the plan, once, with a row per Chunk.
+    assert window.monitor_builds == [unchunked_plan]
+
+
+def test_the_live_transcript_view_is_assembled_from_the_chunks_the_run_reports():
+    """
+    The live Transcript view is what a person watches while a long meeting is still
+    being transcribed. It grows as each Chunk is reported, in the order the Chunks fall,
+    and ends up as exactly the Transcript the run produced.
+    """
+    chunk_texts = [
+        "[00:05] Speaker 1: Agenda pertama.",
+        "[00:03] Speaker 2: Agenda kedua.",
+        "[00:07] Speaker 1: Kita tutup mesyuarat.",
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        plan = a_chunking_plan(tmp, 3)
+        settings, observer, window = a_window_run(tmp, chunk_minutes=25)
+
+        # The view is sampled as each Chunk lands, standing in for a person watching it.
+        seen = []
+        real_refresh = window._refresh_live_transcript_view
+
+        def sample_then_refresh():
+            real_refresh()
+            seen.append(window.live_transcript)
+
+        window._refresh_live_transcript_view = sample_then_refresh
+
+        with chunking_that_splits_into(plan):
+            result = run_pipeline(settings, observer,
+                                  client=chunked_pipeline_provider(chunk_texts, "# Minit"))
+
+    # One refresh per Chunk that carried text, each a superset of the one before it --
+    # never rewritten, never reordered.
+    assert len(seen) == 3
+    assert seen[0] == seen[1][:len(seen[0])]
+    assert seen[1] == seen[2][:len(seen[1])]
+    assert seen[-1] == result.transcript
+    # Each Chunk's line is in it once, on the meeting's clock rather than its own.
+    for phrase in ("Agenda pertama.", "Agenda kedua.", "Kita tutup mesyuarat."):
+        assert seen[-1].count(phrase) == 1
+    assert seen[-1].index("Agenda pertama.") < seen[-1].index("Kita tutup mesyuarat.")
+
+
+def test_the_window_shows_a_reprocessed_chunk_in_place_in_its_transcript():
+    """
+    The Chunk monitor's retry button reaches the same seam handling as the main run, and
+    what a person sees is a Chunk replaced where it stood rather than added on the end:
+    the failed row goes green, and the new text takes the middle Chunk's own place in the
+    Transcript -- with the Overlap at that seam gone.
+    """
+    from src.ui.app_window import WindowPipelineObserver
+
+    with tempfile.TemporaryDirectory() as tmp:
+        settings, plan = a_meeting_at(tmp)
+        window = FakeWindow()
+        with chunking_that_splits_into(plan):
+            run_pipeline(
+                settings, WindowPipelineObserver(window),
+                client=a_meeting_provider(SEAM_CHUNK_TEXTS, failing_chunks={1},
+                                         minutes="# Minit"),
+            )
+        # The middle Chunk failed, so the Transcript is short of it and its row is red.
+        assert window.active_chunk_status[1]["status"] == "error"
+        assert "Agenda seterusnya." not in window.live_transcript
+
+        reprocess_chunk(
+            settings, plan[1], compute_file_hash(settings.audio_path),
+            WindowPipelineObserver(window),
+            client=a_meeting_provider([SEAM_CHUNK_TEXTS[1]], minutes="# Minit"),
+        )
+        transcript = window.live_transcript
+
+    # The row that failed is now a done row, and the Chunk sits between its neighbours,
+    # on the meeting's clock, with the line it repeated across the seam removed.
+    assert window.active_chunk_status[1]["status"] == "done"
+    assert transcript.split("\n\n") == [
+        "[00:40] Speaker 1: Kita teruskan.\n[00:03] Speaker 2: Baik Tuan, saya sambung.",
+        "[25:12] Speaker 1: Agenda seterusnya.",
+        "[50:05] Speaker 2: Baiknya.",
+    ]
+
+
+def test_the_window_asks_for_a_run_that_synthesises_no_minutes():
+    """
+    The window's own flow: transcribe, then extract, then generate Minutes on request.
+    So the run it asks for stops after the Transcript, and the fourth step badge stays
+    pending until the user asks for Minutes the way they always have.
+    """
+    from src.ui.app_window import pipeline_settings_for_a_window_run
+    from src.config import CACHE_DIR
+
+    settings = pipeline_settings_for_a_window_run(
+        audio_path="C:/meetings/meeting.mp3",
+        api_key="key",
+        engine="☁️ Gemini 3.8 Flash",
+        language="Bahasa Melayu",
+        template="action_minutes",
+        preprocess=True,
+        chunk_minutes=25,
+    )
+
+    assert settings.engine == "☁️ Gemini 3.8 Flash"
+    assert settings.language == "Bahasa Melayu"
+    assert settings.template == "action_minutes"
+    assert settings.preprocess is True
+    assert settings.chunk_minutes == 25
+    assert settings.cache_dir == str(CACHE_DIR)
+    # Minutes are the user's separate request, so the run does not spend them unasked.
+    assert settings.synthesize_minutes is False
+
+
+def test_the_window_never_reads_an_interface_variable_from_its_worker_thread():
+    """
+    The defect this ticket exists to close: the worker thread read Tk variables off the
+    UI thread. Settings are now data handed to the run, so the worker has no widget to
+    reach for -- which is only checkable from the worker's own source.
+    """
+    source = (REPO_ROOT / "src" / "ui" / "app_window.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    app = next(node for node in tree.body
+              if isinstance(node, ast.ClassDef) and node.name == "STTMeetApp")
+    worker = next(node for node in app.body
+                  if isinstance(node, ast.FunctionDef) and node.name == "_run_pipeline_worker")
+
+    worker_source = ast.get_source_segment(source, worker)
+
+    assert "run_pipeline(" in worker_source, "the worker must start a Pipeline run"
+    assert not [line for line in worker_source.splitlines() if "_var.get()" in line], (
+        "the worker must read no interface variable"
+    )
+
+
+class FakeControl:
+    """
+    One control the window locks while a run is in flight.
+
+    Records every state it was given, so a test can ask not only what the window
+    looks like at the end but what it did to the person on the way there.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.state = "normal"
+        self.history = []
+
+    def configure(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+            self.history.append(value)
+
+    def usable(self):
+        return self.state != "disabled"
+
+
+class FakeGenerationWindow:
+    """
+    A stand-in window that can be handed one generation run and left to finish it.
+
+    It answers the same surface the real STTMeetApp does -- settings as widgets,
+    controls, status lines, banners, views -- and keeps what it was asked to show,
+    which is the window's whole job as an adapter. CustomTkinter needs a display,
+    so no window is ever constructed here.
+    """
+
+    CONTROL_NAMES = (
+        "start_btn",
+        "cancel_btn",
+        "gen_minutes_btn",
+        "gen_recap_btn",
+        "gen_actions_btn",
+    )
+
+    def __init__(
+        self,
+        transcript="[00:01] Speaker 1: Setuju.",
+        api_key="key",
+        language="Bahasa Melayu",
+        template="action_minutes",
+        engine="",
+    ):
+        self.ui_locale = "en"
+        self.is_processing = False
+        self._transcribing = False
+        self.cancel_event = threading.Event()
+
+        # The Transcript already in the window, and the settings the person chose.
+        self.processed_transcript = transcript
+        self.raw_transcript = ""
+        self.selected_audio_file = None
+        self.api_key_var = SimpleNamespace(get=lambda: api_key)
+        self.lang_var = SimpleNamespace(get=lambda: language)
+        self.template_var = SimpleNamespace(get=lambda: template)
+        self.engine_var = SimpleNamespace(get=lambda: engine)
+        self.chunk_size_var = SimpleNamespace(get=lambda: "25")
+        self.preprocess_var = SimpleNamespace(get=lambda: True)
+        # The export toggle is read into the settings snapshot a run carries, so the
+        # window has to have one; on is the default a run starts from.
+        self.include_time_anchors_var = SimpleNamespace(get=lambda: True)
+        self._parse_chunk_minutes = lambda display: 25
+
+        # What has been generated so far, for this meeting.
+        self.cached_minutes_by_template = {}
+        self.generated_minutes = ""
+        self.generated_recap = ""
+        self.generated_actions = ""
+
+        self.controls = {name: FakeControl(name) for name in self.CONTROL_NAMES}
+        self.status = []
+        self.progress = []
+        self.badges = []
+        self.banners = []      # (document, message) -- a banner shown to the person
+        self.views = []        # (document, text) -- a document rendered
+        self.sessions_saved = []
+        self.completions = []  # the "meeting completed" dialogs
+        # When set, the person cancels the run the moment it reports progress --
+        # standing in for reaching for Cancel while a long generation is under way.
+        self.cancel_on_progress = False
+
+    def __getattr__(self, name):
+        """The controls, by the name the window reaches them under."""
+        controls = self.__dict__.get("controls")
+        if controls and name in controls:
+            return controls[name]
+        raise AttributeError(name)
+
+    # --- the surface one generation run is rendered onto ----------------------
+
+    def _t(self, key, **fmt):
+        return translate(key, self.ui_locale, **fmt)
+
+    def _get_selected_model_override(self):
+        return None
+
+    def after(self, delay_ms, callback=None, *args):
+        """Stand in for the UI thread's queue: a test is already on that thread."""
+        return callback() if callback is not None else None
+
+    def _set_status(self, message):
+        self.status.append(message)
+        if self.cancel_on_progress:
+            self.cancel_on_progress = False
+            self.cancel_event.set()
+
+    def _set_progress(self, percent, message):
+        self.progress.append((percent, message))
+
+    def _update_step_badge(self, step_key, state, extra=""):
+        self.badges.append((step_key, state, extra))
+
+    def _save_full_session(self, audio_hash):
+        self.sessions_saved.append(audio_hash)
+        return True
+
+    def _show_minutes_error_banner(self, message):
+        self.banners.append(("minutes", message))
+
+    def _hide_minutes_error_banner(self):
+        pass
+
+    def _show_recap_error_banner(self, message):
+        self.banners.append(("recap", message))
+
+    def _hide_recap_error_banner(self):
+        pass
+
+    def _show_actions_error_banner(self, message):
+        self.banners.append(("action items", message))
+
+    def _hide_actions_error_banner(self):
+        pass
+
+    def _populate_minutes_tabs(self, sections):
+        self.views.append(("minutes", sections.get("full_text", "")))
+
+    def _update_recap_view(self, text):
+        self.views.append(("recap", text))
+
+    def _update_actions_view(self, text):
+        self.views.append(("action items", text))
+
+    def _on_pipeline_finished(self):
+        self.completions.append(True)
+
+    def locked_controls(self):
+        """
+        The controls a person needs that are still disabled.
+
+        Cancel is deliberately disabled whenever nothing is running, so it is not
+        one of them: what counts as stuck is Start or a Generate button staying
+        disabled with nothing behind them.
+        """
+        return [
+            name for name, control in self.controls.items()
+            if name != "cancel_btn" and not control.usable()
+        ]
+
+    def usable(self):
+        """The window is free for the next request: nothing running, nothing locked."""
+        return self.is_processing is False and not self.locked_controls()
+
+    def borrow_generation_from(self, app_class):
+        """
+        Take the window's own generation methods onto this stand-in.
+
+        The methods under test run against this window rather than against a real
+        CustomTkinter one, which needs a display. Everything they reach for -- the
+        controls, the status lines, the banners, the views -- is answered above.
+        """
+        for name in (
+            "_start_generation",
+            "_run_generation",
+            "_restore_after_generation",
+            "_confirm_regenerating",
+            "_start_minutes_generation_only",
+            "_start_recap_generation_only",
+            "_start_actions_generation_only",
+        ):
+            setattr(self, name, types.MethodType(getattr(app_class, name), self))
+        return self
+
+
+@contextmanager
+def a_generation_window(provider, **window_settings):
+    """
+    A window driven through a generation trigger, answering with a scripted provider.
+
+    The provider is handed to the window in place of a real Gemini client, so a test
+    exercises the whole run -- lock, generate, report, restore -- with no network call
+    and no display.
+    """
+    from src.ui import app_window
+
+    window = FakeGenerationWindow(**window_settings).borrow_generation_from(app_window.STTMeetApp)
+    original = app_window.get_gemini_client
+    app_window.get_gemini_client = lambda api_key: provider
+    try:
+        yield window
+    finally:
+        app_window.get_gemini_client = original
+
+
+def test_a_cancelled_generation_leaves_the_window_usable():
+    """
+    A cancelled generation is an end, not a failure -- but it is still an end, and
+    the person has to get their controls back to try again. The Minutes path had no
+    restore for this case at all, so cancelling left Start and Generate disabled:
+    an app that looks stuck and will not take another request.
+    """
+    from src.ui.app_window import STTMeetApp
+
+    with a_generation_window(FakeGeminiProvider({})) as window:
+        # The person reaches for Cancel while the Minutes are being generated.
+        window.cancel_on_progress = True
+        STTMeetApp._start_minutes_generation_only(window)
+        wait_until(window.usable)
+
+    assert window.is_processing is False
+    assert window.locked_controls() == []
+    # A cancel is not a failure, so nothing is shown as having gone wrong.
+    assert window.banners == []
+    # The run really was cancelled rather than quietly finishing.
+    assert window.status[-1] == translate("status.cancelled", window.ui_locale)
+
+
+# The three documents, each with the trigger a person presses and the call it makes.
+GENERATION_TRIGGERS = (
+    ("Minutes", "_start_minutes_generation_only", "minutes"),
+    ("Recap", "_start_recap_generation_only", "recap"),
+    ("Action items", "_start_actions_generation_only", "action items"),
+)
+
+
+def generation_provider(text):
+    """A provider that answers whatever a document generation asks it."""
+    return FakeGeminiProvider({
+        model: [text] for model in
+        dict.fromkeys([MINUTES_MODEL_NAME] + MINUTES_FALLBACK_MODELS)
+    })
+
+
+def test_each_document_reports_progress_and_shows_what_it_generated():
+    """
+    Minutes, Recap and Action items are three buttons, not three programs. Each says
+    what it is generating while it runs, each puts its finished document where that
+    document belongs, and each is asked for by name -- all through one method, so the
+    shape of a generation run is maintained in one place.
+    """
+    from src.ui.app_window import STTMeetApp
+
+    for document, trigger, view_key in GENERATION_TRIGGERS:
+        with a_generation_window(generation_provider("# %s\n\nBody." % document)) as window:
+            getattr(STTMeetApp, trigger)(window)
+            wait_until(window.usable)
+
+        # The person was told which document was being made, in the Processing language.
+        # Matched case-insensitively and without demanding a bracketed prefix: the three
+        # documents each announce themselves, but only Recap and Action items happen to
+        # lead with a tag, and the wording is the pipeline's shared i18n keys', not this
+        # test's to pin.
+        starting = window.status[0]
+        assert document.lower() in starting.lower(), (
+            "%s did not announce itself: %r" % (document, starting)
+        )
+        assert display_minutes_lang(window.lang_var.get(), window.ui_locale) in starting
+        # The document itself landed in its own view, and the window is free again.
+        assert window.views[-1][0] == view_key
+        assert window.views[-1][1].strip().startswith("#")
+        assert window.locked_controls() == []
+
+
+def test_each_document_surfaces_a_failure_without_losing_the_transcript():
+    """
+    A document that cannot be generated must say so where that document is shown, and
+    must not cost the person the Transcript it was made from. The failure wording is
+    each document's own, which is why it is supplied as data.
+    """
+    from src import gemini_failover
+    from src.ui.app_window import STTMeetApp
+
+    # Every model of the chain refuses for the day.
+    refusing = FakeGeminiProvider({
+        model: [quota_failure_error()]
+        for model in dict.fromkeys([MINUTES_MODEL_NAME] + MINUTES_FALLBACK_MODELS)
+    })
+
+    for document, trigger, view_key in GENERATION_TRIGGERS:
+        # The chain is exhausted three times over, so without this the test would spend
+        # the backoff for real -- 45 seconds per document -- and the wait would race it.
+        with recording_waits(gemini_failover):
+            with a_generation_window(refusing) as window:
+                getattr(STTMeetApp, trigger)(window)
+                wait_until(window.usable)
+
+        assert [name for name, _ in window.banners] == [view_key]
+        assert window.views == [], "%s should show nothing it did not generate" % document
+        # The Transcript is untouched, and the person can ask again.
+        assert window.processed_transcript.strip()
+        assert window.locked_controls() == []
+
+
+def test_a_failure_late_in_a_generation_leaves_the_window_usable():
+    """
+    The step that used to have no restore at all. Minutes generation failing after the
+    model has answered -- while the finished document is being shown -- must still hand
+    the window back. Before, the controls stayed disabled with nothing running behind
+    them and the app looked stuck.
+    """
+    from src.ui.app_window import MINUTES_GENERATION, GenerationSettings, STTMeetApp
+
+    with a_generation_window(generation_provider("# Minit")) as window:
+        window.is_processing = True
+        window.start_btn.configure(state="disabled")
+        window.gen_minutes_btn.configure(state="disabled")
+        # A late step goes wrong: the session save, after the Minutes were generated.
+        window.sessions_saved = None
+        window._save_full_session = _raising_late_step
+
+        settings = GenerationSettings(
+            api_key="key", model_override=None, language="Bahasa Melayu",
+            template="action_minutes", file_hash="manual_session",
+        )
+        STTMeetApp._run_generation(
+            window, MINUTES_GENERATION, settings, window.processed_transcript
+        )
+
+    # The failure is shown rather than swallowed, and the window is usable regardless.
+    assert [name for name, _ in window.banners] == ["minutes"]
+    assert window.is_processing is False
+    assert window.locked_controls() == []
+
+
+def _raising_late_step(audio_hash):
+    """A step late enough in a run to be the one that used to strand the controls."""
+    raise RuntimeError("the session file could not be written")
+
+
+def test_a_cancelled_generation_is_left_in_the_same_state_as_a_failed_one():
+    """
+    Cancelling is not failing, but it is the same ending: the person is back in a
+    window they can use, with nothing shown as having gone wrong. Neither end may
+    leave the app looking stuck.
+    """
+    from src.ui.app_window import STTMeetApp
+
+    refusing = FakeGeminiProvider({
+        model: [quota_failure_error()]
+        for model in dict.fromkeys([MINUTES_MODEL_NAME] + MINUTES_FALLBACK_MODELS)
+    })
+
+    with a_generation_window(FakeGeminiProvider({})) as cancelled:
+        cancelled.cancel_on_progress = True
+        STTMeetApp._start_minutes_generation_only(cancelled)
+        wait_until(cancelled.usable)
+
+    with a_generation_window(refusing) as failed:
+        STTMeetApp._start_minutes_generation_only(failed)
+        wait_until(failed.usable)
+
+    # Same usable state either way; the only difference is what the person was told.
+    assert cancelled.locked_controls() == failed.locked_controls() == []
+    assert cancelled.is_processing is failed.is_processing is False
+    assert cancelled.banners == []
+    assert [name for name, _ in failed.banners] == ["minutes"]
+    assert cancelled.status[-1] != failed.status[-1]
+
+
+def test_a_generation_thread_reads_no_interface_variable():
+    """
+    Every setting a generation run needs is captured on the UI thread before the thread
+    starts, exactly as a Pipeline run's settings are (ADR 0001). So the generation
+    thread holds a dataclass and has no widget to reach for.
+    """
+    source = (REPO_ROOT / "src" / "ui" / "app_window.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    app = next(node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "STTMeetApp")
+    worker = next(node for node in app.body
+                  if isinstance(node, ast.FunctionDef) and node.name == "_run_generation")
+
+    worker_source = ast.get_source_segment(source, worker)
+
+    assert "request.generate(" in worker_source, "the worker must generate the document"
+    assert not [line for line in worker_source.splitlines() if "_var.get()" in line], (
+        "the generation thread must read no interface variable"
+    )
+
+
+def test_a_generation_run_saves_its_session_from_the_snapshot_not_the_widgets():
+    """
+    The autosave a generation run fires when it finishes happens on the generation
+    thread, one call deeper than the worker body a source scan can see: it reaches
+    _get_current_settings. So the settings a generation run must save from are captured
+    on the UI thread before the thread starts, and this exercises the real method with
+    widgets that refuse to be read at all.
+
+    The source-scan guards above cannot catch a read this deep -- they check the worker's
+    own body, and the read lives in a method it calls. Only running it does.
+    """
+    from src.ui.app_window import STTMeetApp
+
+    def poisoned(name):
+        def boom():
+            raise AssertionError("read %s from a worker thread" % name)
+        return SimpleNamespace(get=boom)
+
+    snapshot = {
+        "engine": "the engine chosen when the run started",
+        "language": "Bahasa Melayu",
+        "chunk_minutes": 25,
+        "preprocess": True,
+    }
+
+    with a_generation_window("Transcript already here.") as window:
+        window.chunk_size_var = poisoned("chunk_size_var")
+        window.preprocess_var = poisoned("preprocess_var")
+        window._parse_chunk_minutes = lambda display: 25
+        window._get_current_settings = types.MethodType(
+            STTMeetApp._get_current_settings, window
+        )
+
+        # No snapshot yet: the guard does not apply, so the method falls through to the
+        # widgets and is caught. This is the state a generation run used to leave behind.
+        window.is_processing = True
+        window._session_settings_snapshot = None
+        try:
+            window._get_current_settings()
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("expected the unsnapshotted read to reach the widgets")
+
+        # With the snapshot the generation run captures, the same call never touches one.
+        window._session_settings_snapshot = snapshot
+        assert window._get_current_settings() == snapshot
+
+
+def test_a_generation_run_captures_its_settings_before_it_starts_the_thread():
+    """
+    The snapshot above is only worth anything if it is taken while the run is being set
+    up -- on the UI thread, before any thread exists. So starting a generation must leave
+    the snapshot in place, which is what makes the autosave that follows safe.
+    """
+    from src.ui.app_window import STTMeetApp
+
+    with a_generation_window(generation_provider("# Minit")) as window:
+        window.chunk_size_var = SimpleNamespace(get=lambda: "25")
+        window.preprocess_var = SimpleNamespace(get=lambda: True)
+        window._parse_chunk_minutes = lambda display: 25
+        getattr(STTMeetApp, "_start_minutes_generation_only")(window)
+        wait_until(window.usable)
+
+    assert window._session_settings_snapshot, (
+        "starting a generation must capture the settings the autosave will need"
+    )
+    assert window._session_settings_snapshot["language"] == "Bahasa Melayu"
+
+
+def test_every_test_in_this_suite_is_registered_to_run():
+    """
+    main() calls tests from a hardcoded list, so a test that is defined but not
+    registered never runs and never fails. This suite has been bitten by that before,
+    so the list is checked against the file rather than trusted.
+    """
+    tree = ast.parse((REPO_ROOT / "test_pipeline.py").read_text(encoding="utf-8"))
+    defined = {
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    }
+    entry_point = [node for node in tree.body if isinstance(node, ast.If)]
+    registered = {
+        node.func.id
+        for block in entry_point
+        for node in ast.walk(block)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert defined, "no tests found to register"
+    assert defined <= registered, sorted(defined - registered)
+
+
+def test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why():
+    """A terminal gets an answer, not a traceback, when the recording cannot be read."""
+    from src.headless import EXIT_NO_TRANSCRIPT, run_headless
+
+    # Every model of the transcription chain refuses for the day.
+    provider = FakeGeminiProvider(
+        {model: [quota_failure_error()] for model in FALLBACK_MODELS}
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = a_recording_audio_file(tmp)
+        outcome = run_headless(str(audio), output_dir=tmp, preprocess=False, cache_dir=tmp, client=provider)
+        written = sorted(p.name for p in Path(tmp).glob("*.md"))
+
+    assert outcome.exit_code == EXIT_NO_TRANSCRIPT
+    assert outcome.transcript_path is None and outcome.minutes_path is None
+    assert written == []
+
+
 if __name__ == "__main__":
     test_audio_setup_wizard_integration()
     test_time_conversions()
@@ -670,6 +4448,9 @@ if __name__ == "__main__":
     test_session_roundtrip()
     test_session_never_stores_api_key()
     test_session_loads_v1_without_settings()
+    test_a_session_saved_and_reloaded_at_the_current_cache_version_still_uses_its_minutes()
+    test_a_session_cached_before_time_anchors_existed_reads_as_a_cache_miss()
+    test_a_session_reopen_only_serves_minutes_this_build_could_have_written()
     test_normalize_settings_rejects_stale_values()
     test_load_session_missing_and_corrupt()
     test_every_string_has_english_and_malay()
@@ -693,6 +4474,7 @@ if __name__ == "__main__":
     test_docs_sidebar_widgets_use_explicit_theme_colors()
     test_translate_has_no_combined_mode()
     test_translate_missing_key_raises()
+    test_every_literal_translation_key_resolves()
     test_translate_falls_back_to_english_for_unknown_mode()
     test_translate_formats_placeholders()
     test_logic_coupled_literals_are_not_translated()
@@ -709,10 +4491,108 @@ if __name__ == "__main__":
     test_localize_date_uses_language_months()
     test_prefs_roundtrip_and_tolerance()
     test_template_prompts_and_displays()
+    test_template_reference_documents_match_prompts()
     test_parse_minutes_sections_for_templates()
     test_recap_prompts()
     test_action_items_prompts()
     test_weak_model_diarization_policy()
+    test_quota_failure_predicate_separates_quota_from_transient_errors()
+    test_quota_failure_skips_retries_and_fails_over_to_the_next_model()
+    test_transient_error_retries_with_backoff_then_fails_over()
+    test_success_ends_the_failover_chain_without_touching_later_models()
+    test_exhausted_failover_chain_raises_the_calls_final_error()
+    test_resource_lifecycle_brackets_one_models_whole_retry_sweep()
+    test_resource_is_released_even_when_a_models_sweep_fails()
+    test_transcribed_chunk_is_uploaded_once_and_the_upload_is_deleted()
+    test_transcription_reuses_one_upload_across_a_models_retries()
+    test_transcription_fails_over_to_a_later_model_after_a_transient_error()
+    test_transcription_deletes_the_uploaded_audio_when_the_run_is_cancelled()
+    test_cancellation_during_an_upload_leaves_no_file_in_provider_storage()
+    test_transcription_diarization_still_turns_off_for_weak_models()
+    test_transcription_reports_its_own_progress_wording()
+    test_transcription_keeps_its_own_quota_failure_message()
+    test_transcription_retries_an_empty_transcription_on_its_own_backoff()
+    test_a_chunk_that_only_ever_comes_back_empty_is_not_a_transcript()
+    test_transcription_path_delegates_its_failure_policy_to_the_shared_module()
+    test_upload_lifecycle_is_an_input_to_the_policy_not_part_of_it()
+    test_failover_policy_module_owns_the_policy_and_nothing_else()
+    test_failover_description_carries_no_provider_types()
+    test_recap_path_keeps_its_backoff_step_and_temperature()
+    test_recap_quota_failure_message_is_unchanged()
+    test_recap_path_delegates_its_failure_policy_to_the_shared_module()
+    test_minutes_path_fails_over_to_the_next_model_on_a_quota_failure()
+    test_minutes_quota_failure_message_is_unchanged()
+    test_english_action_minutes_hands_the_caller_a_document_anchored_to_the_transcript()
+    test_time_anchors_stay_off_the_metadata_and_the_headings()
+    test_anchors_disturb_the_buckets_parsed_out_of_the_generated_document()
+    test_the_minutes_tab_renders_an_anchored_document_with_the_renderer_it_has()
+    test_the_time_anchor_toggle_is_remembered_per_session()
+    test_a_session_written_before_the_time_anchor_toggle_existed_loads_with_it_on()
+    test_the_time_anchor_toggle_decides_what_the_text_export_carries()
+    test_the_time_anchor_toggle_decides_what_the_word_export_carries()
+    test_the_time_anchor_toggle_reaches_only_the_minutes_branch()
+    test_the_transcript_appended_to_a_minutes_export_keeps_its_own_markers()
+    test_stripping_does_not_damage_the_markdown_around_the_anchors()
+    test_a_minutes_document_with_no_anchors_exports_the_same_in_either_position()
+    test_an_item_with_no_anchor_is_exported_whole_rather_than_damaged()
+    test_multi_timestamp_anchors_are_stripped_cleanly()
+    test_with_the_switch_on_the_exported_documents_are_what_they_were()
+    test_turning_the_switch_off_leaves_the_minutes_on_screen_exactly_as_they_were()
+    test_export_all_carries_the_toggle_to_both_of_the_files_it_writes()
+    test_the_conversion_the_writers_perform_survives_an_export_of_its_own()
+    test_minutes_path_retries_a_transient_error_with_backoff_then_answers()
+    test_action_items_path_fails_over_to_the_next_model_on_a_quota_failure()
+    test_action_items_path_retries_a_transient_error_with_backoff_then_answers()
+    test_action_items_quota_failure_message_is_unchanged()
+    test_minutes_and_action_items_delegate_their_failure_policy_to_the_shared_module()
+    test_minutes_keep_their_own_failover_chain_apart_from_transcription()
     test_tooltip_text_provider()
+    test_a_whole_pipeline_run_reports_what_it_is_doing_and_yields_transcript_and_minutes()
+    test_a_minutes_failure_never_costs_the_transcript()
+    test_the_run_honours_the_engine_and_the_processing_language()
+    test_every_report_a_run_makes_renders_from_its_key_and_args()
+    test_a_run_defaults_to_what_the_desktop_app_persists()
+    test_a_cancelled_run_transcribes_nothing()
+    test_preprocessing_decides_which_audio_is_transcribed_and_reports_its_own_progress()
+    test_importing_the_pipeline_run_pulls_in_no_ui_toolkit()
+    test_the_pipeline_run_module_reaches_no_ui_package_and_no_translation_table()
+    test_the_pipeline_run_takes_its_settings_as_a_plain_data_object()
+    test_a_headless_run_writes_the_transcript_and_the_minutes_to_disk()
+    test_the_headless_adapter_never_consults_the_export_writers()
+    test_a_headless_run_keeps_the_transcript_when_minutes_fail()
+    test_a_headless_run_that_cannot_transcribe_writes_nothing_and_says_why()
+    test_chunking_splits_a_long_audio_file_and_every_chunk_is_transcribed()
+    test_chunking_is_skipped_entirely_when_it_is_off()
+    test_a_checkpoint_records_each_chunk_as_soon_as_it_is_done()
+    test_an_interrupted_run_resumes_and_does_not_re_pay_for_chunks_already_done()
+    test_tail_context_carries_the_previous_chunk_across_the_seam()
+    test_overlap_is_removed_from_the_seam_between_two_chunks()
+    test_a_reprocessed_chunk_gets_the_seam_handling_a_first_pass_run_gives_it()
+    test_a_chunk_that_fails_again_stays_retryable_and_leaves_the_checkpoint_alone()
+    test_tail_context_is_worked_out_in_exactly_one_place()
+    test_the_window_reprocesses_a_chunk_through_the_pipeline_entry_point()
+    test_a_cancelled_run_stops_between_chunks_and_leaves_the_rest_resumable()
+    test_ctrl_c_cancels_a_headless_run_and_leaves_it_resumable()
+    test_a_headless_run_that_failed_partway_is_resumed_by_running_it_again()
+    test_a_console_report_prints_its_key_and_arguments_without_a_translation_table()
+    test_the_headless_flag_on_the_entry_point_configures_the_run()
+    test_the_engine_and_its_model_name_name_the_same_choice_both_ways()
+    test_the_window_shows_a_pipeline_run_from_the_reports_it_hears()
+    test_the_window_builds_its_chunk_monitor_from_the_plan_the_run_reports()
+    test_the_window_shows_a_chunk_it_read_back_from_the_checkpoint_as_its_own_state()
+    test_the_chunk_monitor_shows_the_whole_recording_when_chunking_is_off()
+    test_the_live_transcript_view_is_assembled_from_the_chunks_the_run_reports()
+    test_the_window_shows_a_reprocessed_chunk_in_place_in_its_transcript()
+    test_the_window_asks_for_a_run_that_synthesises_no_minutes()
+    test_the_window_never_reads_an_interface_variable_from_its_worker_thread()
+    test_a_cancelled_generation_leaves_the_window_usable()
+    test_each_document_reports_progress_and_shows_what_it_generated()
+    test_each_document_surfaces_a_failure_without_losing_the_transcript()
+    test_a_failure_late_in_a_generation_leaves_the_window_usable()
+    test_a_cancelled_generation_is_left_in_the_same_state_as_a_failed_one()
+    test_a_generation_thread_reads_no_interface_variable()
+    test_a_generation_run_saves_its_session_from_the_snapshot_not_the_widgets()
+    test_a_generation_run_captures_its_settings_before_it_starts_the_thread()
+    test_every_test_in_this_suite_is_registered_to_run()
     print("All unit tests passed successfully!")
 

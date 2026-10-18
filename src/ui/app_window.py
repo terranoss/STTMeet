@@ -12,13 +12,20 @@ Features:
 - Tabbed view: Transcript, Summary, Meeting Minutes, Action Items
 - Dynamic Speaker Mapping panel
 - Multi-format Export: Word (.docx), Markdown (.md), Plain Text (.txt)
+
+This window is an adapter over the Pipeline run in src/pipeline.py. It starts a run,
+renders what the run reports, and does not orchestrate transcription itself: see ADR
+0001. Settings are read once on the UI thread and handed over as data, so the worker
+thread has no interface variable to reach for -- which is the whole point of the seam.
+What the window keeps for itself is what a session is and where it goes; that is its
+concern and not the run's.
 """
 import os
 import sys
-import json
 import threading
 import traceback
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -60,19 +67,20 @@ from ..utils import (
     format_duration,
     estimate_cost_and_tokens
 )
-from ..audio_processor import (
-    preprocess_audio,
-    split_audio_into_chunks,
-    compute_file_hash
-)
+from ..audio_processor import compute_file_hash
 from ..cancellation import CancelledError
-from ..gemini_transcriber import (
-    get_gemini_client,
-    transcribe_audio_chunk
+from ..checkpoint_store import checkpoint_path
+from ..gemini_transcriber import get_gemini_client
+from ..pipeline import (
+    Phase,
+    PipelineResult,
+    PipelineSettings,
+    STEP_TRANSCRIBE,
+    model_for_engine,
+    reprocess_chunk,
+    run_pipeline,
 )
 from ..transcript_processor import (
-    adjust_chunk_timestamps,
-    deduplicate_overlap,
     extract_speakers,
     apply_speaker_mapping
 )
@@ -89,7 +97,8 @@ from ..exporter import (
     DocxUnavailableError,
     export_to_docx,
     export_to_markdown,
-    export_to_text
+    export_to_text,
+    strip_time_anchors
 )
 from ..session_store import (
     DEFAULT_SETTINGS,
@@ -99,6 +108,7 @@ from ..session_store import (
     VALID_TEMPLATES,
     build_session_payload,
     load_session,
+    minutes_cache_is_current,
     normalize_settings,
     save_session,
     session_path
@@ -309,7 +319,11 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
     def update_chunk_state(self, chunk_index: int, state: str, detail: str = ""):
         """
         Updates visual badge and buttons for a chunk.
-        state: 'pending', 'working', 'done', 'error', 'cancelled'
+        state: 'pending', 'working', 'done', 'cached', 'error', 'cancelled'
+
+        'cached' is a Chunk the run read back from the Checkpoint rather than
+        transcribing: it is finished, and a person watching deserves to know it was not
+        paid for twice.
         """
         widgets = self.row_widgets.get(chunk_index)
         if not widgets:
@@ -324,6 +338,7 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
             "pending": (self._t("monitor.state_pending"), "gray", ("#E0E0E0", "#2B2B2B"), "disabled"),
             "working": (self._t("monitor.state_working"), "#1976D2", ("#BBDEFB", "#0D47A1"), "disabled"),
             "done": (self._t("monitor.state_done"), "#2E7D32", ("#C8E6C9", "#1B5E20"), "disabled"),
+            "cached": (self._t("monitor.state_cached"), "#2E7D32", ("#C8E6C9", "#1B5E20"), "disabled"),
             "error": (
                 self._t("monitor.state_error_detail", detail=detail[:25]) if detail
                 else self._t("monitor.state_error"),
@@ -352,6 +367,339 @@ class ChunkMonitorDialog(ctk.CTkToplevel):
             self.btn_extract.configure(state="disabled")
 
         self.summary_label.configure(text=status_text)
+
+
+def pipeline_settings_for_a_window_run(
+    audio_path: str,
+    api_key: str,
+    engine: str,
+    language: str,
+    template: str,
+    preprocess: bool,
+    chunk_minutes: int,
+) -> PipelineSettings:
+    """
+    The settings one Pipeline run started from the window needs, as data.
+
+    Every value here was read off the interface on the UI thread before the run began,
+    which is the point: the run holds a dataclass, so its worker thread has no widget to
+    reach for (ADR 0001).
+
+    Two of these are the window's own choices rather than the run's defaults. The
+    Checkpoint goes to the app's cache, where the session file beside it lives; and
+    Minutes are not synthesised, because in the window they are a separate thing a person
+    asks for after extracting the Transcript, not part of pressing Transcribe.
+    """
+    return PipelineSettings(
+        audio_path=audio_path,
+        api_key=api_key,
+        engine=engine,
+        language=language,
+        template=template,
+        preprocess=bool(preprocess),
+        chunk_minutes=int(chunk_minutes),
+        cache_dir=str(CACHE_DIR),
+        synthesize_minutes=False,
+    )
+
+
+@dataclass(frozen=True)
+class GenerationSettings:
+    """
+    What one generation run needs, read off the interface before the thread starts.
+
+    The same discipline the Pipeline run gets (ADR 0001): every value here was read on
+    the UI thread, so the generation thread holds plain data and reaches for no widget.
+    """
+
+    api_key: str
+    model_override: Optional[str]
+    language: str          # the Processing language the document is written in
+    template: str          # the Template the Minutes take their shape from
+    file_hash: str         # the meeting this document belongs to, for the session
+
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    """
+    One document the window can generate from a Transcript it already holds.
+
+    Minutes, Recap and Action items are the same shape of run three times over: generate
+    something, show it, say so if it went wrong, hand the window back. So the differences
+    are data here rather than three parallel blocks -- what the document is called, what it
+    calls to be generated, which view it refreshes and which banner reports its failure.
+    """
+
+    document: str
+    button_name: str                 # the control that starts this generation
+    starting_status: str             # status line shown while the document is generated
+    generate: Callable               # the call that produces the document
+    publish: Callable                # what the window does with the finished document
+    show_error: Callable             # how a failure is shown to the person
+    announce_start: Optional[Callable] = None      # extra reporting as the document begins
+    announce_done: Optional[Callable] = None       # a completion notice, where one is due
+    announce_cancelled: Optional[Callable] = None  # where a cancel leaves a mark
+    hide_error: Optional[Callable] = None
+    warns_before_replacing: bool = False
+
+
+def _announce_minutes_start(window, message):
+    """
+    Minutes are the fourth step of the window's own story, so they badge as one and
+    the bar moves to where that step starts rather than sitting at the Transcript's end.
+    """
+    window._update_step_badge("step4", "working")
+    window._set_progress(0.85, message)
+
+
+def _announce_minutes_done(window):
+    """The Minutes are the last thing the window was asked for, so it says so."""
+    window.after(0, window._on_pipeline_finished)
+
+
+def _announce_minutes_cancelled(window):
+    """A cancelled Minutes run leaves no step done, so the badge goes back to pending."""
+    window._update_step_badge("step4", "pending")
+
+
+def _generate_minutes(client, transcript, settings, progress_callback, cancel_event):
+    """Ask the model for the Minutes of this Transcript, in the chosen Template."""
+    return generate_meeting_minutes(
+        client=client,
+        full_transcript=transcript,
+        language=settings.language,
+        template=settings.template,
+        progress_callback=progress_callback,
+        model_override=settings.model_override,
+        cancel_event=cancel_event,
+    )
+
+
+def _publish_minutes(window, text: str, settings: GenerationSettings):
+    """Bank the Minutes against the Template they were made in, and show them."""
+    window.generated_minutes = text
+    sections = parse_minutes_sections(text)
+    window.cached_minutes_by_template[settings.template] = text
+    window.after(0, lambda: window._populate_minutes_tabs(sections))
+    window.after(0, window._hide_minutes_error_banner)
+    window._update_step_badge("step4", "done")
+    window._set_progress(1.0, window._t("status.all_complete"))
+    if settings.file_hash:
+        window._save_full_session(settings.file_hash)
+
+
+def _show_minutes_error(window, message: str):
+    """Minutes failed, so say so where the Minutes are -- and leave the step marked."""
+    window._update_step_badge("step4", "error", window._t("step.failed"))
+    window.after(0, lambda: window._show_minutes_error_banner(message))
+    window._set_progress(0.80, window._t("status.minutes_failed"))
+
+
+def _publish_recap(window, text: str, settings: GenerationSettings):
+    """Show the Recap and say the run is done."""
+    window.generated_recap = text
+    window.after(0, lambda: window._update_recap_view(text))
+    window.after(0, window._hide_recap_error_banner)
+    if settings.file_hash:
+        window._save_full_session(settings.file_hash)
+    window._set_status(window._t("status.recap_complete"))
+
+
+def _show_recap_error(window, message: str):
+    """The Recap failed: its own banner, and its own wording."""
+    window.after(0, lambda: window._show_recap_error_banner(message))
+    window._set_status(window._t("status.recap_failed", error=message[:40]))
+
+
+def _generate_recap(client, transcript, settings, progress_callback, cancel_event):
+    """Ask the model for a Recap of this Transcript."""
+    return generate_meeting_recap(
+        client=client,
+        full_transcript=transcript,
+        language=settings.language,
+        progress_callback=progress_callback,
+        model_override=settings.model_override,
+        cancel_event=cancel_event,
+    )
+
+
+def _publish_actions(window, text: str, settings: GenerationSettings):
+    """Show the Action items and say the run is done."""
+    window.generated_actions = text
+    window.after(0, lambda: window._update_actions_view(text))
+    window.after(0, window._hide_actions_error_banner)
+    if settings.file_hash:
+        window._save_full_session(settings.file_hash)
+    window._set_status(window._t("status.actions_complete"))
+
+
+def _show_actions_error(window, message: str):
+    """The Action items failed: their own banner, and their own wording."""
+    window.after(0, lambda: window._show_actions_error_banner(message))
+    window._set_status(window._t("status.actions_failed", error=message[:40]))
+
+
+def _generate_actions(client, transcript, settings, progress_callback, cancel_event):
+    """Ask the model for the Action items this Transcript committed to."""
+    return generate_action_items(
+        client=client,
+        full_transcript=transcript,
+        language=settings.language,
+        progress_callback=progress_callback,
+        model_override=settings.model_override,
+        cancel_event=cancel_event,
+    )
+
+
+# The three documents, as data. Each button names its own, and each is handed to the
+# same templated method, so the shape of a generation run is written down once.
+MINUTES_GENERATION = GenerationRequest(
+    document="Minutes",
+    button_name="gen_minutes_btn",
+    starting_status="status.step4_start",
+    generate=_generate_minutes,
+    publish=_publish_minutes,
+    show_error=_show_minutes_error,
+    announce_start=_announce_minutes_start,
+    announce_done=_announce_minutes_done,
+    announce_cancelled=_announce_minutes_cancelled,
+    hide_error=lambda window: window._hide_minutes_error_banner(),
+    warns_before_replacing=True,
+)
+
+RECAP_GENERATION = GenerationRequest(
+    document="Recap",
+    button_name="gen_recap_btn",
+    starting_status="status.generating_recap",
+    generate=_generate_recap,
+    publish=_publish_recap,
+    show_error=_show_recap_error,
+    hide_error=lambda window: window._hide_recap_error_banner(),
+)
+
+ACTION_ITEMS_GENERATION = GenerationRequest(
+    document="Action items",
+    button_name="gen_actions_btn",
+    starting_status="status.generating_actions",
+    generate=_generate_actions,
+    publish=_publish_actions,
+    show_error=_show_actions_error,
+    hide_error=lambda window: window._hide_actions_error_banner(),
+)
+
+
+class WindowPipelineObserver:
+    """
+    Renders a Pipeline run's reports onto the desktop window.
+
+    The window is the run's other adapter: it starts a Pipeline run and then does
+    nothing but show what the run reports. Everything a person sees during a run --
+    step badges, status text, the progress bar, the Chunk monitor's rows and the live
+    Transcript view -- arrives through report() and goes straight back out to a window
+    method. The run never reaches in here to change a widget, and this never reaches
+    into the run to ask what it is doing.
+
+    Reports carry translation keys, so this is also where a run becomes English or
+    Bahasa Melayu. A headless caller renders the same keys in a terminal instead; see
+    ADR 0001.
+
+    Counts for step 3's badge are remembered rather than recomputed from the run, so
+    the badge reads the way it always has -- (2/5) while working, (5/5) when the whole
+    meeting is transcribed, and how many are done when it is not.
+    """
+
+    def __init__(self, window):
+        self.window = window
+        self.chunk_total = 0
+        self.chunk_index = 0
+        self.chunks_done = 0
+        self._step_state = ""
+
+    def report(self, report) -> None:
+        if report.phase == Phase.STEP:
+            self._show_step(report)
+        elif report.phase == Phase.STATUS:
+            self.window._set_status(self._worded(report))
+        elif report.phase == Phase.PROGRESS:
+            self._show_progress(report)
+        elif report.phase == Phase.PLAN:
+            self.window._adopt_chunk_plan(report.args.get("chunks") or [])
+        elif report.phase == Phase.CHUNK:
+            self._show_chunk(report)
+        else:
+            # A new kind of report should not render as nothing at all, quietly. Logged
+            # rather than shown, so a run nobody is watching costs nobody a dialog.
+            log.debug("Window has nothing to show for report %s/%s", report.phase, report.key)
+
+    # --- one kind of report at a time -----------------------------------------
+
+    def _show_step(self, report):
+        self._step_state = report.state
+        if report.args.get("chunk_count"):
+            self.chunk_total = int(report.args["chunk_count"])
+        self.window._update_step_badge(report.key, report.state, self._step_extra(report))
+
+    def _show_progress(self, report):
+        if report.key == "status.step3_chunk":
+            # The run has reached a Chunk. Re-badge step 3 so its count moves as the
+            # meeting is transcribed, exactly as the loop it replaced did.
+            self.chunk_index = int(report.args.get("index") or 0)
+            self.chunk_total = int(report.args.get("total") or self.chunk_total)
+            if self._step_state == "working":
+                self.window._update_step_badge(
+                    STEP_TRANSCRIBE, "working", self._transcribe_extra("working")
+                )
+        self.window._set_progress(report.percent, self._worded(report))
+
+    def _show_chunk(self, report):
+        state, detail, text = self._chunk_state(report)
+        self.window._update_chunk_monitor_item(report.index, state, detail)
+        if report.key == "chunk.working":
+            # Still nothing to record: a Chunk being transcribed is not a Chunk the
+            # session can be said to have.
+            return
+        if text:
+            self.chunks_done += 1
+        self.window._note_chunk(report.index, "done" if text else state, text, detail)
+        self.window._refresh_live_transcript_view()
+        self.window._refresh_monitor_summary()
+
+    @staticmethod
+    def _chunk_state(report) -> Tuple[str, str, str]:
+        """(monitor state, detail, transcript text) for one Chunk report."""
+        detail = str(report.args.get("error") or "")
+        if report.key in ("chunk.done", "chunk.cached"):
+            return ("done" if report.key == "chunk.done" else "cached",
+                    "", str(report.args.get("text") or ""))
+        if report.key == "chunk.error":
+            return "error", detail, ""
+        if report.key == "chunk.cancelled":
+            return "cancelled", detail, ""
+        return "working", detail, ""
+
+    # --- wording the window has always used for its badges --------------------
+
+    def _worded(self, report) -> str:
+        """The report's key and arguments, in the window's Interface language."""
+        return self.window._t(report.key, **report.args)
+
+    def _step_extra(self, report) -> str:
+        if report.args.get("skipped"):
+            return self.window._t("step.skipped")
+        if report.args.get("chunk_count"):
+            return self.window._t("step.chunk_count", count=report.args["chunk_count"])
+        if report.key == STEP_TRANSCRIBE:
+            return self._transcribe_extra(report.state)
+        return ""
+
+    def _transcribe_extra(self, state: str) -> str:
+        if state == "done":
+            return f"({self.chunk_total}/{self.chunk_total})"
+        if state == "error":
+            return self.window._t(
+                "status.chunks_done_suffix", done=self.chunks_done, total=self.chunk_total
+            )
+        return f"({self.chunk_index}/{self.chunk_total})"
 
 
 # Traditional icon toolbar: (i18n key, glyph, handler name resolved on the app).
@@ -420,6 +768,8 @@ class STTMeetApp(ctk.CTk):
         self.active_client = None
         self.active_checkpoint_file = None
         self.active_file_hash: str = ""
+        self.active_chunk_minutes: int = 0
+        """The Chunking size the last Pipeline run used, which its Checkpoint records."""
 
         # Session bookkeeping. _step_states / _progress_value mirror the widgets so
         # autosaves from the worker thread never have to read Tk state.
@@ -1171,7 +1521,7 @@ class STTMeetApp(ctk.CTk):
 
     def _open_audio_setup_wizard_manual(self):
         if not self.selected_audio_file or not os.path.exists(self.selected_audio_file):
-            messagebox.showinfo(self._t("msg.info"), self._t("file.no_selection"), parent=self)
+            messagebox.showinfo(self._t("msg.notice"), self._t("file.no_selection"), parent=self)
             return
         self._open_audio_setup_wizard(self.selected_audio_file)
 
@@ -1549,6 +1899,11 @@ class STTMeetApp(ctk.CTk):
         # Pre-process state: persisted across restarts via prefs.json, edited in Settings modal
         self.preprocess_var = ctk.BooleanVar(value=bool(get_pref("preprocess", True)))
 
+        # Whether time anchors reach an exported Minutes. Per-session rather than a
+        # preference: it is a choice about one meeting's documents, and it starts on
+        # because the trail is worth having unless someone says otherwise.
+        self.include_time_anchors_var = ctk.BooleanVar(value=True)
+
         # Action Buttons (Workflow Triggers)
         self.start_btn = ctk.CTkButton(
             ctrl_frame,
@@ -1837,6 +2192,20 @@ class STTMeetApp(ctk.CTk):
         self.speaker_btn.grid(row=0, column=0, padx=16, pady=10, sticky="w")
         self._i18n_label(self.speaker_btn, "btn.map_speakers")
 
+        # Time anchors in the exported Minutes. It lives in the bottom bar beside the
+        # Export buttons and is never hidden per tab: on the tabs where it has no
+        # effect it is inert, which is better than the bar re-laying itself out every
+        # time someone changes tab. Nothing happens on a flip -- the Minutes on screen
+        # always carry their anchors -- so the switch costs no regeneration.
+        self.time_anchor_switch = ctk.CTkSwitch(
+            bottom_frame,
+            text=self._t("export.time_anchors"),
+            variable=self.include_time_anchors_var,
+            width=190
+        )
+        self.time_anchor_switch.grid(row=0, column=1, padx=(12, 12), pady=10, sticky="w")
+        self._i18n_label(self.time_anchor_switch, "export.time_anchors")
+
         # Export Buttons
         export_docx_btn = ctk.CTkButton(
             bottom_frame,
@@ -1949,15 +2318,14 @@ class STTMeetApp(ctk.CTk):
             self.after(150, lambda: self._open_audio_setup_wizard(chosen))
 
     def _get_selected_model_override(self) -> Optional[str]:
-        """Returns the specific Gemini model string if selected, or None for Auto-Failover."""
-        choice = self.engine_var.get()
-        if "Flash Lite" in choice:
-            return "gemini-3.5-flash-lite"
-        elif "3.8 Flash" in choice:
-            return "gemini-3.8-flash"
-        elif "3.5 Flash" in choice:
-            return "gemini-3.5-flash"
-        return None
+        """
+        The model the Engine choice pins, or None when it pins nothing (auto-failover).
+
+        The mapping itself belongs to the Pipeline run module, not here: the run turns an
+        Engine into a model the same way whether it was started from this window or from a
+        terminal, so there is one answer rather than two that can drift apart.
+        """
+        return model_for_engine(self.engine_var.get())
 
     def _is_diarization_supported(
         self,
@@ -2067,24 +2435,33 @@ class STTMeetApp(ctk.CTk):
         for tb in [self.txt_transcript, self.txt_minutes, self.txt_recap, self.txt_actions]:
             tb.delete("1.0", "end")
 
-        chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
-        language = self.lang_var.get()
-        do_preprocess = self.preprocess_var.get()
-
-        # Capture the settings on the UI thread; worker-thread autosaves reuse this
-        # instead of reading widgets from another thread.
+        # Every setting is read here, on the UI thread, and never again: the run and
+        # every autosave it triggers work from this snapshot rather than from widgets.
+        settings = pipeline_settings_for_a_window_run(
+            audio_path=self.selected_audio_file,
+            api_key=api_key,
+            engine=self.engine_var.get(),
+            language=self.lang_var.get(),
+            template=self.template_var.get(),
+            preprocess=bool(self.preprocess_var.get()),
+            chunk_minutes=self._parse_chunk_minutes(self.chunk_size_var.get()),
+        )
         self._session_settings_snapshot = {
-            "engine": self.engine_var.get(),
-            "language": language,
-            "chunk_minutes": chunk_mins,
-            "preprocess": bool(do_preprocess)
+            "engine": settings.engine,
+            "language": settings.language,
+            "chunk_minutes": settings.chunk_minutes,
+            "preprocess": settings.preprocess,
+            # Nothing in the run consumes the toggle, but an autosave the run triggers
+            # has to carry it or the meeting would reopen with the setting reset.
+            "include_time_anchors": bool(self.include_time_anchors_var.get()),
         }
+        self.active_chunk_minutes = settings.chunk_minutes
         self._step_states = {"step1": "pending", "step2": "pending", "step3": "pending", "step4": "pending"}
         self._progress_value = 0.0
 
         self.worker_thread = threading.Thread(
             target=self._run_pipeline_worker,
-            args=(self.selected_audio_file, api_key, chunk_mins, language, do_preprocess),
+            args=(settings,),
             daemon=True
         )
         self.worker_thread.start()
@@ -2141,230 +2518,129 @@ class STTMeetApp(ctk.CTk):
             self.monitor_dialog.update_chunk_state(idx, st["status"], st.get("error", ""))
         self.monitor_dialog.update_overall_summary(completed_count, len(chunks_meta), has_errors)
 
-    def _run_pipeline_worker(
-        self,
-        audio_path: str,
-        api_key: str,
-        chunk_minutes: int,
-        language: str,
-        do_preprocess: bool
-    ):
+    def _run_pipeline_worker(self, settings: PipelineSettings):
+        """
+        Run one Pipeline run and show what it reports.
+
+        The window owns no loop here. This thread starts the run, hands it the settings
+        captured on the UI thread and an observer that renders every report, and then
+        waits to be told how the run ended -- which is the whole contract between the
+        window and the run (ADR 0001). Nothing in this method reads an interface
+        variable, so there is nothing for it to touch from the wrong thread.
+
+        The session is saved from here while the run's settings are still the ones in
+        force, which is what makes an autosave consistent with the Transcript it is
+        saving.
+        """
+        observer = WindowPipelineObserver(self)
         try:
-            client = get_gemini_client(api_key) if api_key else None
-            file_hash = compute_file_hash(audio_path)
-            checkpoint_file = CACHE_DIR / f"progress_cloud_{file_hash}.json"
-            model_override = self._get_selected_model_override()
-
-            # Store active pipeline context for single-chunk reprocessing
-            self.active_client = client
-            self.active_checkpoint_file = checkpoint_file
-            self.active_file_hash = file_hash
-            self.active_model_override = model_override
-
-            # Step 1: Pre-process Audio
-            self._update_step_badge("step1", "working")
-            target_audio = audio_path
-            if do_preprocess:
-                self._set_status(self._t("status.step1_start"))
-                target_audio = preprocess_audio(
-                    audio_path,
-                    progress_callback=lambda msg: self._set_status(
-                        f"{self._t('status.step_prefix', n=1)} {msg}"
-                    )
-                )
-                self._update_step_badge("step1", "done")
-            else:
-                self._set_status(self._t("status.step1_done"))
-                self._update_step_badge("step1", "done", self._t("step.skipped"))
-
-            if self.cancel_event.is_set():
-                # Runs on the worker thread; the handler touches Tk widgets.
-                self.after(0, self._on_pipeline_cancelled)
-                return
-
-            # Step 2: Slicing into Chunks
-            self._update_step_badge("step2", "working")
-            self._set_status(self._t("status.step2_start"))
-            chunks = split_audio_into_chunks(
-                target_audio,
-                chunk_minutes=chunk_minutes,
-                progress_callback=lambda msg, pct: self._set_progress(
-                    pct * 0.2, f"{self._t('status.step_prefix', n=2)} {msg}"
-                )
+            client = get_gemini_client(settings.api_key) if settings.api_key else None
+            # Recorded up front so closing the window mid-run still has a session to
+            # autosave, which is what it did when the window owned the loop.
+            self.active_file_hash = compute_file_hash(settings.audio_path)
+            self._note_a_legacy_progress_file(self.active_file_hash)
+            result = run_pipeline(
+                settings,
+                observer,
+                cancel_event=self.cancel_event,
+                client=client,
             )
-            total_chunks = len(chunks)
-            self.active_chunks_meta = chunks
-            self._update_step_badge(
-                "step2", "done", self._t("step.chunk_count", count=total_chunks)
-            )
-
-            # Initialize chunk statuses
-            completed_transcripts = {}
-            if checkpoint_file.exists():
-                try:
-                    with open(checkpoint_file, "r", encoding="utf-8") as f:
-                        saved_data = json.load(f)
-                        completed_transcripts = saved_data.get("chunks", {})
-                except Exception:
-                    completed_transcripts = {}
-
-            self.active_chunk_status = {}
-            for c in chunks:
-                idx = c["chunk_index"]
-                idx_str = str(idx)
-                if idx_str in completed_transcripts and completed_transcripts[idx_str].strip():
-                    self.active_chunk_status[idx] = {
-                        "status": "done",
-                        "text": completed_transcripts[idx_str],
-                        "error": ""
-                    }
-                else:
-                    self.active_chunk_status[idx] = {
-                        "status": "pending",
-                        "text": "",
-                        "error": ""
-                    }
-
-            # Launch/Update the Floating Monitor Dialog
-            self.after(0, lambda: self._create_or_show_monitor(chunks))
-
-            # Step 3: Process Chunks
-            self._update_step_badge("step3", "working", f"(0/{total_chunks})")
-            previous_tail_context = ""
-            completed_count = sum(1 for st in self.active_chunk_status.values() if st["status"] == "done")
-            has_errors = False
-
-            # Live preview of already cached text
-            self._refresh_live_transcript_view()
-
-            for i, chunk_info in enumerate(chunks):
-                if self.cancel_event.is_set():
-                    self.after(0, self._on_pipeline_cancelled)
-                    return
-
-                idx = chunk_info["chunk_index"]
-                idx_str = str(idx)
-                chunk_display = f"Chunk {i+1} of {total_chunks}"
-                base_pct = 0.2 + (0.6 * (i / total_chunks))
-
-                # If already done from checkpoint, skip network call
-                if self.active_chunk_status[idx]["status"] == "done":
-                    chunk_text = self.active_chunk_status[idx]["text"]
-                    lines = [l for l in chunk_text.splitlines() if l.strip()]
-                    previous_tail_context = "\n".join(lines[-4:]) if lines else ""
-                    self._set_progress(
-                        base_pct, self._t("status.step3_cached", chunks=chunk_display)
-                    )
-                    continue
-
-                # Mark chunk as working in monitor & main status
-                self._update_chunk_monitor_item(idx, "working")
-                engine_display_name = model_override or "Gemini Auto-Failover"
-                self._set_progress(
-                    base_pct,
-                    self._t("status.step3_transcribing",
-                            chunks=chunk_display, engine=engine_display_name)
-                )
-                self._update_step_badge("step3", "working", f"({i+1}/{total_chunks})")
-
-                try:
-                    if not client:
-                        raise ValueError("Gemini API Client is required.")
-                    can_diarize = self._is_diarization_supported(chunk_minutes, self.engine_var.get())
-                    raw_chunk_text = transcribe_audio_chunk(
-                        client=client,
-                        chunk_file_path=chunk_info["file_path"],
-                        previous_tail_transcript=previous_tail_context,
-                        progress_callback=lambda msg: self._set_status(
-                            self._t("status.step_chunk", chunk=chunk_display, msg=msg)
-                        ),
-                        model_override=model_override,
-                        cancel_event=self.cancel_event,
-                        diarize=can_diarize
-                    )
-
-                    adjusted_text = adjust_chunk_timestamps(
-                        raw_chunk_text,
-                        offset_seconds=chunk_info["offset_seconds"]
-                    )
-
-                    # Deduplicate with preceding completed chunk text
-                    preceding_text = ""
-                    for p_i in range(i - 1, -1, -1):
-                        p_idx = chunks[p_i]["chunk_index"]
-                        if self.active_chunk_status.get(p_idx, {}).get("text"):
-                            preceding_text = self.active_chunk_status[p_idx]["text"]
-                            break
-
-                    chunk_text = deduplicate_overlap(preceding_text, adjusted_text) if preceding_text else adjusted_text
-
-                    # Save to memory and disk cache
-                    self.active_chunk_status[idx] = {
-                        "status": "done",
-                        "text": chunk_text,
-                        "error": ""
-                    }
-                    completed_transcripts[idx_str] = chunk_text
-                    self._save_checkpoint_file(checkpoint_file, file_hash, completed_transcripts)
-
-                    completed_count += 1
-                    lines = [l for l in chunk_text.splitlines() if l.strip()]
-                    previous_tail_context = "\n".join(lines[-4:]) if lines else ""
-
-                    self._update_chunk_monitor_item(idx, "done")
-                    self._refresh_live_transcript_view()
-
-                except CancelledError:
-                    # A cancel is not a chunk failure: leave the chunk pending so
-                    # the next run resumes it, and unwind the whole pipeline.
-                    self._update_chunk_monitor_item(idx, "cancelled")
-                    self.after(0, self._on_pipeline_cancelled)
-                    return
-
-                except Exception as chunk_err:
-                    err_msg = str(chunk_err)
-                    log.error("Failed chunk %s: %s", chunk_display, err_msg)
-                    has_errors = True
-                    self.active_chunk_status[idx] = {
-                        "status": "error",
-                        "text": "",
-                        "error": err_msg
-                    }
-                    self._update_chunk_monitor_item(idx, "error", err_msg)
-
-                # Update monitor overall summary
-                self.after(0, lambda c=completed_count, t=total_chunks, e=has_errors: (
-                    self.monitor_dialog.update_overall_summary(c, t, e) if self.monitor_dialog and self.monitor_dialog.winfo_exists() else None
-                ))
-
-            self.is_processing = False
-            self._transcribing = False
-            self.after(0, lambda: self.start_btn.configure(state="normal"))
-            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
-            self.after(0, self._unlock_monitor)
-
-            if completed_count == total_chunks:
-                self._update_step_badge("step3", "done", f"({total_chunks}/{total_chunks})")
-                self._set_progress(0.80, self._t("status.all_chunks_done"))
-            else:
-                self._update_step_badge(
-                    "step3", "error",
-                    f"({self._t('status.chunks_done_suffix', done=completed_count, total=total_chunks)})"
-                )
-                self._set_progress(
-                    0.80, self._t("status.batch_finished", done=completed_count, total=total_chunks)
-                )
-
-            # Autosave so settings + partial progress survive a restart
-            # even when the user never clicks "Extract Transcript".
-            if file_hash:
-                self._save_full_session(file_hash)
-
-        except Exception as e:
+        except CancelledError:
+            # A cancel is not a failure: the Chunks already transcribed are in the
+            # Checkpoint, and _on_pipeline_cancelled saves the session and unlocks the
+            # monitor on the UI thread.
+            self.after(0, self._on_pipeline_cancelled)
+            return
+        except Exception as err:
             tb = traceback.format_exc()
             log.error("Pipeline error:\n%s", tb)
-            self.after(0, lambda err=str(e): self._on_pipeline_error(err))
+            self.after(0, lambda msg=str(err): self._on_pipeline_error(msg))
+            return
 
+        # Context a later single-Chunk reprocess needs, taken from the run that just
+        # happened rather than guessed at from the widgets afterwards.
+        self.active_client = client
+        self.active_model_override = result.engine
+        self.active_checkpoint_file = checkpoint_path(CACHE_DIR, result.file_hash)
+
+        # Autosave before the run is declared over, so the settings saved are the ones
+        # this run actually used.
+        if result.file_hash:
+            self._save_full_session(result.file_hash)
+        self.after(0, lambda done=result: self._on_pipeline_run_finished(done))
+
+    def _note_a_legacy_progress_file(self, file_hash: str):
+        """
+        Say, when it applies, that progress from before the Pipeline run is not resumed.
+
+        The window's own per-Chunk progress file recorded which Chunks were done but not
+        the Chunking size they were sliced at, so there is no way to tell whether those
+        are the Chunks this run would produce -- and a Checkpoint that cannot be
+        checked against the run is not one, because stitching it in would put words at a
+        seam that may never have been spoken across. So it is left alone and the meeting
+        is transcribed afresh. Nothing is deleted: the file is the user's, and a workspace
+        reset clears the cache like everything else in it.
+        """
+        legacy = CACHE_DIR / f"progress_cloud_{file_hash}.json"
+        if legacy.exists():
+            log.info(
+                "Per-Chunk progress saved before the Pipeline run (%s) is not carried "
+                "forward; this recording is transcribed from the beginning.",
+                legacy.name,
+            )
+
+    def _on_pipeline_run_finished(self, result: PipelineResult):
+        """Restore the controls a finished Pipeline run left locked. UI thread only."""
+        self.is_processing = False
+        self._transcribing = False
+        self.start_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self._unlock_monitor()
+
+    def _adopt_chunk_plan(self, plan: List[Dict]):
+        """
+        Take the Chunk plan a Pipeline run reported and build the Chunk monitor from it.
+
+        The run decided where the Chunks fall, so the window does not work it out again;
+        it renders what it was handed. With Chunking off the plan carries no boundaries
+        at all, so the recording's own duration gives the single Chunk its span.
+        """
+        plan = list(plan or [])
+        for chunk in plan:
+            if chunk.get("start_ms") is None or chunk.get("end_ms") is None:
+                span_ms = int(float(self.audio_duration_seconds or 0.0) * 1000)
+                chunk.setdefault("start_ms", 0)
+                chunk.setdefault("end_ms", span_ms)
+
+        self.active_chunks_meta = plan
+        self.active_chunk_status = {
+            chunk["chunk_index"]: {"status": "pending", "text": "", "error": ""}
+            for chunk in plan
+        }
+        self._create_or_show_monitor(plan)
+
+    def _note_chunk(self, chunk_index: int, status: str, text: str = "", error: str = ""):
+        """Record what the run reported about one Chunk, for the session and the views."""
+        self.active_chunk_status[chunk_index] = {
+            "status": status,
+            "text": text,
+            "error": error,
+        }
+
+    def _refresh_monitor_summary(self):
+        """Tell the Chunk monitor how much of the meeting is transcribed. Safe off-thread."""
+        completed = 0
+        has_errors = False
+        for state in self.active_chunk_status.values():
+            if state["status"] == "done":
+                completed += 1
+            elif state["status"] == "error":
+                has_errors = True
+        total = len(self.active_chunk_status)
+        self.after(0, lambda c=completed, t=total, e=has_errors: (
+            self.monitor_dialog.update_overall_summary(c, t, e)
+            if self.monitor_dialog and self.monitor_dialog.winfo_exists() else None
+        ))
     def _update_chunk_monitor_item(self, chunk_index: int, state: str, detail: str = ""):
         if self.monitor_dialog and self.monitor_dialog.winfo_exists():
             self.after(0, lambda: self.monitor_dialog.update_chunk_state(chunk_index, state, detail))
@@ -2382,7 +2658,15 @@ class STTMeetApp(ctk.CTk):
             self.after(0, lambda t=full_live: self._update_transcript_view(t))
 
     def _reprocess_single_chunk(self, chunk_index: int):
-        """Reprocess an individual failed or pending chunk in an isolated background thread."""
+        """
+        Reprocess one failed Chunk, on the same seam the main run would have used.
+
+        This is a second entry on the Pipeline run interface, not a second copy of the
+        loop: the window hands the run the Chunk, the Checkpoint to find its neighbours
+        in, and the settings the run itself used, then renders what comes back. The
+        Tail context sent in and the Overlap removed are the run's, so a retried Chunk is
+        stitched into the Transcript exactly as a first-pass one would have been.
+        """
         chunk_info = next((c for c in self.active_chunks_meta if c["chunk_index"] == chunk_index), None)
         if not chunk_info:
             messagebox.showerror(
@@ -2401,97 +2685,68 @@ class STTMeetApp(ctk.CTk):
         self._update_chunk_monitor_item(chunk_index, "working")
         self._set_status(self._t("status.reprocessing_chunk", index=chunk_index + 1))
 
+        # Read here, on the UI thread: the reprocessing thread must not reach for a
+        # widget, exactly as the main run's thread does not. is_processing is set, so
+        # this is the snapshot the run that cut these Chunks took -- its Engine, and the
+        # Chunking size its Checkpoint was written at -- rather than the widgets as they
+        # stand now.
+        run_settings = self._get_current_settings()
+        file_hash = self.active_file_hash
+        settings = PipelineSettings(
+            audio_path=self.selected_audio_file,
+            api_key=api_key,
+            engine=run_settings.get("engine", ""),
+            chunk_minutes=self.active_chunk_minutes,
+            cache_dir=str(CACHE_DIR),
+            synthesize_minutes=False,
+        )
+
         def worker():
             try:
                 client = self.active_client or get_gemini_client(api_key)
-
-                # Find preceding tail context
-                preceding_text = ""
-                for prev_idx in range(chunk_index - 1, -1, -1):
-                    if self.active_chunk_status.get(prev_idx, {}).get("text"):
-                        preceding_text = self.active_chunk_status[prev_idx]["text"]
-                        break
-
-                lines = [l for l in preceding_text.splitlines() if l.strip()]
-                tail_context = "\n".join(lines[-4:]) if lines else ""
-
-                chunk_mins = self._parse_chunk_minutes(self.chunk_size_var.get())
-                can_diarize = self._is_diarization_supported(chunk_mins, self.engine_var.get())
-                raw_text = transcribe_audio_chunk(
-                    client=client,
-                    chunk_file_path=chunk_info["file_path"],
-                    previous_tail_transcript=tail_context,
-                    model_override=getattr(self, "active_model_override", None),
+                result = reprocess_chunk(
+                    settings,
+                    chunk_info,
+                    file_hash,
+                    WindowPipelineObserver(self),
                     cancel_event=self.cancel_event,
-                    diarize=can_diarize
+                    client=client,
                 )
-
-                adjusted_text = adjust_chunk_timestamps(raw_text, offset_seconds=chunk_info["offset_seconds"])
-                final_text = deduplicate_overlap(preceding_text, adjusted_text) if preceding_text else adjusted_text
-
-                # Update status
-                self.active_chunk_status[chunk_index] = {
-                    "status": "done",
-                    "text": final_text,
-                    "error": ""
-                }
-
-                # Save checkpoint
-                if self.active_checkpoint_file:
-                    try:
-                        saved = {}
-                        if self.active_checkpoint_file.exists():
-                            with open(self.active_checkpoint_file, "r", encoding="utf-8") as f:
-                                saved = json.load(f).get("chunks", {})
-                        saved[str(chunk_index)] = final_text
-                        self._save_checkpoint_file(
-                            self.active_checkpoint_file,
-                            self.active_file_hash,
-                            saved
-                        )
-                    except Exception as ce:
-                        log.warning("Failed saving checkpoint during reprocess: %s", ce)
-
-                self._update_chunk_monitor_item(chunk_index, "done")
-                self._refresh_live_transcript_view()
-
-                # Recompute overall count
-                total = len(self.active_chunks_meta)
-                completed = sum(1 for st in self.active_chunk_status.values() if st["status"] == "done")
-                has_err = any(st["status"] == "error" for st in self.active_chunk_status.values())
-                self.after(0, lambda c=completed, t=total, e=has_err: (
-                    self.monitor_dialog.update_overall_summary(c, t, e) if self.monitor_dialog and self.monitor_dialog.winfo_exists() else None
-                ))
-                self._set_status(self._t("status.reprocess_done", index=chunk_index + 1))
-                if self.active_file_hash:
-                    self._save_full_session(self.active_file_hash)
+                # The observer has already put the Chunk's new text, or the reason it
+                # failed, into the Chunk monitor and the Transcript; what is left to say
+                # is how the retry ended.
+                if result.failed_chunks:
+                    error = self.active_chunk_status.get(chunk_index, {}).get("error", "")
+                    self._set_status(
+                        self._t("status.reprocess_failed", index=chunk_index + 1,
+                                error=error[:40])
+                    )
+                else:
+                    self._set_status(self._t("status.reprocess_done", index=chunk_index + 1))
+                if file_hash:
+                    self._save_full_session(file_hash)
 
             except CancelledError:
                 log.info("Reprocess of chunk %d cancelled by user.", chunk_index)
-                self.active_chunk_status[chunk_index] = {
-                    "status": "cancelled",
-                    "text": "",
-                    "error": "Cancelled by user"
-                }
+                self._note_chunk(chunk_index, "cancelled", error="Cancelled by user")
                 self._update_chunk_monitor_item(chunk_index, "cancelled")
+                self._refresh_monitor_summary()
                 self._set_status(self._t("status.cancelled"))
 
-            except Exception as e:
-                err_str = str(e)
+            except Exception as err:
+                err_str = str(err)
                 log.error("Reprocess of chunk %d failed: %s", chunk_index, err_str)
-                self.active_chunk_status[chunk_index] = {
-                    "status": "error",
-                    "text": "",
-                    "error": err_str
-                }
+                self._note_chunk(chunk_index, "error", error=err_str)
                 self._update_chunk_monitor_item(chunk_index, "error", err_str)
+                self._refresh_monitor_summary()
                 self._set_status(
                     self._t("status.reprocess_failed", index=chunk_index + 1, error=err_str[:40])
                 )
             finally:
                 self.is_processing = False
                 self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
-        t.start()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _extract_transcript_from_monitor(self):
         """Combines all green chunk transcripts in proper sequence and populates the main app."""
@@ -2543,265 +2798,178 @@ class STTMeetApp(ctk.CTk):
             self._t("msg.extracted_body", count=len(ordered_parts))
         )
 
-    def _save_checkpoint_file(self, checkpoint_path, file_hash, chunks_dict):
-        try:
-            with open(checkpoint_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "audio_hash": file_hash,
-                    "engine": "cloud",
-                    "chunks": chunks_dict,
-                    "updated_at": datetime.now().isoformat()
-                }, f, indent=2)
-        except Exception as e:
-            log.warning("Could not write checkpoint file: %s", e)
+    def _start_generation(self, request: GenerationRequest):
+        """
+        Generate one document -- Minutes, Recap or Action items -- from the Transcript
+        already in the window, without transcribing anything again.
 
-    def _execute_minutes_synthesis(self, client, language: str, file_hash: str):
+        The three documents differ only in what they call and what they display, so
+        they differ only in the data they hand this method; the shape of a generation
+        run lives here once. Everything the run needs is read here, on the UI thread,
+        and passed down as GenerationSettings: the generation thread reaches for no
+        widget, exactly as a Pipeline run's thread does not.
+
+        The Transcript is worth more than any document made from it, so a document
+        that fails to generate never costs the person their Transcript or their place
+        in the window: whatever happens, the controls come back.
         """
-        Isolated minutes synthesis execution.
-        Safeguards transcript so a minutes failure never marks the transcript as failed or crashes the session.
-        """
-        self._update_step_badge("step4", "working")
-        self._set_progress(
-            0.85,
-            self._t("status.step4_start",
-                    language=display_minutes_lang(language, self.ui_locale))
+        transcript_to_use = self.processed_transcript or self.raw_transcript
+        if not transcript_to_use.strip():
+            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
+            return
+
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
+            return
+
+        if self.is_processing:
+            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
+            return
+
+        if not self._confirm_regenerating(request):
+            return
+
+        language = self.lang_var.get()
+        settings = GenerationSettings(
+            api_key=api_key,
+            model_override=self._get_selected_model_override(),
+            language=language,
+            template=self.template_var.get(),
+            file_hash=(compute_file_hash(self.selected_audio_file)
+                       if self.selected_audio_file else "manual_session"),
         )
 
+        # A generation run saves the session when it finishes, and that save happens on
+        # the generation thread. The settings widgets are therefore read here, on the UI
+        # thread, and every autosave this run triggers works from this snapshot rather
+        # than from widgets -- the same discipline a Pipeline run follows, and the reason
+        # _get_current_settings can guard on the snapshot being present.
+        self._session_settings_snapshot = {
+            "engine": self.engine_var.get(),
+            "language": settings.language,
+            "chunk_minutes": self._parse_chunk_minutes(self.chunk_size_var.get()),
+            "preprocess": bool(self.preprocess_var.get()),
+            # Read here on the UI thread for the same reason as the rest of it: an
+            # autosave from the generation thread cannot reach the widgets.
+            "include_time_anchors": bool(self.include_time_anchors_var.get()),
+        }
+
+        self.is_processing = True
+        self.cancel_event.clear()
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        getattr(self, request.button_name).configure(state="disabled")
+        if request.hide_error:
+            request.hide_error(self)
+
+        starting_line = self._t(request.starting_status,
+                                language=display_minutes_lang(language, self.ui_locale))
+        if request.announce_start:
+            request.announce_start(self, starting_line)
+        else:
+            self._set_status(starting_line)
+
+        t = threading.Thread(
+            target=self._run_generation,
+            args=(request, settings, transcript_to_use),
+            daemon=True
+        )
+        t.start()
+
+    def _confirm_regenerating(self, request: GenerationRequest) -> bool:
+        """
+        Ask before replacing a document the person already has, where that is worth
+        warning about. The ask is the document's own, supplied as data.
+        """
+        if not request.warns_before_replacing:
+            return True
+
+        current_template = self.template_var.get()
+        already_there = (
+            current_template in self.cached_minutes_by_template
+            or bool(self.generated_minutes and self.generated_minutes.strip())
+        )
+        if not already_there:
+            return True
+
+        return messagebox.askyesno(
+            self._t("msg.notice"),
+            self._t("msg.minutes_already_generated",
+                    template=display_template_name(current_template, self.ui_locale))
+        )
+
+    def _run_generation(self, request, settings: GenerationSettings, transcript: str):
+        """
+        One generation run, for any of the three documents.
+
+        The run itself is the document's own call and nothing else; what it reports,
+        what it shows when it goes wrong, and -- on every exit, without exception --
+        the state it hands the window back are decided here, once. A document that
+        fails late, after the work has been paid for, must still leave the person able
+        to press the button again.
+        """
         try:
-            if not client:
-                api_key = self.api_key_var.get().strip()
-                if not api_key:
-                    raise ValueError(self._t("msg.key_required"))
-                client = get_gemini_client(api_key)
-
-            transcript_to_use = self.processed_transcript or self.raw_transcript
-            if not transcript_to_use.strip():
-                raise ValueError("Transcript is empty. Cannot generate minutes.")
-
-            template = self.template_var.get()
-            self.generated_minutes = generate_meeting_minutes(
+            client = get_gemini_client(settings.api_key)
+            text = request.generate(
                 client=client,
-                full_transcript=transcript_to_use,
-                language=language,
-                template=template,
+                transcript=transcript,
+                settings=settings,
                 progress_callback=lambda msg: self._set_status(
                     f"{self._t('status.step_prefix', n=4)} {msg}"
                 ),
-                model_override=self._get_selected_model_override(),
-                cancel_event=self.cancel_event
+                cancel_event=self.cancel_event,
             )
-
-            sections = parse_minutes_sections(self.generated_minutes)
-            self.cached_minutes_by_template[template] = self.generated_minutes
-            self.after(0, lambda secs=sections: self._populate_minutes_tabs(secs))
-            self.after(0, self._hide_minutes_error_banner)
-            self._update_step_badge("step4", "done")
-            self._save_full_session(file_hash)
-            self._set_progress(1.0, self._t("status.all_complete"))
-            self.after(0, self._on_pipeline_finished)
+            request.publish(self, text, settings)
+            if request.announce_done:
+                request.announce_done(self)
 
         except CancelledError:
-            # Cancellation is not a synthesis failure: leave the transcript and
-            # badges untouched so the user can retry cleanly.
-            log.info("Minutes synthesis cancelled by user.")
-            self.is_processing = False
-            self._transcribing = False
-            self._update_step_badge("step4", "pending")
+            # A cancel is not a failure: nothing was produced, so nothing is shown
+            # as having gone wrong, and the Transcript is left exactly as it was.
+            log.info("%s generation cancelled by user.", request.document)
+            if request.announce_cancelled:
+                request.announce_cancelled(self)
             self._set_status(self._t("status.cancelled"))
-            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
 
         except Exception as err:
             err_msg = str(err)
-            log.warning("Minutes synthesis failed (transcript remains protected): %s", err_msg)
-            self._update_step_badge("step4", "error", self._t("step.failed"))
-            self.after(0, lambda msg=err_msg: self._show_minutes_error_banner(msg))
-            self._set_progress(0.80, self._t("status.minutes_failed"))
-            self.is_processing = False
-            self.after(0, lambda: self.start_btn.configure(state="normal"))
-            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
-            self.after(0, lambda: self.gen_minutes_btn.configure(state="normal"))
+            log.warning("%s generation failed (transcript remains protected): %s",
+                        request.document, err_msg)
+            request.show_error(self, err_msg)
+
+        finally:
+            # Every exit passes through here. This is the path that used not to exist
+            # at all, and the app looked stuck because of it.
+            self._restore_after_generation(request)
+
+    def _restore_after_generation(self, request: GenerationRequest):
+        """
+        Hand the window back to the person, whatever became of the run.
+
+        Is_processing is cleared here and not on any one branch, so a late failure --
+            one raised after the document was generated, or one raised while reporting
+            the failure itself -- cannot leave the controls locked with nothing running
+            behind them.
+        """
+        self.is_processing = False
+        self._transcribing = False
+        button = getattr(self, request.button_name)
+        self.after(0, lambda: self.start_btn.configure(state="normal"))
+        self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
+        self.after(0, lambda: button.configure(state="normal"))
 
     def _start_minutes_generation_only(self):
-        """
-        Independent Step 4 trigger.
-        Enables user to generate or retry minutes from existing transcript without re-transcribing.
-        """
-        transcript_to_use = self.processed_transcript or self.raw_transcript
-        if not transcript_to_use.strip():
-            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
-            return
-
-        api_key = self.api_key_var.get().strip()
-        if not api_key:
-            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
-            return
-
-        if self.is_processing:
-            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
-            return
-
-        current_template = self.template_var.get()
-        # If this template was already generated, warn the user before overwriting
-        if current_template in self.cached_minutes_by_template or (self.generated_minutes and self.generated_minutes.strip()):
-            template_label = display_template_name(current_template, self.ui_locale)
-            confirm = messagebox.askyesno(
-                self._t("msg.notice"),
-                self._t("msg.minutes_already_generated", template=template_label)
-            )
-            if not confirm:
-                return
-
-        self.is_processing = True
-        self.cancel_event.clear()
-        self.start_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="disabled")
-        self.gen_minutes_btn.configure(state="disabled")
-        self._hide_minutes_error_banner()
-
-        language = self.lang_var.get()
-        file_hash = compute_file_hash(self.selected_audio_file) if self.selected_audio_file else "manual_session"
-
-        def runner():
-            try:
-                client = get_gemini_client(api_key)
-                self._execute_minutes_synthesis(client, language, file_hash)
-            except Exception as e:
-                err_msg = str(e)
-                log.error("Manual minutes generation failed: %s", err_msg)
-                self._update_step_badge("step4", "error", "(Failed)")
-                self.after(0, lambda msg=err_msg: self._show_minutes_error_banner(msg))
-                self.is_processing = False
-                self.after(0, lambda: self.start_btn.configure(state="normal"))
-                self.after(0, lambda: self.gen_minutes_btn.configure(state="normal"))
-
-        t = threading.Thread(target=runner, daemon=True)
-        t.start()
+        """Generate or retry the Minutes from the Transcript already in the window."""
+        self._start_generation(MINUTES_GENERATION)
 
     def _start_recap_generation_only(self):
-        """
-        Independent trigger for Executive Meeting Recap.
-        Enables user to generate or retry meeting recap from existing transcript.
-        """
-        transcript_to_use = self.processed_transcript or self.raw_transcript
-        if not transcript_to_use.strip():
-            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
-            return
-
-        api_key = self.api_key_var.get().strip()
-        if not api_key:
-            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
-            return
-
-        if self.is_processing:
-            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
-            return
-
-        self.is_processing = True
-        self.cancel_event.clear()
-        self.start_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="disabled")
-        self.gen_recap_btn.configure(state="disabled")
-        self._hide_recap_error_banner()
-
-        language = self.lang_var.get()
-        file_hash = compute_file_hash(self.selected_audio_file) if self.selected_audio_file else "manual_session"
-
-        def runner():
-            try:
-                self._set_status(self._t("status.generating_recap", language=display_minutes_lang(language, self.ui_locale)))
-                client = get_gemini_client(api_key)
-                recap_text = generate_meeting_recap(
-                    client=client,
-                    full_transcript=transcript_to_use,
-                    language=language,
-                    progress_callback=lambda msg: self._set_status(f"[Recap] {msg}"),
-                    model_override=self._get_selected_model_override(),
-                    cancel_event=self.cancel_event
-                )
-                self.generated_recap = recap_text
-                self.after(0, lambda: self._update_recap_view(recap_text))
-                self.after(0, self._hide_recap_error_banner)
-                if file_hash:
-                    self._save_full_session(file_hash)
-                self._set_status(self._t("status.recap_complete"))
-            except CancelledError:
-                log.info("Recap synthesis cancelled by user.")
-                self._set_status(self._t("status.cancelled"))
-            except Exception as e:
-                err_msg = str(e)
-                log.error("Recap generation failed: %s", err_msg)
-                self.after(0, lambda msg=err_msg: self._show_recap_error_banner(msg))
-                self._set_status(self._t("status.recap_failed", error=err_msg[:40]))
-            finally:
-                self.is_processing = False
-                self.after(0, lambda: self.start_btn.configure(state="normal"))
-                self.after(0, lambda: self.gen_recap_btn.configure(state="normal"))
-
-        t = threading.Thread(target=runner, daemon=True)
-        t.start()
+        """Generate or retry the Recap from the Transcript already in the window."""
+        self._start_generation(RECAP_GENERATION)
 
     def _start_actions_generation_only(self):
-        """
-        Independent trigger for Action Items.
-        Enables user to generate or retry action items directly from existing transcript.
-        """
-        transcript_to_use = self.processed_transcript or self.raw_transcript
-        if not transcript_to_use.strip():
-            messagebox.showwarning(self._t("msg.notice"), self._t("msg.no_transcript"))
-            return
-
-        api_key = self.api_key_var.get().strip()
-        if not api_key:
-            messagebox.showerror(self._t("msg.error"), self._t("msg.key_required_minutes"))
-            return
-
-        if self.is_processing:
-            messagebox.showinfo(self._t("msg.busy"), self._t("msg.task_running"))
-            return
-
-        self.is_processing = True
-        self.cancel_event.clear()
-        self.start_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="disabled")
-        self.gen_actions_btn.configure(state="disabled")
-        self._hide_actions_error_banner()
-
-        language = self.lang_var.get()
-        file_hash = compute_file_hash(self.selected_audio_file) if self.selected_audio_file else "manual_session"
-
-        def runner():
-            try:
-                self._set_status(self._t("status.generating_actions", language=display_minutes_lang(language, self.ui_locale)))
-                client = get_gemini_client(api_key)
-                actions_text = generate_action_items(
-                    client=client,
-                    full_transcript=transcript_to_use,
-                    language=language,
-                    progress_callback=lambda msg: self._set_status(f"[Actions] {msg}"),
-                    model_override=self._get_selected_model_override(),
-                    cancel_event=self.cancel_event
-                )
-                self.generated_actions = actions_text
-                self.after(0, lambda: self._update_actions_view(actions_text))
-                self.after(0, self._hide_actions_error_banner)
-                if file_hash:
-                    self._save_full_session(file_hash)
-                self._set_status(self._t("status.actions_complete"))
-            except CancelledError:
-                log.info("Action items synthesis cancelled by user.")
-                self._set_status(self._t("status.cancelled"))
-            except Exception as e:
-                err_msg = str(e)
-                log.error("Action items generation failed: %s", err_msg)
-                self.after(0, lambda msg=err_msg: self._show_actions_error_banner(msg))
-                self._set_status(self._t("status.actions_failed", error=err_msg[:40]))
-            finally:
-                self.is_processing = False
-                self.after(0, lambda: self.start_btn.configure(state="normal"))
-                self.after(0, lambda: self.gen_actions_btn.configure(state="normal"))
-
-        t = threading.Thread(target=runner, daemon=True)
-        t.start()
+        """Generate or retry the Action items from the Transcript already in the window."""
+        self._start_generation(ACTION_ITEMS_GENERATION)
 
     def _update_step_badge(self, step_key: str, state: str, extra: str = ""):
         """
@@ -2848,6 +3016,7 @@ class STTMeetApp(ctk.CTk):
             "chunk_minutes": chunk_mins,
             "preprocess": bool(self.preprocess_var.get()),
             "template": self.template_var.get(),
+            "include_time_anchors": bool(self.include_time_anchors_var.get()),
         }
 
     def _get_current_status(self) -> Dict:
@@ -2951,11 +3120,18 @@ class STTMeetApp(ctk.CTk):
             self.generated_minutes = data["generated_minutes"]
             self.generated_recap = data.get("generated_recap", "") or ""
             self.generated_actions = data.get("generated_actions", "") or ""
-            self.cached_minutes_by_template = dict(data.get("cached_minutes_by_template", {}) or {})
-            # If a legacy session has generated_minutes but empty cached_minutes_by_template, backfill it
-            saved_template = data.get("settings", {}).get("template", "action_minutes")
-            if self.generated_minutes and saved_template not in self.cached_minutes_by_template:
-                self.cached_minutes_by_template[saved_template] = self.generated_minutes
+            # Cached Minutes are served only when this build could have written them.
+            # A session from before the prompts asked for time anchors would otherwise
+            # reopen on a document in which the feature does nothing, and the backfill
+            # below would resurrect exactly that document, so the whole restore -- cache
+            # and backfill together -- is what a cache miss skips.
+            if minutes_cache_is_current(data):
+                self.cached_minutes_by_template = dict(data.get("cached_minutes_by_template") or {})
+                saved_template = data.get("settings", {}).get("template", "action_minutes")
+                if self.generated_minutes and saved_template not in self.cached_minutes_by_template:
+                    self.cached_minutes_by_template[saved_template] = self.generated_minutes
+            else:
+                self.cached_minutes_by_template = {}
 
             self.detected_speakers = data["detected_speakers"]
             self.speaker_mapping = data["speaker_mapping"]
@@ -3014,6 +3190,7 @@ class STTMeetApp(ctk.CTk):
         chunk_val = self._t("chunk.no_chunk") if clean["chunk_minutes"] == 0 else f"{clean['chunk_minutes']} min"
         self.chunk_size_var.set(chunk_val)
         self.preprocess_var.set(clean["preprocess"])
+        self.include_time_anchors_var.set(clean["include_time_anchors"])
         if "template" in clean and clean["template"] in VALID_TEMPLATES:
             self.template_var.set(clean["template"])
             self._refresh_template_dropdown()
@@ -3333,6 +3510,11 @@ class STTMeetApp(ctk.CTk):
         # Determine content, title, and filename prefix based on the active tab.
         # Titles follow the interface language; filename prefixes deliberately
         # stay fixed so saved filenames are stable across a language switch.
+        #
+        # Only the Minutes branch is ever stripped of its time anchors. The Transcript
+        # carries markers of its own and the Recap and Action items never carry anchors
+        # at all, so for those tabs the question does not arise.
+        is_minutes = False
         if active_tab == "tab_transcript":
             content = self.processed_transcript or self.raw_transcript
             title = self._t("export.title_transcript", name=base_name)
@@ -3353,6 +3535,13 @@ class STTMeetApp(ctk.CTk):
             title = self._t("export.title_minutes", name=base_name)
             prefix = "Minit"
             include_appendix = True
+            is_minutes = True
+
+        # The toggle is an export-time transform, not a generation setting: the Minutes
+        # on screen keep their anchors either way, so flipping it costs nothing and
+        # flipping it back brings the trail straight back.
+        if is_minutes and not bool(self.include_time_anchors_var.get()):
+            content = strip_time_anchors(content)
 
         if not content or not content.strip():
             messagebox.showwarning(
