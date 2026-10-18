@@ -2,6 +2,7 @@
 import ast
 import dataclasses
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -1371,6 +1372,174 @@ def test_minutes_quota_failure_message_is_unchanged():
         )
     else:
         raise AssertionError("a Quota failure on every model must raise RuntimeError")
+
+
+ANCHORED_ACTION_MINUTES = """# Action Minutes of Meeting
+
+**Meeting Title:** Q3 Platform Steering Sync
+**Date & Time:** 14 October 2026, 10:30 AM
+**Location / Link:** Video Conference Link
+**Chairperson:** Aisha Rahman
+**Minute Taker:** Lim Wei
+**Attendees:** Priya, Danial, Aisha, Lim
+**Absentees:** -
+
+---
+
+## 1. Meeting Objective
+Confirm the launch sequence for the payments rollout and agree who owns each gate. (03:41)
+
+---
+
+## 2. Review of Prior Action Items
+* **Circulate the revised rollout plan:** Completed — *Notes:* Plan reissued after the March review.
+
+---
+
+## 3. Agenda Items & Decisions Reached
+
+### Agenda Item 1: Payments rollout staging
+* **Summary of Outcome:** The team agreed to stage the rollout behind a feature flag. (12:34)
+* **Formal Decision:** Stage two goes live only after the error budget holds for 72 hours. (15:02)
+
+### Agenda Item 2: Support readiness
+* **Summary of Outcome:** Support needs the staging window confirmed before sign-off.
+* **Formal Decision:** Sign-off is delegated to the duty manager.
+
+---
+
+## 4. Action Item Register
+
+| # | Action Item / Deliverable | Owner | Target Due Date | Status |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | Circulate the revised rollout plan | Priya | 20/10/2026 | Open (12:34) |
+| 2 | Confirm the staging window with Support | Danial | 17/10/2026 | Open (1:07:45) |
+(Extract all concrete commitments and tasks)
+
+---
+
+## 5. Next Meeting
+* **Date & Time:** 28 October 2026, 10:30 AM
+* **Tentative Agenda:** Rollout review, error budget, support readiness
+
+"""
+
+
+def a_transcript_carrying_its_own_markers():
+    """A meeting long enough to cross the hour boundary the markers switch on."""
+    return (
+        "[00:12] Aisha: Welcome, let us start with the rollout sequence.\n"
+        "[03:41] Priya: The objective today is to confirm the staging plan.\n"
+        "[12:34] Priya: I propose we stage the rollout behind a feature flag.\n"
+        "[15:02] Aisha: Agreed, stage two waits on the error budget.\n"
+        "[22:14] Danial: Support needs the staging window confirmed first.\n"
+        "[01:07:45] Danial: I will confirm the staging window with Support.\n"
+    )
+
+
+def an_anchored_document_from_the_fake_provider():
+    """Minutes as a caller receives them: generated, then handed back whole."""
+    provider = FakeGeminiProvider({"model-a": [ANCHORED_ACTION_MINUTES]})
+    minutes = generate_meeting_minutes(
+        provider,
+        a_transcript_carrying_its_own_markers(),
+        language="English",
+        template="action_minutes",
+        model_override="model-a",
+    )
+    return minutes
+
+
+def test_english_action_minutes_hands_the_caller_a_document_anchored_to_the_transcript():
+    """
+    Anchors are the model's job, so what a caller receives is the place to see them:
+    a bullet points back to the marker it came from, one past the hour takes the
+    hour form, and an item the model had nothing to point at carries none.
+    """
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    anchored_bullets = [line for line in minutes.splitlines() if line.startswith("* ")]
+    assert any(line.endswith("(12:34)") for line in anchored_bullets), anchored_bullets
+    assert any(line.endswith("(15:02)") for line in anchored_bullets), anchored_bullets
+    # Past the hour the anchor takes the hour form the Transcript's own markers use.
+    assert "(1:07:45)" in minutes
+    # An item with nothing in the Transcript to point at gets no anchor and no
+    # placeholder -- its neighbours carry one, and absence is still correct.
+    assert any(
+        line.startswith("* **Summary of Outcome:** Support needs the staging window")
+        and not line.endswith(")")
+        for line in anchored_bullets
+    ), anchored_bullets
+
+
+def test_time_anchors_stay_off_the_metadata_and_the_headings():
+    """Anchors record where content came from, so structure carries none."""
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    anchored_structure = [
+        line for line in minutes.splitlines()
+        if line.startswith("#") or line.startswith("**")
+    ]
+    assert anchored_structure
+    assert [line for line in anchored_structure if re.search(r"\(\d{1,2}:\d{2}(:\d{2})?\)\s*$", line)] == []
+    # The Date & Time fields read as written, never as something that looks like
+    # a point in the recording.
+    date_lines = [line for line in minutes.splitlines() if line.startswith("**Date & Time:**")]
+    assert date_lines and all(re.search(r"\(\d{1,2}:\d{2}\)", line) is None for line in date_lines)
+
+
+def test_anchors_disturb_the_buckets_parsed_out_of_the_generated_document():
+    """
+    The document is what gets displayed and exported; the buckets are parsed from
+    it and must come out carrying the anchors rather than trimmed of them.
+    """
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    sections = parse_minutes_sections(minutes)
+
+    assert sections["full_text"] == minutes
+    assert "(03:41)" in sections["summary"]
+    assert "(12:34)" in sections["highlights"]
+    assert "(1:07:45)" in sections["action_items"]
+
+
+def test_the_minutes_tab_renders_an_anchored_document_with_the_renderer_it_has():
+    """
+    Anchors are plain text inside an existing bullet, so the Minutes tab needs no
+    change to show them. The viewer needs a display to construct, so its rendering
+    is driven through an object that keeps what it was asked to draw.
+    """
+    from src.ui.markdown_view import MarkdownViewer
+
+    class AViewerThatOnlyRecords:
+        """The renderer's whole output surface, answered without a display."""
+
+        # The renderer walks the document through these two, and both of them do
+        # nothing but insert -- which is what the recording stands in for.
+        _render_inline_spans = MarkdownViewer._render_inline_spans
+        _render_table = MarkdownViewer._render_table
+
+        def __init__(self):
+            self.drawn = []
+
+        def insert(self, index, text, tags=None):
+            self.drawn.append((tags, text))
+
+    minutes = an_anchored_document_from_the_fake_provider()
+
+    viewer = AViewerThatOnlyRecords()
+    MarkdownViewer._render_markdown(viewer, minutes)
+    rendered = "".join(text for _tags, text in viewer.drawn)
+
+    # Every anchored bullet and cell is drawn, anchor included.
+    assert "The team agreed to stage the rollout behind a feature flag. (12:34)" in rendered
+    assert "Open (1:07:45)" in rendered
+    assert "Confirm the staging window with Support" in rendered
+    # And the unanchored item renders whole, rather than being cut short by a
+    # renderer looking for an anchor to strip.
+    assert "Support needs the staging window confirmed before sign-off." in rendered
+    # Headings stay headings, so the structure is not cluttered by markers.
+    assert not [tags for tags, text in viewer.drawn if tags == "h1" and "(1:07:45)" in text]
 
 
 def test_transcription_retries_an_empty_transcription_on_its_own_backoff():
@@ -3596,6 +3765,10 @@ if __name__ == "__main__":
     test_recap_path_delegates_its_failure_policy_to_the_shared_module()
     test_minutes_path_fails_over_to_the_next_model_on_a_quota_failure()
     test_minutes_quota_failure_message_is_unchanged()
+    test_english_action_minutes_hands_the_caller_a_document_anchored_to_the_transcript()
+    test_time_anchors_stay_off_the_metadata_and_the_headings()
+    test_anchors_disturb_the_buckets_parsed_out_of_the_generated_document()
+    test_the_minutes_tab_renders_an_anchored_document_with_the_renderer_it_has()
     test_minutes_path_retries_a_transient_error_with_backoff_then_answers()
     test_action_items_path_fails_over_to_the_next_model_on_a_quota_failure()
     test_action_items_path_retries_a_transient_error_with_backoff_then_answers()

@@ -143,6 +143,9 @@ Based on the meeting transcript below, generate professional Action Minutes in E
 * **Date & Time:** [DD Month YYYY, HH:MM AM/PM if mentioned]  
 * **Tentative Agenda:** [Key items to cover]  
 
+TIME ANCHORS:
+Close every bullet, every sentence of prose, and every table cell with a parenthesised time anchor giving the point in the transcript where that content was recorded — for example (12:34). Copy the time from the bracketed marker on the transcript turn it came from ([12:34]) and drop the brackets; when the marker itself carries hours ([01:12:34]), the anchor carries hours too (1:12:34). Switch to the hour form on the same boundary the markers use: under an hour (MM:SS), from one hour onwards (H:MM:SS). If an item has nothing in the transcript to point at, leave it with no anchor at all — never write a placeholder such as (00:00) or (--:--). Headings, the metadata block at the top, and the Date & Time fields carry no anchor, so a meeting time is never read as a point in the recording.
+
 TRANSCRIPT:
 {transcript}
 """,
