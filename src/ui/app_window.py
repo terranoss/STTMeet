@@ -97,7 +97,8 @@ from ..exporter import (
     DocxUnavailableError,
     export_to_docx,
     export_to_markdown,
-    export_to_text
+    export_to_text,
+    strip_time_anchors
 )
 from ..session_store import (
     DEFAULT_SETTINGS,
@@ -1898,6 +1899,11 @@ class STTMeetApp(ctk.CTk):
         # Pre-process state: persisted across restarts via prefs.json, edited in Settings modal
         self.preprocess_var = ctk.BooleanVar(value=bool(get_pref("preprocess", True)))
 
+        # Whether time anchors reach an exported Minutes. Per-session rather than a
+        # preference: it is a choice about one meeting's documents, and it starts on
+        # because the trail is worth having unless someone says otherwise.
+        self.include_time_anchors_var = ctk.BooleanVar(value=True)
+
         # Action Buttons (Workflow Triggers)
         self.start_btn = ctk.CTkButton(
             ctrl_frame,
@@ -2186,6 +2192,20 @@ class STTMeetApp(ctk.CTk):
         self.speaker_btn.grid(row=0, column=0, padx=16, pady=10, sticky="w")
         self._i18n_label(self.speaker_btn, "btn.map_speakers")
 
+        # Time anchors in the exported Minutes. It lives in the bottom bar beside the
+        # Export buttons and is never hidden per tab: on the tabs where it has no
+        # effect it is inert, which is better than the bar re-laying itself out every
+        # time someone changes tab. Nothing happens on a flip -- the Minutes on screen
+        # always carry their anchors -- so the switch costs no regeneration.
+        self.time_anchor_switch = ctk.CTkSwitch(
+            bottom_frame,
+            text=self._t("export.time_anchors"),
+            variable=self.include_time_anchors_var,
+            width=190
+        )
+        self.time_anchor_switch.grid(row=0, column=1, padx=(12, 12), pady=10, sticky="w")
+        self._i18n_label(self.time_anchor_switch, "export.time_anchors")
+
         # Export Buttons
         export_docx_btn = ctk.CTkButton(
             bottom_frame,
@@ -2431,6 +2451,9 @@ class STTMeetApp(ctk.CTk):
             "language": settings.language,
             "chunk_minutes": settings.chunk_minutes,
             "preprocess": settings.preprocess,
+            # Nothing in the run consumes the toggle, but an autosave the run triggers
+            # has to carry it or the meeting would reopen with the setting reset.
+            "include_time_anchors": bool(self.include_time_anchors_var.get()),
         }
         self.active_chunk_minutes = settings.chunk_minutes
         self._step_states = {"step1": "pending", "step2": "pending", "step3": "pending", "step4": "pending"}
@@ -2827,6 +2850,9 @@ class STTMeetApp(ctk.CTk):
             "language": settings.language,
             "chunk_minutes": self._parse_chunk_minutes(self.chunk_size_var.get()),
             "preprocess": bool(self.preprocess_var.get()),
+            # Read here on the UI thread for the same reason as the rest of it: an
+            # autosave from the generation thread cannot reach the widgets.
+            "include_time_anchors": bool(self.include_time_anchors_var.get()),
         }
 
         self.is_processing = True
@@ -2990,6 +3016,7 @@ class STTMeetApp(ctk.CTk):
             "chunk_minutes": chunk_mins,
             "preprocess": bool(self.preprocess_var.get()),
             "template": self.template_var.get(),
+            "include_time_anchors": bool(self.include_time_anchors_var.get()),
         }
 
     def _get_current_status(self) -> Dict:
@@ -3163,6 +3190,7 @@ class STTMeetApp(ctk.CTk):
         chunk_val = self._t("chunk.no_chunk") if clean["chunk_minutes"] == 0 else f"{clean['chunk_minutes']} min"
         self.chunk_size_var.set(chunk_val)
         self.preprocess_var.set(clean["preprocess"])
+        self.include_time_anchors_var.set(clean["include_time_anchors"])
         if "template" in clean and clean["template"] in VALID_TEMPLATES:
             self.template_var.set(clean["template"])
             self._refresh_template_dropdown()
@@ -3482,6 +3510,11 @@ class STTMeetApp(ctk.CTk):
         # Determine content, title, and filename prefix based on the active tab.
         # Titles follow the interface language; filename prefixes deliberately
         # stay fixed so saved filenames are stable across a language switch.
+        #
+        # Only the Minutes branch is ever stripped of its time anchors. The Transcript
+        # carries markers of its own and the Recap and Action items never carry anchors
+        # at all, so for those tabs the question does not arise.
+        is_minutes = False
         if active_tab == "tab_transcript":
             content = self.processed_transcript or self.raw_transcript
             title = self._t("export.title_transcript", name=base_name)
@@ -3502,6 +3535,13 @@ class STTMeetApp(ctk.CTk):
             title = self._t("export.title_minutes", name=base_name)
             prefix = "Minit"
             include_appendix = True
+            is_minutes = True
+
+        # The toggle is an export-time transform, not a generation setting: the Minutes
+        # on screen keep their anchors either way, so flipping it costs nothing and
+        # flipping it back brings the trail straight back.
+        if is_minutes and not bool(self.include_time_anchors_var.get()):
+            content = strip_time_anchors(content)
 
         if not content or not content.strip():
             messagebox.showwarning(

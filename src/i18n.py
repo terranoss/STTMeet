@@ -230,6 +230,13 @@ STRINGS: Dict[str, Dict[str, str]] = {
     "btn.export_txt": {"en": "📃 Export Text (.txt)", "ms": "📃 Eksport Teks (.txt)"},
     "btn.export_all": {"en": "📦 Export All", "ms": "📦 Eksport Semua"},
 
+    # The switch beside the Export buttons. The label follows the interface language,
+    # like every other control -- the anchors themselves are numeric and need none.
+    "export.time_anchors": {
+        "en": "⏱ Include time anchors",
+        "ms": "⏱ Sertakan penanda masa",
+    },
+
     # --- Stepper ------------------------------------------------------
     "step.step1": {"en": "① Preprocess", "ms": "① Praproses"},
     "step.step2": {"en": "② Chunking", "ms": "② Pemotongan"},

@@ -308,6 +308,7 @@ def _sample_settings():
         "chunk_minutes": 20,
         "preprocess": False,
         "template": "action_minutes",
+        "include_time_anchors": True,
     }
 
 def _sample_status():
@@ -384,6 +385,58 @@ def test_session_loads_v1_without_settings():
         assert loaded["status"]["chunks"] == []
         assert loaded["processed_transcript"] == "old transcript"
         assert loaded["speaker_mapping"] == {}
+
+def test_the_time_anchor_toggle_is_remembered_per_session():
+    """
+    The switch is a per-session setting, so someone who chose a clean export does not
+    choose it again at the next meeting. Checked over the real round trip through disk,
+    because a value that did not survive the write is a toggle that resets every time
+    the session is reopened.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = session_path(Path(tmp), "abc123")
+        payload = build_session_payload(
+            audio_hash="abc123",
+            audio_path="D:/meetings/agm.mp3",
+            settings=dict(_sample_settings(), include_time_anchors=False),
+            status=_sample_status(),
+        )
+        assert save_session(payload, path)
+
+        loaded = load_session(path)
+
+    assert loaded is not None
+    assert loaded["settings"]["include_time_anchors"] is False
+
+
+def test_a_session_written_before_the_time_anchor_toggle_existed_loads_with_it_on():
+    """
+    A session this build did not write has no record of the toggle, and the documented
+    default is on -- the feature works without anyone opting in. It has to arrive as a
+    setting rather than a missing key, or the first export after an upgrade would find
+    nothing to read.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "session_pre_toggle.json"
+        path.write_text(json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "audio_hash": "pre-toggle",
+            "settings": {
+                "engine": "☁️ Gemini 3.5 Flash",
+                "language": "English",
+                "chunk_minutes": 20,
+                "preprocess": False,
+                "template": "action_minutes",
+            },
+            "generated_minutes": "old minutes",
+        }), encoding="utf-8")
+
+        loaded = load_session(path)
+
+    assert loaded is not None
+    assert DEFAULT_SETTINGS["include_time_anchors"] is True
+    assert loaded["settings"]["include_time_anchors"] is True
+
 
 def test_a_session_saved_and_reloaded_at_the_current_cache_version_still_uses_its_minutes():
     """
@@ -1691,6 +1744,445 @@ def test_the_minutes_tab_renders_an_anchored_document_with_the_renderer_it_has()
     assert "Support needs the staging window confirmed before sign-off." in rendered
     # Headings stay headings, so the structure is not cluttered by markers.
     assert not [tags for tags, text in viewer.drawn if tags == "h1" and "(1:07:45)" in text]
+
+
+# ---------------------------------------------------------------------------
+# The export seam
+#
+# Anchors are written by the model, so whether they reach the exported document is
+# only visible on the file that comes out. Every test below writes into a temporary
+# directory and reads that file back -- the highest point at which the toggle's
+# behaviour exists -- and never reaches into the strip itself.
+# ---------------------------------------------------------------------------
+
+ANCHORED_RECAP = """# Meeting Recap
+
+The team agreed to stage the payments rollout behind a feature flag. (12:34)
+
+| Item | Owner |
+| :- | :- |
+| Staging window confirmed | Danial (5:02) |
+"""
+
+ANCHORED_ACTIONS = """# Action Item Register
+
+| # | Action | Owner |
+| :- | :- | :- |
+| 1 | Circulate the rollout plan | Priya (12:34) |
+"""
+
+UNANCHORED_MINUTES = """# Minutes of Meeting
+
+**Date & Time:** 14 October 2026, 10:30 AM
+
+## 1. Objective
+The team confirmed the staging plan before breaking for lunch.
+
+## 2. Action Item Register
+
+| # | Action | Owner |
+| :- | :- | :- |
+| 1 | Circulate the rollout plan | Priya |
+"""
+
+MINUTES_WITH_AN_ITEM_THAT_HAS_NO_ANCHOR = """# Minutes of Meeting
+
+**Date & Time:** 14 October 2026, 10:30 AM
+
+## 1. Decisions Reached
+
+* **Summary of Outcome:** The team agreed to stage the rollout behind a feature flag. (12:34)
+* **Summary of Outcome:** Sign-off is delegated to the duty manager (as at last quarter).
+
+## 2. Action Item Register
+
+| # | Action | Owner |
+| :- | :- | :- |
+| 1 | Circulate the rollout plan | Priya |
+| 2 | Confirm the staging window with Support | Danial |
+"""
+
+MEETING_DOCUMENTS = {
+    "minutes": ANCHORED_ACTION_MINUTES,
+    "transcript": None,  # filled in below, once the transcript fixture exists
+    "recap": ANCHORED_RECAP,
+    "actions": ANCHORED_ACTIONS,
+}
+MEETING_DOCUMENTS["transcript"] = a_transcript_carrying_its_own_markers()
+
+
+class RecordingMessageboxes:
+    """The message boxes the export handler reaches for, keeping rather than showing."""
+
+    def __init__(self):
+        self.shown = []
+
+    def showinfo(self, title, message):
+        self.shown.append(("info", message))
+
+    def showwarning(self, title, message):
+        self.shown.append(("warning", message))
+
+    def showerror(self, title, message):
+        self.shown.append(("error", message))
+
+
+class ExportWindow:
+    """
+    The window the export handler reads, with nothing constructed and nothing drawn.
+
+    The save dialog and the message boxes are the only things between a person and a
+    written file, so both are answered here and the file is left for the test to read.
+    """
+
+    def __init__(self, tab, documents, save_dir, include_time_anchors=True):
+        self.tabview = SimpleNamespace(get=lambda: tab)
+        self.selected_audio_file = str(Path(save_dir) / "q3_platform_sync.wav")
+        self.processed_transcript = documents["transcript"]
+        self.generated_minutes = documents["minutes"]
+        self.generated_recap = documents["recap"]
+        self.generated_actions = documents["actions"]
+        self.ui_locale = "en"
+        self.include_time_anchors = include_time_anchors
+        self.include_time_anchors_var = SimpleNamespace(get=lambda: self.include_time_anchors)
+        self.saved = []
+        self.box = None
+
+    def borrow_export_from(self, app_class):
+        for name in ("_t", "_export_document"):
+            setattr(self, name, types.MethodType(getattr(app_class, name), self))
+        return self
+
+    def answer_the_save_dialog(self, **kwargs):
+        """Where a file asked to be saved is actually saved, inside the temp directory."""
+        self.saved.append(kwargs["initialfile"])
+        return str(Path(self.selected_audio_file).parent / kwargs["initialfile"])
+
+
+@contextmanager
+def exported_documents(tab, documents=None, include_time_anchors=True, fmt="txt"):
+    """Run one export into a temporary directory and hand back what it wrote."""
+    from src.ui import app_window
+
+    documents = MEETING_DOCUMENTS if documents is None else documents
+    with tempfile.TemporaryDirectory() as tmp:
+        window = ExportWindow(tab, documents, tmp, include_time_anchors).borrow_export_from(
+            app_window.STTMeetApp
+        )
+        window.box = RecordingMessageboxes()
+        original_dialog = app_window.filedialog.asksaveasfilename
+        original_messagebox = app_window.messagebox
+        app_window.filedialog.asksaveasfilename = window.answer_the_save_dialog
+        app_window.messagebox = window.box
+        try:
+            app_window.STTMeetApp._export_document(window, fmt)
+            yield window, {name: Path(tmp) / name for name in window.saved}
+        finally:
+            app_window.filedialog.asksaveasfilename = original_dialog
+            app_window.messagebox = original_messagebox
+
+
+def the_only_file(written):
+    """The single file an export produced, asserted to be the only one."""
+    assert len(written) == 1, written
+    return next(iter(written.values()))
+
+
+def read_docx(path):
+    """A Word document as a caller receives it: its paragraphs and its tables."""
+    from docx import Document
+
+    document = Document(str(path))
+    paragraphs = [p.text for p in document.paragraphs]
+    tables = [[cell.text for cell in row.cells]
+              for table in document.tables for row in table.rows]
+    return paragraphs, tables
+
+
+def read_docx_bold_runs(path):
+    """Every run of every paragraph, with whether Word renders it bold."""
+    from docx import Document
+
+    document = Document(str(path))
+    return [(run.text, bool(run.font.bold))
+            for paragraph in document.paragraphs for run in paragraph.runs]
+
+
+def test_the_time_anchor_toggle_decides_what_the_text_export_carries():
+    """
+    The whole point of the switch: the person writing minutes out chooses whether the
+    trail goes with them. Off means the document reads as a finished record, and the
+    anchors are gone from a bullet, from a line of prose and from a table cell alike.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False) as (_window, written):
+        clean = the_only_file(written).read_text(encoding="utf-8")
+
+    with exported_documents("tab_minutes", include_time_anchors=True) as (_window, written):
+        anchored = the_only_file(written).read_text(encoding="utf-8")
+
+    # Off: no anchor of either form survives anywhere in the document.
+    assert "(12:34)" not in clean, clean
+    assert "(1:07:45)" not in clean, clean
+    # And what the anchors were attached to is still there, whole.
+    assert "The team agreed to stage the rollout behind a feature flag." in clean
+    assert "Confirm the staging window with Support" in clean
+    assert "Stage two goes live only after the error budget holds for 72 hours." in clean
+    # On: the trail is back in the exported document, on all three kinds of line.
+    assert "(12:34)" in anchored
+    assert "(1:07:45)" in anchored
+
+
+def test_the_time_anchor_toggle_decides_what_the_word_export_carries():
+    """
+    The same question asked of the Word document, which is where stripping has the most
+    to lose: the anchors sit inside bullets and inside table cells, and a strip that
+    damaged the Markdown would show up as a table that no longer has its columns.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False, fmt="docx") as (_w, written):
+        clean_paragraphs, clean_tables = read_docx(the_only_file(written))
+
+    with exported_documents("tab_minutes", include_time_anchors=True, fmt="docx") as (_w, written):
+        anchored_paragraphs, anchored_tables = read_docx(the_only_file(written))
+
+    everything = "\n".join(clean_paragraphs + [cell for row in clean_tables for cell in row])
+    assert "(12:34)" not in everything, everything
+    assert "(1:07:45)" not in everything, everything
+    # The content the anchors closed is still there, on the bullet and in the cell.
+    assert "Summary of Outcome: The team agreed to stage the rollout behind a feature flag." in clean_paragraphs
+    assert any(row[-1] == "Open" for row in clean_tables), clean_tables
+    # On, the trail is back in the Word document too.
+    assert any("(12:34)" in p for p in anchored_paragraphs)
+    assert any("(1:07:45)" in cell for row in anchored_tables for cell in row)
+
+
+def test_the_time_anchor_toggle_reaches_only_the_minutes_branch():
+    """
+    Stripping belongs to the Minutes and to nothing else. The Transcript's markers are
+    how that document is read at all, the Recap and Action items were never anchored,
+    and the appendix hung off a Minutes export is still the Transcript -- so every one
+    of them comes out of the export in either position of the switch, unchanged.
+    """
+    for tab in ("tab_transcript", "tab_recap", "tab_actions"):
+        with exported_documents(tab, include_time_anchors=False) as (_window, off):
+            without = the_only_file(off).read_bytes()
+        with exported_documents(tab, include_time_anchors=True) as (_window, on):
+            with_anchors = the_only_file(on).read_bytes()
+
+        assert without == with_anchors, tab
+
+    # And the markers themselves are visibly still in the Transcript export, which is
+    # the thing being protected rather than a coincidence of identical bytes.
+    with exported_documents("tab_transcript", include_time_anchors=False) as (_window, written):
+        transcript = the_only_file(written).read_text(encoding="utf-8")
+    assert "[12:34] Priya: I propose we stage the rollout behind a feature flag." in transcript
+
+
+def test_the_transcript_appended_to_a_minutes_export_keeps_its_own_markers():
+    """
+    The appendix in a Minutes Word export is the Transcript, and its markers are the
+    Transcript's own. They are the one marker the switch must not reach, or a clean
+    export would hand over an appendix with every turn unplaceable in the recording.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False, fmt="docx") as (_w, written):
+        paragraphs, _tables = read_docx(the_only_file(written))
+
+    appendix = [p for p in paragraphs if p.startswith("[")]
+    assert appendix, "the Minutes export carries no transcript appendix at all"
+    assert "[12:34] Priya: I propose we stage the rollout behind a feature flag." in appendix
+    assert "[01:07:45] Danial: I will confirm the staging window with Support." in appendix
+
+
+def test_stripping_does_not_damage_the_markdown_around_the_anchors():
+    """
+    The strip runs before the renderers, so a mistake in it arrives as a broken table
+    rather than as an error -- a dropped pipe, a swallowed bold span, a cell lost to
+    the cell after it. This is the failure that would be least likely to be noticed by
+    eye, so it is asserted structurally: the exported table has the shape the Minutes
+    document declares, and the bold spans are still bold.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=False, fmt="docx") as (_w, written):
+        clean = the_only_file(written)
+        _paragraphs, clean_tables = read_docx(clean)
+        clean_bold = read_docx_bold_runs(clean)
+
+    with exported_documents("tab_minutes", include_time_anchors=True, fmt="docx") as (_w, written):
+        anchored = the_only_file(written)
+        _paragraphs, anchored_tables = read_docx(anchored)
+        anchored_bold = read_docx_bold_runs(anchored)
+
+    # The register is the last table written, and it is five columns wide in both
+    # positions -- pipes intact, the alignment row still skipped rather than exported.
+    clean_register = clean_tables[2:]
+    anchored_register = anchored_tables[2:]
+    assert anchored_register and len(anchored_register[0]) == 5
+    assert [len(row) for row in clean_register] == [len(row) for row in anchored_register]
+    assert [row[0] for row in clean_register] == [row[0] for row in anchored_register]
+    # The header survives whole, so the separator row was recognised as markdown.
+    assert clean_register[0][1] == "Action Item / Deliverable"
+    # Every cell of the document is intact, minus its anchor.
+    assert clean_register[1][4] == "Open"
+    assert clean_register[2][1] == "Confirm the staging window with Support"
+    # Bold spans are still bold in both positions: stripping the anchor did not
+    # flatten the emphasis around it.
+    assert [text for text, bold in clean_bold if bold]
+    assert [text for text, bold in clean_bold if bold] == [text for text, bold in anchored_bold if bold]
+    assert ("Formal Decision:", True) in clean_bold
+
+
+def test_a_minutes_document_with_no_anchors_exports_the_same_in_either_position():
+    """
+    A Minutes may carry no anchors at all -- the model writes them only where it had
+    something to point at. Turning the switch off on such a document is a request for
+    nothing, so the file is identical rather than the export failing, and nothing is
+    shown to the person as having gone wrong.
+    """
+    documents = dict(MEETING_DOCUMENTS, minutes=UNANCHORED_MINUTES)
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False) as (window, off):
+        without = the_only_file(off).read_bytes()
+    with exported_documents("tab_minutes", documents, include_time_anchors=True) as (window, on):
+        with_anchors = the_only_file(on).read_bytes()
+
+    assert without == with_anchors
+    assert "Circulate the rollout plan" in without.decode("utf-8")
+    assert [kind for kind, _message in window.box.shown] == ["info"]
+
+
+def test_an_item_with_no_anchor_is_exported_whole_rather_than_damaged():
+    """
+    Half a document is anchored and half is not, which is the ordinary case. The items
+    with no anchor -- and the ordinary parenthesised aside one of them happens to
+    carry -- come through the strip untouched, since there is nothing there to remove.
+    """
+    documents = dict(MEETING_DOCUMENTS, minutes=MINUTES_WITH_AN_ITEM_THAT_HAS_NO_ANCHOR)
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False, fmt="docx") as (_w, written):
+        paragraphs, tables = read_docx(the_only_file(written))
+
+    # The anchored bullet loses its anchor and nothing else.
+    assert "Summary of Outcome: The team agreed to stage the rollout behind a feature flag." in paragraphs
+    # The unanchored one is not shortened, and its aside is not mistaken for an anchor.
+    assert "Summary of Outcome: Sign-off is delegated to the duty manager (as at last quarter)." in paragraphs
+    # A table row whose cells carry no anchor keeps both of its values.
+    assert "Confirm the staging window with Support" in [cell for row in tables for cell in row]
+
+
+def without_the_generation_stamp(path):
+    """
+    A written file with the line every export stamps on itself removed.
+
+    The stamp is the moment of writing rather than part of the document, and two runs
+    a second apart would differ on it alone -- which would make a byte-for-byte
+    comparison a coin toss rather than a fact about the toggle.
+    """
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines()
+             if not line.startswith(translate("export.generated_on", "en"))]
+    return "\n".join(lines).encode("utf-8")
+
+
+def test_with_the_switch_on_the_exported_documents_are_what_they_were():
+    """
+    A switch that changes a document in its off position has changed it in its on
+    position too, so the on position is checked against the writers themselves: the
+    same text, the same title, handed straight to the writer with nothing in between.
+    Any transform that leaked into the on position would show up here as a difference.
+    """
+    from src.exporter import export_to_docx, export_to_text
+
+    title = translate("export.title_minutes", "en", name="q3_platform_sync")
+    transcript = a_transcript_carrying_its_own_markers()
+
+    with exported_documents("tab_minutes", include_time_anchors=True) as (_window, written):
+        exported_text = without_the_generation_stamp(the_only_file(written))
+    with exported_documents("tab_minutes", include_time_anchors=True, fmt="docx") as (_window, written):
+        exported_docx = the_only_file(written)
+        exported_word = (read_docx(exported_docx), read_docx_bold_runs(exported_docx))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reference_text = Path(tmp) / "reference.txt"
+        reference_docx = Path(tmp) / "reference.docx"
+        export_to_text(str(reference_text), title, ANCHORED_ACTION_MINUTES, transcript, "en")
+        export_to_docx(str(reference_docx), title, ANCHORED_ACTION_MINUTES,
+                       raw_transcript=transcript, locale="en")
+
+        assert exported_text == without_the_generation_stamp(reference_text)
+        assert exported_word == (read_docx(reference_docx), read_docx_bold_runs(reference_docx))
+
+
+def test_turning_the_switch_off_leaves_the_minutes_on_screen_exactly_as_they_were():
+    """
+    The Minutes always carry their anchors, in either position of the switch -- that is
+    what makes flipping it back on instant and free. Nothing is regenerated to do it,
+    and the document the tab is showing is the same object it was before the flip.
+    """
+    with exported_documents("tab_minutes", include_time_anchors=True) as (window, written):
+        on_screen = window.generated_minutes
+        anchored = the_only_file(written).read_text(encoding="utf-8")
+
+    # The person turns it off, and exports again from the same window.
+    with exported_documents("tab_minutes", include_time_anchors=False) as (window, written):
+        clean = the_only_file(written).read_text(encoding="utf-8")
+
+    assert window.generated_minutes == on_screen
+    assert "(12:34)" in on_screen
+    assert "(12:34)" in anchored and "(12:34)" not in clean
+
+
+def test_export_all_carries_the_toggle_to_both_of_the_files_it_writes():
+    """
+    Export All is two exports, and setting the switch twice for it would be a decision
+    nobody should have to make. Both files it writes obey the one setting.
+    """
+    for include_time_anchors in (True, False):
+        with exported_documents("tab_minutes", include_time_anchors=include_time_anchors,
+                                fmt="all") as (_window, written):
+            assert len(written) == 2, written
+            documents = []
+            for path in written.values():
+                if path.suffix == ".docx":
+                    paragraphs, tables = read_docx(path)
+                    documents.append("\n".join(paragraphs + [c for r in tables for c in r]))
+                else:
+                    documents.append(path.read_text(encoding="utf-8"))
+
+        for document in documents:
+            assert ("(12:34)" in document) is include_time_anchors, document
+            # The Transcript goes out with both files and keeps its markers either way.
+            assert "[12:34] Priya: I propose we stage the rollout behind a feature flag." in document
+
+
+def test_the_conversion_the_writers_perform_survives_an_export_of_its_own():
+    """
+    The export module's Markdown conversion had no coverage at all until this, and the
+    constructs a generated document does not usually contain -- links, inline code,
+    images, emphasis -- are the ones a real meeting is most likely to carry by accident.
+    Asserted on the written file, in the plain-text form that has no Markdown left in
+    it: the readable text survives, and none of the syntax does.
+    """
+    documents = dict(MEETING_DOCUMENTS, minutes=(
+        "# Minutes of Meeting\n"
+        "\n"
+        "## 1. Reference Material\n"
+        "* **Rollout plan:** see the [staging runbook](https://example.invalid/runbook) for detail.\n"
+        "* **Flag name:** set `PAYMENTS_STAGED` before promoting.\n"
+        "* **Chart:** ![error budget](https://example.invalid/budget.png) had two breaches.\n"
+        "* **Decision:** hold the release until the *error budget* holds.\n"
+        "\n"
+    ))
+
+    with exported_documents("tab_minutes", documents, include_time_anchors=False) as (_window, written):
+        exported = the_only_file(written).read_text(encoding="utf-8")
+
+    # The readable text is all there...
+    assert "see the staging runbook for detail" in exported
+    assert "set PAYMENTS_STAGED before promoting" in exported
+    assert "had two breaches" in exported
+    assert "hold the release until the error budget holds" in exported
+    # ...and none of the syntax that was carrying it is.
+    assert "https://example.invalid/runbook" not in exported
+    assert "![error budget]" not in exported
+    assert "`PAYMENTS_STAGED`" not in exported
+    assert "**Rollout plan:**" not in exported
 
 
 def test_transcription_retries_an_empty_transcription_on_its_own_backoff():
@@ -3426,6 +3918,9 @@ class FakeGenerationWindow:
         self.engine_var = SimpleNamespace(get=lambda: engine)
         self.chunk_size_var = SimpleNamespace(get=lambda: "25")
         self.preprocess_var = SimpleNamespace(get=lambda: True)
+        # The export toggle is read into the settings snapshot a run carries, so the
+        # window has to have one; on is the default a run starts from.
+        self.include_time_anchors_var = SimpleNamespace(get=lambda: True)
         self._parse_chunk_minutes = lambda display: 25
 
         # What has been generated so far, for this meeting.
@@ -3954,6 +4449,19 @@ if __name__ == "__main__":
     test_time_anchors_stay_off_the_metadata_and_the_headings()
     test_anchors_disturb_the_buckets_parsed_out_of_the_generated_document()
     test_the_minutes_tab_renders_an_anchored_document_with_the_renderer_it_has()
+    test_the_time_anchor_toggle_is_remembered_per_session()
+    test_a_session_written_before_the_time_anchor_toggle_existed_loads_with_it_on()
+    test_the_time_anchor_toggle_decides_what_the_text_export_carries()
+    test_the_time_anchor_toggle_decides_what_the_word_export_carries()
+    test_the_time_anchor_toggle_reaches_only_the_minutes_branch()
+    test_the_transcript_appended_to_a_minutes_export_keeps_its_own_markers()
+    test_stripping_does_not_damage_the_markdown_around_the_anchors()
+    test_a_minutes_document_with_no_anchors_exports_the_same_in_either_position()
+    test_an_item_with_no_anchor_is_exported_whole_rather_than_damaged()
+    test_with_the_switch_on_the_exported_documents_are_what_they_were()
+    test_turning_the_switch_off_leaves_the_minutes_on_screen_exactly_as_they_were()
+    test_export_all_carries_the_toggle_to_both_of_the_files_it_writes()
+    test_the_conversion_the_writers_perform_survives_an_export_of_its_own()
     test_minutes_path_retries_a_transient_error_with_backoff_then_answers()
     test_action_items_path_fails_over_to_the_next_model_on_a_quota_failure()
     test_action_items_path_retries_a_transient_error_with_backoff_then_answers()

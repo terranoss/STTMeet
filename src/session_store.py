@@ -38,6 +38,11 @@ DEFAULT_SETTINGS = {
     "chunk_minutes": 25,
     "preprocess": True,
     "template": "action_minutes",
+    # Whether time anchors reach the exported document. On by default, so the trail
+    # survives outside the app unless someone deliberately hands over a clean record.
+    # This is a property of the export rather than of the Minutes, which always carry
+    # their anchors -- which is why it is a setting and not part of the generation run.
+    "include_time_anchors": True,
 }
 
 VALID_ENGINES = [
@@ -133,6 +138,10 @@ def normalize_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     template = raw.get("template")
     if template in VALID_TEMPLATES:
         result["template"] = template
+
+    include_time_anchors = raw.get("include_time_anchors")
+    if isinstance(include_time_anchors, bool):
+        result["include_time_anchors"] = include_time_anchors
 
     return result
 
