@@ -1008,6 +1008,47 @@ def test_template_prompts_and_displays():
         melayu_prompt = get_synthesis_prompt(template=tmpl, language="Bahasa Melayu")
         assert seeded not in melayu_prompt, f"{tmpl}: English rule pasted into a Malay prompt"
 
+
+def test_template_reference_documents_match_prompts():
+    """
+    Each Template has a reference document describing its section structure for
+    developers to read. Those documents describe the section structure the prompts
+    produce, and this check enforces that they agree on their section heading sets.
+
+    Only headings are compared: full-text comparison would fail on harmless
+    placeholder wording that differs between the copies.
+    This check covers English prompts because there are no Malay reference
+    documents currently maintained.
+    """
+    reference_docs = {
+        "action_minutes": Path("docs/meeting_minute/action_minutes_template.md"),
+        "discussion_minutes": Path("docs/meeting_minute/discussion_minutes_template.md"),
+        "three_column": Path("docs/meeting_minute/three_column_minutes_template.md"),
+        "board_governance": Path("docs/meeting_minute/board_governance_minutes_template.md"),
+    }
+
+    assert set(reference_docs.keys()) == set(VALID_TEMPLATES), (
+        "Every valid template must have a reference document defined in the check"
+    )
+
+    def extract_headings(text: str) -> list[str]:
+        return [line.strip() for line in text.splitlines() if line.strip().startswith("#")]
+
+    for tmpl, doc_path in reference_docs.items():
+        assert doc_path.exists(), f"Reference document for {tmpl} missing at {doc_path}"
+        doc_headings = extract_headings(doc_path.read_text(encoding="utf-8"))
+        prompt_headings = extract_headings(get_synthesis_prompt(template=tmpl, language="English"))
+
+        # Non-trivial heading count so a broken parse cannot produce a silent pass
+        assert len(doc_headings) >= 1, f"{tmpl}: reference document has no headings"
+        assert len(prompt_headings) >= 1, f"{tmpl}: prompt has no headings"
+        assert doc_headings == prompt_headings, (
+            f"Headings mismatch for template {tmpl}:\n"
+            f"Doc: {doc_headings}\n"
+            f"Prompt: {prompt_headings}"
+        )
+
+
 def test_parse_minutes_sections_for_templates():
     three_col_sample = """# Three-Column Meeting Minutes
 **Project:** Alpha
@@ -4415,6 +4456,7 @@ if __name__ == "__main__":
     test_localize_date_uses_language_months()
     test_prefs_roundtrip_and_tolerance()
     test_template_prompts_and_displays()
+    test_template_reference_documents_match_prompts()
     test_parse_minutes_sections_for_templates()
     test_recap_prompts()
     test_action_items_prompts()
